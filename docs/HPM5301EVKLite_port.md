@@ -148,7 +148,64 @@ DAP 目标脚（PA04–PA08）就是芯片自身的 JTAG 引脚：
 
 ---
 
-## 5. 注意事项
+## 5. 探针侧 RTT→CDC 桥（分支 `feat/probe-rtt-bridge`）
+
+普通 RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 WrOff/RdOff → 读环形
+缓冲 → 写回 RdOff），上限 ~1.1 MB/s。这个分支把轮询下沉进探针固件（J-Link 式），
+固件自己在主循环里搜控制块、搬环形缓冲、回写 RdOff，数据直接进 CDC 串口环。
+
+| 路径 | 吞吐（目标 64 MHz，12 KB 环） |
+| --- | --- |
+| 目标停在复位默认 8 MHz（生产者在目标侧，此时封顶） | 277 KB/s |
+| `make rtt-test`（OpenOCD rtt server） | 919 KB/s |
+| `make rtt-max`（轮询在 OpenOCD 内） | 1140 KB/s |
+| **探针侧桥 @20 MHz SWD** | 1420 KB/s |
+| **探针侧桥 @36 MHz SWD** | **2190 KB/s（2.14 MB/s），全流校验零丢包零重包** |
+
+### 5.1 SWD 访问用 ARM DAPLink 官方 `swd_host.c`
+
+`firmware/application_5301/src/swd_host/`（`swd_host.c/.h`、`debug_cm.h`）来自
+DAPLink 官方代码（经 [MicroLink](https://github.com/minichao9901) 同款 5301 工程转录），
+**时序逻辑一字未改**，只裁掉与 SWD 访问无关的部分：
+
+- 去掉 `target_config.h`（连带 `flash_blob.h`/`util.h` 依赖链）；
+- 裁掉 `swd_flash_syscall_exec/verify_exec`（flash 算法调用）；
+- 裁掉 `swd_set_target_state_hw/sw` 与 `swd_wait_until_halted`（目标状态机）。
+
+`swd_host_port.c` 提供它需要的两个平台符号：`SWD_Transfer()` 按 RnW 分派到本工程
+`SW_DP.c` 的 `SWD_Read()/SWD_Write()`（与 DAP 主机通路同一套按速度预编译的 bit-bang
+blob），`swd_set_target_reset()` 用 `DAP_config.h` 的 `PIN_nRESET_OUT()`。
+
+### 5.2 三个必须注意的坑（都踩过）
+
+1. **握手必须在默认低速档、提速必须在 `swd_init_debug()` 之后**：
+   `swd_init_debug()` 内部会再调一次 `swd_init()` → `DAP_Setup()`，把时钟档重置回默认
+   并加载 Slow blob。顺序写反（先提速再握手）会在读 DP IDCODE 时直接失败（返回 -2）。
+2. **RdOff 回写要幂等重试**：`swd_write_data()` 收尾那个 dummy RDBUFF 读失败时**也会
+   返回 0**，但此时写其实已经落到目标上了。若据此判定"没写成功"就跳过数据交付 → 丢一
+   段；若判定"写成功"后重读重发 → 重一段。做法：先把数据交付进 CDC 环，再写 RdOff；
+   失败就记下目标值，下轮**先补写同一个绝对值**（RdOff 是绝对值，重写永远安全），
+   补上再继续搬。实测 `wr_err=1` 时流依然完整。
+3. **长块读在目标运行中会失败**：单次块读限到 512 B（128 字），配合官方
+   `swd_read_memory()` 内部的 1 KB 页切分。45/60 MHz 在目标运行时开始出错，故桥用
+   36 MHz；20 MHz 时吞吐只有 1.42 MB/s（轮询越长，主循环喂 CDC 的次数越少）。
+
+### 5.3 与 DAP 主机通路的互斥
+
+桥只在 **DAP 空闲 ≥20 ms** 时才轮询（`rtt_bridge_note_dap_activity()` 记录最近一次
+DAP 命令），每次轮询有界（≤2048 B），所以正常调试会话最多多约 1 ms 抖动，不会撕裂
+传输。桥运行时 `uartx_set_cdc_source(1)` 让 RTT 成为 CDC 环的**唯一生产者**（UART 侧
+退出，遵守 `chry_ringbuffer` 的单生产者约定）。
+
+启动/测速：
+
+```powershell
+python script_test\rtt_probe_bridge.py COM52 6 36000
+```
+
+---
+
+## 6. 注意事项
 
 1. **J5.15（nSRST）是 EVKLite 自己的复位输入**（芯片 RESET_N），固件无法
    驱动它。用 20 针排线直连目标板的 JTAG 座时，不要让目标板的复位网络
@@ -165,7 +222,7 @@ DAP 目标脚（PA04–PA08）就是芯片自身的 JTAG 引脚：
 
 ---
 
-## 6. 验证清单
+## 7. 验证清单
 
 - [x] `build_xip_evklite.bat` / `build_dfu_evklite.bat` 编译通过，输出
       `[pack boot]` / `[pack app]`。
@@ -175,6 +232,9 @@ DAP 目标脚（PA04–PA08）就是芯片自身的 JTAG 引脚：
 - [x] 长按 USER KEY 1s → 设备重枚举为 `PID_0207`（DFU+MSC 虚拟 U 盘）。
 - [x] CDC 串口回环：**短接 J3.8 ↔ J3.10**，`script_test/evk_echo.py` 与
       `uart_loopback_common.py` 全速率通过（9600~10 Mbps，10M→974 KB/s）。
+- [x] 探针侧 RTT 桥：`script_test/rtt_probe_bridge.py COM52 6 36000` →
+      **2190 KB/s**，全流 13.5 MB 零丢包零重包（两连跑复现）；跑完桥后
+      CMSIS-DAP 主机通路仍正常（`script_test/evk_swd_probe.py`）。
 
 > 2026-09-27 实测记录（`script_test/evk_diag.py` 诊断固件）：
 > UART3 内部回环自测 8/8、主机 27 字节经 CDC→UART TX 全部发出（TX DMA 完成

@@ -218,14 +218,54 @@ Byte[0x03-0x3F] = Command data（可选）
    Byte[0x16] = \0
    设备回应代表成功
 
-13. 设备复位指令 0xFE
+13. 探针侧 RTT 桥指令 0x31
+    主机发送 request
+    Byte[0x00] = 0x01 // Report ID
+    Byte[0x01] = 0x0D // Data Length（START 时；简单查询用 1）
+    Byte[0x02] = 0x31 // Command type
+    Byte[0x03] = action：0=停止，1=启动，2=查状态，3=自动启动（自己搜控制块），
+                  4=原始 DAP 透传（调试用），5=读探针自身内存（调试用），6=取透传结果
+    Byte[0x04-0x07] = 目标地址（action=1 时可选，0 = 用默认搜索区间）
+    Byte[0x08-0x0B] = 搜索长度（action=1 时可选，0 = 默认）
+    Byte[0x0C] = RTT 通道号（默认 0）
+    设备回应 response
+    Byte[0x00] = 0x02 // Report ID
+    Byte[0x01] = 0x32 // Data Length = 1(command) + 1(rc) + 48(12 个状态字)
+    Byte[0x02] = 0x31 // Command type
+    Byte[0x03] = 返回码（0 = 正常；启动失败为负：-1=SWJ_Clock 失败，-2=SWD 初始化
+                 失败，-3=没找到 RTT 控制块）
+    Byte[0x04..0x33] = 12 个 32 位小端状态字（见下表）
+
+    状态字（action=2/1/3 时为桥的状态；action=5 时前若干字是读回的探针内存，
+    action=6 时前若干字是透传回来的 DAP 响应字节）：
+
+    | 字 | 位域 | 含义 |
+    | --- | --- | --- |
+    | [0] | bit0 / bit8-15 / bit16 / bit24-31 | 运行中 / 通道 / SWD 已就绪 / clock_delay |
+    | [1] | 32 位 | 找到的 RTT 控制块地址（`SEGGER RTT` 签名处） |
+    | [2] | 32 位 | 上行缓冲描述符地址 |
+    | [3] | 32 位 | 已搬运字节数（每次启动清零） |
+    | [4] | 低 16 / 高 16 | 轮询次数 / 实际搬运次数 |
+    | [5] | 低 16 / 高 16 | 目标内存读错误数 / RdOff 写错误数 |
+    | [6] | 低 16 / 高 16 | 上次搬运字节数 / 空环（无数据可搬）次数 |
+    | [7] | 低 16 / 高 16 | 因 DAP 忙而让路的次数 / 重新扫描控制块次数 |
+    | [8] | 低 8 | 最近一条 DAP 命令 ID |
+    | [9] | 32 位 | 最近一条 DAP 响应 |
+    | [10] | 低 8 | 最近一次启动的返回码 |
+
+    说明：桥在探针固件里自己完成 RTT 控制块搜索、环形缓冲搬运与 RdOff 回写，数据
+    直接进 CDC 串口环（此时 UART 侧不再写同一个环）。SWD 访问用 ARM DAPLink 官方
+    `swd_host.c`（`src/swd_host/`）。它只在 DAP 空闲 ≥20 ms 时轮询，正常调试会话最多
+    多约 1 ms 抖动。实测 2.14 MB/s 且零丢包，测速脚本 `script_test/rtt_probe_bridge.py`。
+
+14. 设备复位指令 0xFE
    主机发送 request
    Byte[0x00] = 0x01 // Report ID
    Byte[0x01] = 0x01 // Data Length
    Byte[0x02] = 0xFE // Command type
    设备复位，不会回复，此时连接断开
 
-14. 进入DFU模式设置指令 0xFF
+15. 进入DFU模式设置指令 0xFF
    主机发送 request
    Byte[0x00] = 0x01 // Report ID
    Byte[0x01] = 0x01 // Data Length
