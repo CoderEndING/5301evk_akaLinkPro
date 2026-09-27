@@ -62,9 +62,6 @@
 #define MSC_INTF_STRING_INDEX 0x00
 #define CDC_INTF_STRING_INDEX 0x00
 
-#define WEBUSB_URL_STRINGS \
-    'a', 'k', 'k', 'a', 'k', 'o', '.', 'g', 'i', 't', 'h', 'u', 'b', '.', 'i', 'o', '/', 'a', 'k', 'a', 'L', 'i', 'n', 'k', 'P', 'r', 'o',
-// https://akkako.github.io/akaLinkPro/
 
 // clang-format off
 __ALIGN_BEGIN const uint8_t USBD_WinUSBDescriptorSetDescriptor[] = {
@@ -190,13 +187,21 @@ __ALIGN_BEGIN const uint8_t USBD_BinaryObjectStoreDescriptor[] = {
 #endif
 };
 // clang-format on
-#define URL_DESCRIPTOR_LENGTH (3 + 31)
-
-const uint8_t USBD_WebUSBURLDescriptor[URL_DESCRIPTOR_LENGTH] = {
-    URL_DESCRIPTOR_LENGTH,
+/* WebUSB landing page (the URL Chrome's device notification links to).
+ * bLength = strlen(url) + 3 (bLength + bDescriptorType + bScheme). */
+static const struct
+{
+    uint8_t len;
+    uint8_t type;
+    uint8_t scheme;
+    char url[sizeof("minichao9901.github.io/web-serial-rtt-tools") - 1];
+} USBD_WebUSBURLDescriptor = {
+    sizeof("minichao9901.github.io/web-serial-rtt-tools") - 1 + 3,
     WEBUSB_URL_TYPE,
     WEBUSB_URL_SCHEME_HTTPS,
-    WEBUSB_URL_STRINGS};
+    "minichao9901.github.io/web-serial-rtt-tools"};
+
+#define URL_DESCRIPTOR_LENGTH sizeof(USBD_WebUSBURLDescriptor)
 
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
 // clang-format off
@@ -460,6 +465,7 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
         usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_PACKET_SIZE);
         usbd_ep_start_read(0, CDC_OUT_EP, usb_tmpbuffer, DAP_PACKET_SIZE);
         break;
+
     case USBD_EVENT_SET_REMOTE_WAKEUP:
         break;
     case USBD_EVENT_CLR_REMOTE_WAKEUP:
@@ -617,7 +623,7 @@ struct usb_bos_descriptor bos_desc = {
 
 struct usb_webusb_descriptor webusb_url_desc = {
     .vendor_code = USBD_WEBUSB_VENDOR_CODE,
-    .string = USBD_WebUSBURLDescriptor,
+    .string = (const uint8_t *)&USBD_WebUSBURLDescriptor,
     .string_len = URL_DESCRIPTOR_LENGTH};
 
 const struct usb_descriptor cmsisdap_descriptor = {
