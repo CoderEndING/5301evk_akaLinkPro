@@ -224,10 +224,17 @@ Byte[0x03-0x3F] = Command data（可选）
     Byte[0x01] = 0x0D // Data Length（START 时；简单查询用 1）
     Byte[0x02] = 0x31 // Command type
     Byte[0x03] = action：0=停止，1=启动，2=查状态，3=自动启动（自己搜控制块），
-                  4=原始 DAP 透传（调试用），5=读探针自身内存（调试用），6=取透传结果
-    Byte[0x04-0x07] = 目标地址（action=1 时可选，0 = 用默认搜索区间）
-    Byte[0x08-0x0B] = 搜索长度（action=1 时可选，0 = 默认）
+                  4=原始 DAP 透传（调试用），5=读探针自身内存（调试用），6=取透传结果，
+                  7=运行时调参，8=纯 SWD 基准，9=取基准结果
+    Byte[0x04-0x07] = 目标地址（action=1 时可选，0 = 用默认搜索区间；
+                                action=8 时为目标地址）
+    Byte[0x08-0x0B] = 搜索长度（action=1 时可选，0 = 默认；
+                                action=8 时 low16 = 每次读的字节数，high16 = 轮数）
     Byte[0x0C] = RTT 通道号（默认 0）
+    action=7 调参：Byte[0x04-0x07] = SWD 时钟 Hz（0 = 不改，运行中也能改），
+                   Byte[0x08-0x09] = 块读字节数（0 = 不改，钳到 64~4096），
+                   Byte[0x0A] = bit0 丢弃模式（搬走但不送 CDC，用于量纯 SWD 侧），
+                   Byte[0x0B] = clock_delay 覆盖（0xFF = 用档位原生值；实测无差别）
     设备回应 response
     Byte[0x00] = 0x02 // Report ID
     Byte[0x01] = 0x32 // Data Length = 1(command) + 1(rc) + 48(12 个状态字)
@@ -252,6 +259,11 @@ Byte[0x03-0x3F] = Command data（可选）
     | [8] | 低 8 | 最近一条 DAP 命令 ID |
     | [9] | 32 位 | 最近一条 DAP 响应 |
     | [10] | 低 8 | 最近一次启动的返回码 |
+    | [11] | 低 16 / bit16 / 高 8 | 块读字节数 / 丢弃模式 / 当前 SWD 档位（MHz） |
+
+    action=8/9（纯 SWD 基准）：8 只排队，结果由 9 取回，响应前 3 个字为
+    [0]=错误码（0 正常，-1 SWD 初始化失败，-2 读失败）、[1]=总字节数、
+    [2]=耗时 MCHTMR tick（24 MHz）。
 
     说明：桥在探针固件里自己完成 RTT 控制块搜索、环形缓冲搬运与 RdOff 回写，数据
     直接进 CDC 串口环（此时 UART 侧不再写同一个环）。SWD 访问用 ARM DAPLink 官方

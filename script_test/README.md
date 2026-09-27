@@ -61,6 +61,7 @@ EVKLite 上 CDC 是复合设备的 `MI_01`，可用
 | `evk_diag.py` | 全量诊断（需诊断固件）：引脚直连自测 / UART 内部回环 / 计数器 / force-start |
 | `evk_watch_jumper.py` | 打开 TX 心跳并实时轮询 RX 计数，用于边插跳线边观察（需诊断固件） |
 | `rtt_probe_bridge.py` | **探针侧 RTT 桥测速**：boost 目标 → HID `CMD_RTT` 启动桥 → 只读串口测吞吐，并做全流零丢包校验（分支 `feat/probe-rtt-bridge`） |
+| `rtt_bridge_sweep.py` | **调优扫描**：时钟 × clock_delay × 块大小，并排给出「纯 SWD 基准 / 丢弃模式搬运 / 端到端」三个数，直接指出天花板在哪一侧（`--clk=` 指定桥的请求档位） |
 | `rtt_peek.py` | 读探针自身内存（HID `CMD_RTT` action 5），bring-up 期查 `DAP_Data`/trace 用 |
 | `rtt_rawdap.py` | 经探针主循环透传原始 CMSIS-DAP 请求（action 4/6），bring-up 期用 |
 
