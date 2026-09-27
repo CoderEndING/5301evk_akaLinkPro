@@ -94,6 +94,26 @@ WrOff/RdOff → 读环形缓冲 → 写回 RdOff），每次轮询约 3 ms 固�
 > 控制块，再经 USB 推给主机），这样就没有主机往返开销，理论上限回到 SWD 读带宽
 > （~2 MB/s）。J-Link 就是这么做的，属于固件新功能。
 
+`rtt_speed_test.py` 走的是 OpenOCD 自带的 rtt server，它的 `rtt polling_interval`
+**默认 100 ms**，实测（20 MHz SWD、目标 64 MHz）：
+
+| polling_interval | 吞吐 | 轮询/秒 |
+| --- | --- | --- |
+| 不设置（默认 100 ms） | 9.2 KB/s | 9 |
+| 10 ms | 64.1 KB/s | 64 |
+| 5 ms | 64.3 KB/s | 64 |
+| **1 ms**（脚本采用） | **903.9 KB/s** | 904 |
+| 0 ms（不限速） | 906.1 KB/s | 906 |
+
+- **必须设成 1 ms**：默认值只有 9 KB/s（每次轮询只搬约 1 KB，100 ms 一次 = 9 KB/s）。
+- 1 ms 再往下没有收益（0 ms 与 1 ms 等价），所以脚本保持 1 ms。
+- 5~10 ms 反而异常差（64 KB/s）——OpenOCD 的定时器在这个区间量化得很糟，别在这个
+  范围里"调优"。
+- 注意这个参数**只影响 `make rtt-test`**；`make rtt-max` 的轮询跑在 OpenOCD 内部，
+  与它无关。
+- 低 SWD 时钟下这个参数也救不了：1 MHz 时 1 ms 间隔也只有 ~79 KB/s（受 SWD 读出
+  速度限制）。
+
 ### SRAM 测速为什么必须固定目标主频 ⚠️
 
 SWD 的每次 AHB-AP 事务要花掉目标机好几个 HCLK，所以吞吐上限是
