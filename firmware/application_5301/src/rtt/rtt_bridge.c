@@ -240,7 +240,10 @@ static int rtt_find_cb(void)
         if (rtt_read_bytes(s_search_addr + off, s_scan, want) != 0)
         {
             s_read_err++;
-            continue; /* 这一段读不动（例如超出目标 SRAM），跳过 */
+            /* 这一段读不动通常意味着已经走出目标 SRAM（搜索区间默认 64 KB，
+             * 而 F103C8 只有 20 KB）：后面全是未映射区，再扫没有意义，直接收工。
+             * 这也避免了每次启动白记几十次读错误。 */
+            break;
         }
         for (uint32_t i = 0U; (i + RTT_BRIDGE_SIG_LEN) <= want; i++)
         {
@@ -742,16 +745,23 @@ void rtt_bridge_poll(void)
         {
             err_run = 0U;
             s_rescans++;
-            /* 链路变差（高频档余量不够）时自愈：降一档并重新初始化，再重扫。 */
-            if (rtt_clock_step_down())
-            {
-                s_swd_ready = 0U;
-                (void)rtt_swd_init();
-            }
+            /* 关键：AHB-AP 上一次瞬态错误会在 CTRL/STAT 里留下 sticky 标志
+             * （STICKYERR/STICKYORUN/WDERR…），之后**每一次**访问都直接返回 FAULT。
+             * 不主动清，一次瞬态就会变成永久失效 —— 高频档尤其容易踩到。
+             * swd_clear_errors() 即 DAPLink 的 DP_ABORT 写（STKCMPCLR|STKERRCLR|
+             * WDERRCLR|ORUNERRCLR）。 */
+            (void)swd_clear_errors();
             s_cb_addr = 0U;
             if (rtt_find_cb() != 0)
             {
-                /* Target gone or RTT not initialised: back off, keep trying. */
+                /* 重扫也找不到：这才是「这一档真的用不了」，降一档重来。
+                 * （注意不能一有错就降档：目标运行中出现几次读失败是正常的瞬态，
+                 *   那样会把 45 MHz 平白降到 20 MHz。） */
+                if (rtt_clock_step_down())
+                {
+                    s_swd_ready = 0U;
+                    (void)rtt_swd_init();
+                }
                 s_backoff_until = now + (RTT_ERROR_BACKOFF_MS * (RTT_MCHTMR_HZ / 1000U));
                 return;
             }

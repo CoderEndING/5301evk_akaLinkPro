@@ -14,6 +14,8 @@
 /* DAP_config.h 必须最先包含：DAP.h 依赖它提供的 __STATIC_FORCEINLINE、
  * DAP_SWD/DAP_JTAG 等开关。 */
 #include "DAP_config.h"
+#include "hpm_common.h"
+#include "hpm_interrupt.h" /* disable_global_irq / restore_global_irq */
 #include "DAP.h"
 #include "swd_host.h"
 
@@ -34,6 +36,8 @@
 uint8_t SWD_Transfer(uint32_t request, uint32_t *data)
 {
     uint32_t dummy = 0;
+    uint8_t ack;
+    uint32_t level;
 
     if (data == NULL) {
         /* DAPLink 会用 NULL 做 dummy read（例如清 AP 读流水线的 RDBUFF 读），
@@ -41,11 +45,22 @@ uint8_t SWD_Transfer(uint32_t request, uint32_t *data)
         data = &dummy;
     }
 
+    /* 临界区：这一趟传输是纯 bit-bang 时序循环，中途被任何 ISR 打断都会把采样点
+     * 推后、读回错误的 ACK。原来只有在目标运行 + CDC 持续搬运（USB ISR 频繁）时
+     * 才会暴露：20 MHz（位周期 50 ns）扛得住，36 MHz（28 ns）开始逐轮随机失败。
+     * 一个字约 1.1 µs，两个 CSR 操作的开销 ~2%，换掉高频档的随机性很值。
+     * 注意：本函数也可能在 USB ISR 上下文里被 DAP 命令通路调用，此时 MIE 本来就是
+     * 0，restore 传回的旧值也是 0，不会误开中断。 */
+    level = disable_global_irq(CSR_MSTATUS_MIE_MASK);
+
     if ((request & 0x02U) != 0U) {
-        return SWD_Read(request, data);
+        ack = SWD_Read(request, data);
+    } else {
+        ack = SWD_Write(request, data);
     }
 
-    return SWD_Write(request, data);
+    restore_global_irq(level);
+    return ack;
 }
 
 /**
