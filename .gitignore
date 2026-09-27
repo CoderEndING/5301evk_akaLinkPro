@@ -28,3 +28,6 @@ script_test/stm32f103_rtt_speed/build/
 
 # script_test scratch
 script_test/_openocd_probe.log
+
+# python cache
+__pycache__/
