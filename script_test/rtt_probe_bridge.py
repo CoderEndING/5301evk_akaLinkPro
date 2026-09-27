@@ -84,8 +84,28 @@ def rd(tn, addr):
     return int(m.group(1), 16) if m else None
 
 
+def decode_clock(cfgr):
+    """RCC_CFGR -> (MHz, 描述)。晶振 8 MHz、HSI 8 MHz（HSI 进 PLL 要先 /2）。"""
+    pllsrc = (cfgr >> 16) & 1
+    mull = ((cfgr >> 18) & 0xF) + 2
+    sws = (cfgr >> 2) & 3
+    mhz = (8.0 if pllsrc else 4.0) * mull
+    if sws != 2:
+        return 8.0, "SWS=%d 没跑在 PLL 上（HSI 8 MHz 直出）" % sws
+    return mhz, "PLL=%g MHz (%s x%d)" % (mhz, "HSE" if pllsrc else "HSI/2", mull)
+
+
 def boost_target():
-    """64 MHz from HSI/2 * 16, applied while halted, then release the probe."""
+    """让目标跑在高频上。
+
+    测试固件（script_test/stm32f103_rtt_speed）现在**自己**就超频到 96 MHz
+    （main.c 的 clock_init），所以这里默认只做两件事：复位让固件重新跑一遍
+    clock_init，然后读回 RCC_CFGR 报出实际频率 —— **不再去写 RCC**。
+    （以前无条件写 RCC_CFGR 会把固件设好的 APB 分频覆盖掉，实测交付率因此
+      从 2503 KB/s 掉到 1389 KB/s。）
+
+    只有目标还跑在 8 MHz 的老固件上（SWS != 2）时，才退回老办法：从 HSI/2 x16
+    顶上 64 MHz。"""
     proc = subprocess.Popen([OPENOCD, "-s", SCRIPTS, "-f", CFG,
                              "-c", "gdb port disabled", "-c", "tcl port disabled",
                              "-c", "telnet port 4453"],
@@ -102,19 +122,26 @@ def boost_target():
             print("  ! OpenOCD did not come up - is the target wired?")
             return False
         tn.cmd("reset halt")
-        tn.cmd("mww 0x%08X 0x00000012" % FLASH_ACR)
-        tn.cmd("mww 0x%08X 0x00380400" % RCC_CFGR)
-        cr = rd(tn, RCC_CR) or 0
-        tn.cmd("mww 0x%08X 0x%08X" % (RCC_CR, cr | 0x01000000))
-        for _ in range(50):
-            if (rd(tn, RCC_CR) or 0) & 0x02000000:
-                break
-            time.sleep(0.02)
-        tn.cmd("mww 0x%08X 0x00380402" % RCC_CFGR)
-        tn.cmd("adapter speed %d" % KHZ)
-        tn.cmd("reset run")
-        cfgr = rd(tn, RCC_CFGR)
-        print("  target RCC_CFGR=0x%08X (SWS=%d, PLL=2 means 64 MHz)" % (cfgr, (cfgr >> 2) & 3))
+        cfgr = rd(tn, RCC_CFGR) or 0
+        mhz, desc = decode_clock(cfgr)
+        if ((cfgr >> 2) & 3) == 2:
+            tn.cmd("adapter speed %d" % KHZ)
+            tn.cmd("reset run")
+            print("  target RCC_CFGR=0x%08X (固件自带超频: %s)" % (cfgr, desc))
+        else:
+            tn.cmd("mww 0x%08X 0x00000012" % FLASH_ACR)
+            tn.cmd("mww 0x%08X 0x00380400" % RCC_CFGR)
+            cr = rd(tn, RCC_CR) or 0
+            tn.cmd("mww 0x%08X 0x%08X" % (RCC_CR, cr | 0x01000000))
+            for _ in range(50):
+                if (rd(tn, RCC_CR) or 0) & 0x02000000:
+                    break
+                time.sleep(0.02)
+            tn.cmd("mww 0x%08X 0x00380402" % RCC_CFGR)
+            tn.cmd("adapter speed %d" % KHZ)
+            tn.cmd("reset run")
+            cfgr = rd(tn, RCC_CFGR) or 0
+            print("  target RCC_CFGR=0x%08X (脚本顶上: %s)" % (cfgr, decode_clock(cfgr)[1]))
         try:
             tn.cmd("shutdown")  # OpenOCD exits without a trailing prompt
         except (ConnectionError, OSError):
