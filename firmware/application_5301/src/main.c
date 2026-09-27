@@ -80,6 +80,9 @@ int main(void)
         chry_dap_usb2uart_handle();
         api_param_poll();
         dfu_key_poll();
+        /* Probe-side RTT bridge: polls the target itself (only while the DAP
+         * is idle) and forwards the bytes over the CDC. */
+        rtt_bridge_poll();
     }
     return 0;
 }

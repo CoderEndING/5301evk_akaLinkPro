@@ -105,6 +105,19 @@ static volatile uint32_t rb_write_pos = 0;
 /* 1 = the VCOM pins are muxed to UART2 (COM mode), 0 = JTAG owns the pins
  * (only possible on boards where UART2 shares the JTAG pins). */
 static volatile uint8_t s_uart2_com_mode = 0;
+
+/* 1 = the probe-side RTT bridge owns the CDC ringbuffer; the UART must then
+ * stay out of it (single producer rule for chry_ringbuffer). */
+static volatile uint8_t s_cdc_src_rtt = 0;
+
+void uartx_set_cdc_source(uint8_t from_rtt)
+{
+    s_cdc_src_rtt = from_rtt ? 1U : 0U;
+    if (s_cdc_src_rtt)
+    {
+        chry_ringbuffer_reset(&g_uartrx);
+    }
+}
 ATTR_PLACE_AT_NONCACHEABLE_BSS_WITH_ALIGNMENT(4)
 uint8_t uart_rx_buf[UART_RX_DMA_BUFFER_SIZE];
 
@@ -151,8 +164,15 @@ static uint32_t uartx_rx_written(void)
  * Must be called with interrupts disabled (or from an ISR). */
 static void uartx_rx_flush_locked(void)
 {
-    uint32_t written = uartx_rx_written();
+    uint32_t written;
     uint32_t copied = 0;
+
+    if (s_cdc_src_rtt)
+    {
+        return; /* the RTT bridge is the CDC producer right now */
+    }
+
+    written = uartx_rx_written();
 
     if (written == rb_write_pos)
     {
@@ -313,7 +333,7 @@ SDK_DECLARE_EXT_ISR_M(UART_IRQ, uart_isr)
 
 void usb2uart_handler(void)
 {
-    if (!s_uart2_com_mode)
+    if (!s_uart2_com_mode || s_cdc_src_rtt)
     {
         return;
     }

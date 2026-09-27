@@ -3,6 +3,7 @@
 
 #include "api_param.h"
 #include "usb_composite.h"
+#include "rtt_bridge.h"
 #include "led_state.h"
 #include "hpm_dfu_trigger.h"
 #include "board.h"
@@ -43,6 +44,15 @@
 #define CMD_GET_BL_COMPILE_DATE (0x17)
 #define CMD_RESET_DEVICE (0xFE)
 #define CMD_ENTER_DFU (0xFF)
+/* Probe-side SEGGER RTT bridge (see src/rtt/rtt_bridge.c). */
+#define CMD_RTT (0x31)
+#define RTT_ACT_STOP 0U
+#define RTT_ACT_START 1U
+#define RTT_ACT_STATUS 2U
+#define RTT_ACT_AUTOSTART 3U
+#define RTT_ACT_RAW_DAP 4U
+#define RTT_ACT_PEEK 5U
+#define RTT_ACT_RAW_RESULT 6U
 
 #define PARAM_MAGIC_NUMBER (0x0D000721UL)
 /* EasyFlash ENV key that stores the whole api_param_t blob. */
@@ -183,6 +193,107 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
         res_hid[2] = CMD_GET_VOLTAGE;
         res_hid[3] = (vol >> 0) & 0xFF;
         res_hid[4] = (vol >> 8) & 0xFF;
+    }
+    break;
+    case CMD_RTT:
+    {
+        /* Probe-side RTT bridge control. All SWD work is deferred to the main
+         * loop (rtt_bridge_poll): the bit-bang engine must not run in the USB
+         * interrupt context.
+         * req_hid[3] = action; START takes addr/size/channel from req_hid[4..12];
+         * RAW_DAP takes a length + request bytes.
+         * Response: res_hid[3] = return code, res_hid[4..] = 12 status words. */
+        uint32_t out[12] = {0};
+        int8_t rc = 0;
+
+        switch (req_hid[3])
+        {
+        case RTT_ACT_STOP:
+            rtt_bridge_stop();
+            break;
+        case RTT_ACT_START:
+        {
+            uint32_t addr = (uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                            ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24);
+            uint32_t size = (uint32_t)req_hid[8] | ((uint32_t)req_hid[9] << 8) |
+                            ((uint32_t)req_hid[10] << 16) | ((uint32_t)req_hid[11] << 24);
+            rtt_bridge_request_start(addr, size, req_hid[12]);
+            break;
+        }
+        case RTT_ACT_AUTOSTART:
+            rtt_bridge_request_start(0U, 0U, 0U);
+            break;
+        case RTT_ACT_RAW_DAP:
+        {
+            /* Queue a raw CMSIS-DAP request; it runs from the main loop and the
+             * response is read back with RTT_ACT_RAW_RESULT. */
+            uint8_t req[24];
+            uint32_t n = req_hid[4];
+
+            if (n > sizeof(req))
+            {
+                n = sizeof(req);
+            }
+            for (uint32_t i = 0U; i < n; i++)
+            {
+                req[i] = req_hid[5U + i];
+            }
+            rtt_bridge_request_raw(req, n);
+            break;
+        }
+        case RTT_ACT_RAW_RESULT:
+        {
+            uint8_t resp[16];
+            uint32_t n = rtt_bridge_raw_result(resp, sizeof(resp));
+
+            rc = (int8_t)n;
+            for (uint32_t i = 0U; i < n; i++)
+            {
+                out[i / 4U] |= ((uint32_t)resp[i]) << ((i % 4U) * 8U);
+            }
+            break;
+        }
+        case RTT_ACT_PEEK:
+        {
+            /* Debug helper: read up to 12 words of the PROBE's own memory.
+             * req_hid[4..7] = address, req_hid[8] = word count. */
+            uint32_t addr = (uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                            ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24);
+            uint32_t n = req_hid[8];
+
+            if (n > 12U)
+            {
+                n = 12U;
+            }
+            for (uint32_t i = 0U; i < n; i++)
+            {
+                out[i] = *(volatile uint32_t *)(addr + i * 4U);
+            }
+            rc = (int8_t)n;
+            break;
+        }
+        case RTT_ACT_STATUS:
+        default:
+            break;
+        }
+
+        /* PEEK and RAW_RESULT fill out[] themselves; everything else reports
+         * the bridge status words. */
+        if ((req_hid[3] != RTT_ACT_PEEK) && (req_hid[3] != RTT_ACT_RAW_RESULT))
+        {
+            (void)rtt_bridge_status(out, 12U);
+            out[10] = (uint32_t)(int32_t)rtt_bridge_start_result();
+        }
+        res_hid[1] = 1U + 1U + 4U * 12U;
+        res_hid[2] = CMD_RTT;
+        res_hid[3] = (uint8_t)rc;
+        for (uint32_t i = 0U; i < 12U; i++)
+        {
+            res_hid[4U + i * 4U + 0U] = (uint8_t)(out[i] >> 0);
+            res_hid[4U + i * 4U + 1U] = (uint8_t)(out[i] >> 8);
+            res_hid[4U + i * 4U + 2U] = (uint8_t)(out[i] >> 16);
+            res_hid[4U + i * 4U + 3U] = (uint8_t)(out[i] >> 24);
+        }
     }
     break;
     case CMD_GET_MODEL:
