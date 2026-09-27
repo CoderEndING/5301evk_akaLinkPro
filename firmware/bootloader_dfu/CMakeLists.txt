@@ -56,6 +56,26 @@ sdk_linker_global_symbols("_flash_size=128K" "_noncacheable_size=256K")
 # Include CherryUSB DFU class
 sdk_inc($ENV{HPM_SDK_BASE}/middleware/cherryusb/class/dfu)
 
+# CherryUSB DFU class.
+# Older SDKs compile class/dfu/usbd_dfu.c into the SDK library when
+# CONFIG_USB_DEVICE_DFU is set; HPM SDK 1.11+ dropped that, so add the source
+# here only when the SDK lib does not already carry it. Our src/dfu_flash_port.c
+# implements both hook generations (dfu_*_flash/dfu_leave for CherryUSB >= 1.4,
+# usbd_dfu_read/write/reset for older classes).
+get_target_property(_boot_sdk_srcs ${HPM_SDK_LIB} SOURCES)
+set(_boot_has_usbd_dfu OFF)
+if(_boot_sdk_srcs)
+    foreach(_s ${_boot_sdk_srcs})
+        if(_s MATCHES "usbd_dfu")
+            set(_boot_has_usbd_dfu ON)
+        endif()
+    endforeach()
+endif()
+if(NOT _boot_has_usbd_dfu)
+    sdk_src($ENV{HPM_SDK_BASE}/middleware/cherryusb/class/dfu/usbd_dfu.c)
+endif()
+sdk_compile_definitions(-DUSBD_DFU_XFER_SIZE=4096)
+
 # Include paths
 sdk_inc(src)
 

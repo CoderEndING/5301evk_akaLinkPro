@@ -5,10 +5,19 @@
  * Bootloader DFU flash port.
  *
  * Replaces the SDK's middleware/cherryusb/port/hpmicro/hpm_dfu_port.c (which is
- * removed from the SDK library by CMakeLists.txt). Same behaviour, but every
- * erase/program/read is limited to [USBD_DFU_APP_DEFAULT_ADD, BOARD_DFU_WRITABLE_END):
- * the last two 4K flash sectors reserved for the APP parameter store can never
- * be touched by a DFU upgrade.
+ * removed from the SDK library by CMakeLists.txt). Every erase/program/read is
+ * limited to [USBD_DFU_APP_DEFAULT_ADD, BOARD_DFU_WRITABLE_END): the last two
+ * 4K flash sectors reserved for the APP parameter store can never be touched by
+ * a DFU upgrade.
+ *
+ * Two CherryUSB hook generations are implemented side by side; the class
+ * variant compiled into the firmware decides which pair is used:
+ *  - CherryUSB >= 1.4 (HPM SDK 1.11+): the DFU class keeps its own address
+ *    pointer (DfuSe SET-ADDRESS-POINTER command) and calls the weak hooks
+ *    dfu_erase_flash / dfu_write_flash / dfu_read_flash / dfu_leave with
+ *    absolute flash addresses.
+ *  - older CherryUSB: the class calls usbd_dfu_read / usbd_dfu_write /
+ *    usbd_dfu_reset with (block number, raw command buffer) arguments.
  */
 #include <stdio.h>
 #include <string.h>
@@ -23,6 +32,10 @@
 
 #ifndef USBD_DFU_APP_DEFAULT_ADD
 #define USBD_DFU_APP_DEFAULT_ADD 0x80020000
+#endif
+
+#ifndef USBD_DFU_XFER_SIZE
+#define USBD_DFU_XFER_SIZE 4096 /* must match wTransferSize in dfu_desc.c */
 #endif
 
 #ifndef DFU_XPI_NOR_BASE
@@ -46,7 +59,6 @@
 
 static xpi_nor_config_t s_dfu_xpi_nor_config;
 static bool s_dfu_xpi_nor_initialized = false;
-volatile uint32_t flash_start_address;
 
 static void dfu_flash_init(void)
 {
@@ -66,7 +78,7 @@ static void dfu_flash_init(void)
     }
 }
 
-static int dfu_erase_flash(uint32_t add)
+static int dfu_erase_flash_range(uint32_t add)
 {
     uint32_t sector_size;
     uint32_t addr_offset;
@@ -107,15 +119,87 @@ static int dfu_erase_flash(uint32_t add)
     return (status == status_success) ? 0 : 1;
 }
 
-int usbd_dfu_read(uint16_t value, const uint8_t *data, uint16_t length, uint16_t *actual_length)
+/* ---------------- CherryUSB DFU class hooks (weak overrides) ---------------- */
+
+uint16_t dfu_erase_flash(uint32_t add)
 {
-    uint32_t i = 0;
+    dfu_flash_init();
+    return (uint16_t)dfu_erase_flash_range(add);
+}
+
+uint16_t dfu_write_flash(uint8_t *src, uint8_t *dest, uint32_t len)
+{
+    dfu_flash_init();
+
+    if (!s_dfu_xpi_nor_initialized) {
+        return 1;
+    }
+
+    uint32_t addr = (uint32_t)dest;
+    if ((addr < USBD_DFU_APP_DEFAULT_ADD) || ((addr + len) > DFU_WRITABLE_END)) {
+        printf("ERROR!Address is out of range 0x%08x(0x%08x-0x%08x)\n", addr,
+               (unsigned int)USBD_DFU_APP_DEFAULT_ADD, (unsigned int)DFU_WRITABLE_END);
+        return 1;
+    }
+
+    uint32_t addr_offset = addr - (uint32_t)BOARD_FLASH_BASE_ADDRESS;
+    XPI_Type *base = (XPI_Type *)DFU_XPI_NOR_BASE;
+    xpi_xfer_channel_t chn = xpi_xfer_channel_auto;
+
+    disable_global_irq(CSR_MSTATUS_MIE_MASK);
+    hpm_stat_t status = rom_xpi_nor_program(base, chn, &s_dfu_xpi_nor_config,
+                                            (const uint32_t *)src, addr_offset, len);
+    enable_global_irq(CSR_MSTATUS_MIE_MASK);
+    __asm("fence.i");
+
+    return (status == status_success) ? 0 : 1;
+}
+
+uint8_t *dfu_read_flash(uint8_t *src, uint8_t *dest, uint32_t len)
+{
+    /* The DFU class only calls this with addresses handed out by the
+     * SET-ADDRESS-POINTER command; clamp reads to the writable APP region. */
+    uint32_t addr = (uint32_t)src;
+    if ((addr < USBD_DFU_APP_DEFAULT_ADD) || ((addr + len) > DFU_WRITABLE_END)) {
+        return dest;
+    }
 
     __asm("fence.i");
     l1c_dc_invalidate_all();
 
+    memcpy(dest, (const void *)addr, len);
+    return dest;
+}
+
+void dfu_leave(void)
+{
+    /* Firmware transfer complete: reset so the bootloader can validate the
+     * new APP image (signature + length + CRC32) and jump to it. */
+    ppor_sw_reset(HPM_PPOR, 24);
+    while (1) {
+    }
+}
+
+/* ------------------- CherryUSB < 1.4 hooks (old class) ------------------- */
+
+volatile uint32_t flash_start_address;
+
+/* CherryUSB renamed the DfuSe special commands; accept both spellings so the
+ * file builds against old and new class headers. */
+#ifndef DFU_CMD_SETADDRESSPOINTER
+#define DFU_CMD_SETADDRESSPOINTER DFU_SPECIAL_CMD_SET_ADDRESS_POINTER
+#endif
+#ifndef DFU_CMD_ERASE
+#define DFU_CMD_ERASE DFU_SPECIAL_CMD_ERASE
+#endif
+
+int usbd_dfu_read(uint16_t value, const uint8_t *data, uint16_t length, uint16_t *actual_length)
+{
+    __asm("fence.i");
+    l1c_dc_invalidate_all();
+
     if (value == 0) {
-        if (data[0] == DFU_SPECIAL_CMD_SET_ADDRESS_POINTER) {
+        if (data[0] == DFU_CMD_SETADDRESSPOINTER) {
             memcpy((uint8_t *)&flash_start_address, &data[1], 4);
             return 0;
         }
@@ -126,7 +210,7 @@ int usbd_dfu_read(uint16_t value, const uint8_t *data, uint16_t length, uint16_t
         }
         uint8_t *p = (uint8_t *)addr;
         uint8_t *buf = (uint8_t *)data;
-        for (i = 0; i < length; i++) {
+        for (uint32_t i = 0; i < length; i++) {
             buf[i] = p[i];
         }
         *actual_length = length;
@@ -145,12 +229,12 @@ int usbd_dfu_write(uint16_t value, const uint8_t *data, uint16_t length)
     }
 
     if (value == 0) {
-        if (data[0] == DFU_SPECIAL_CMD_SET_ADDRESS_POINTER) {
+        if (data[0] == DFU_CMD_SETADDRESSPOINTER) {
             memcpy((uint8_t *)&flash_start_address, &data[1], 4);
             return 0;
-        } else if (data[0] == DFU_SPECIAL_CMD_ERASE) {
+        } else if (data[0] == DFU_CMD_ERASE) {
             memcpy((uint8_t *)&flash_start_address, &data[1], 4);
-            return dfu_erase_flash(flash_start_address);
+            return dfu_erase_flash_range(flash_start_address);
         }
     } else if (value > 1) {
         uint32_t addr = (value - 2) * USBD_DFU_XFER_SIZE + flash_start_address;

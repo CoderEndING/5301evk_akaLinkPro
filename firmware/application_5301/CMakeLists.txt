@@ -28,9 +28,9 @@ set(CONFIG_USB_DEVICE_MSC 1)
 # Custom linker script for the APP (DFU) layout: it reserves the first 256 bytes
 # of the APP region for the integrity/version header so the code entry moves to
 # 0x80020100 (signature stays at 0x80020000). Must be set before find_package.
-if(NOT HPM_BUILD_TYPE STREQUAL "flash_xip")
-    set(CUSTOM_GCC_LINKER_FILE ${CMAKE_CURRENT_SOURCE_DIR}/linker/flash_dfu_app.ld)
-endif()
+# Always on: both the classic flash_dfu type (older SDKs) and the flash_xip
+# emulation below (HPM SDK 1.11+ removed flash_dfu) link through this script.
+set(CUSTOM_GCC_LINKER_FILE ${CMAKE_CURRENT_SOURCE_DIR}/linker/flash_dfu_app.ld)
 
 find_package(hpm-sdk REQUIRED HINTS $ENV{HPM_SDK_BASE})
 project(akaLinkPro_App)
@@ -47,6 +47,20 @@ sdk_ld_options("--specs=nano.specs")
 # CherryUSB config — pick up local usb_config.h
 sdk_compile_definitions(-D__INCLUDE_CHERRYUSB_CONFIG_H__)
 
+# Board-specific JTAG bit-bang assembly pin mapping.
+# hpm5301evklite wires the DAP target port to the J5 header: TCK=PA06,
+# TMS=PA07, TDI=PA05, TDO=PA04 (defaults are the akaLinkPro mapping).
+# The SWD blobs for this mapping are pre-generated and selected by
+# BOARD_SWD_BLOB_EVKLITE in boards/hpm5301evklite/board.h.
+if(BOARD STREQUAL "hpm5301evklite")
+    sdk_compile_definitions(
+        -DJTAG_PIN_JTCK_SHIFT=6
+        -DJTAG_PIN_JTMS_SHIFT=7
+        -DJTAG_PIN_JTDI_SHIFT=5
+        -DJTAG_PIN_JTDO_SHIFT=4
+    )
+endif()
+
 # UART2 clock: default 80 MHz (datasheet max), max baud 10 Mbps.
 # Uncomment the line below to overclock UART2 to 180 MHz (OUT OF SPEC) which
 # reaches 22.5 Mbps and makes 11.25/15/18 Mbps exactly representable.
@@ -61,6 +75,15 @@ sdk_compile_definitions(-D__INCLUDE_CHERRYUSB_CONFIG_H__)
 # the parameter store and must never be claimed by APP code/data.
 if(NOT HPM_BUILD_TYPE STREQUAL "flash_xip")
     sdk_linker_global_symbols("_dfu_bl_length=0x20000" "_flash_size=0xFE000")
+endif()
+
+# HPM SDK 1.11+ removed the flash_dfu build type. The evklite build scripts
+# pass -DHPM_BUILD_TYPE=flash_xip together with the custom linker script
+# above; override the SDK's FLASH_XIP=1 (no .nor_cfg_option in the APP image)
+# and define FLASH_DFU=1 so the .dfu_signature lands at 0x80020000.
+if(HPM_BUILD_TYPE STREQUAL "flash_xip")
+    sdk_linker_global_symbols("_dfu_bl_length=0x20000" "_flash_size=0xFE000")
+    sdk_compile_definitions(-DFLASH_XIP=0 -DFLASH_DFU=1)
 endif()
 
 # sdk_compile_definitions(-DCONFIG_NDEBUG_CONSOLE=1)
