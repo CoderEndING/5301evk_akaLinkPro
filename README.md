@@ -137,7 +137,7 @@ RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 
 | 目标停在复位默认 8 MHz（RTT 生产者在目标侧，此时封顶） | 277 KB/s |
 | `make rtt-test`（OpenOCD rtt server） | **919 KB/s** |
 | `make rtt-max`（轮询在 OpenOCD 内 + 32 位分块读 + 12 KB 环） | **1140 KB/s** |
-| **探针侧 RTT 桥**（`CMD_RTT` 0x31，固件自己轮询 RTT + CDC 转发） | **2954 KB/s（2.89 MB/s）零丢包** |
+| **探针侧 RTT 桥**（`CMD_RTT` 0x31，固件自己轮询 RTT + CDC 转发） | **2527 KB/s（2.47 MB/s）零丢包**；切到 60 MHz 档可到 **2954 KB/s（2.89 MB/s）** |
 
 ### 探针侧 RTT→CDC 桥
 
@@ -168,13 +168,14 @@ python script_test\rtt_probe_bridge.py COM52 6 36000   # 自动 boost 目标 + �
 
 | 量的是什么 | 数字 |
 | --- | --- |
-| SWD 侧（纯读目标 SRAM）@60 MHz | **3312 KB/s**（20/30/36/45 MHz 分别 1476/2053/2359/2788） |
+| SWD 侧（纯读目标 SRAM） | 20/30/36/45/60 MHz → 1476/2053/2359/2788/**3312** KB/s |
 | 桥的搬运（丢弃模式，不送 CDC）@60 MHz | 3232 KB/s |
-| 端到端（CDC 读走）@60 MHz，**当前默认** | **2954 KB/s，零丢包** |
+| 端到端（CDC 读走）@45 MHz（默认）/ @60 MHz | **2527** / **2954 KB/s，零丢包** |
 
 60 MHz 档原来做完整初始化会失败（换挡瞬态），已用「斜坡换挡 + 换挡后热身 + 失败先清
-sticky 错误再判死」修好，交付从 2512 → **2954 KB/s（+18%）**；现在瓶颈已转到 USB/CDC
-（丢弃 3232 vs 端到端 2954），详见
+sticky 错误再判死」修好；但它**长跑偶尔抖动**（约每 5~10 次 10 秒一次），所以默认仍取
+稳定的 45 MHz，想要极限速度可用 HID `CMD_RTT` action 7 切 60 MHz（固件带自动降档兜底）。
+现在 60 MHz 下的瓶颈已转到 USB/CDC（丢弃 3232 vs 端到端 2954），详见
 [`docs/HPM5301EVKLite_port.md` §5.8/§5.9](docs/HPM5301EVKLite_port.md#58-swd-读速-vs-rtt-交付率逐档对照表)。
 
 > ⚠️ 测交付率时主机侧读法影响极大：Windows 上 pyserial 的 `ser.read(n)` 会把主机侧压到

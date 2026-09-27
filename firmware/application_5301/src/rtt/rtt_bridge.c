@@ -33,11 +33,20 @@
 /* Debug port / AHB-AP 的寄存器与传输编码由官方 swd_host.c / debug_cm.h 负责，
  * 这里只留桥自己的配置常量。 */
 
-/* 桥默认的 SWD 时钟档。60 MHz 档在加上「斜坡换挡 + 换挡后热身 + 读失败先清
- * sticky 错误重试」之后已经可用：纯 SWD 读 3312 KB/s、交付 2956 KB/s（主机用
- * readinto 读时），比 45 MHz 档的 2519 KB/s 高 17%。启动时若这一档用不了，会沿
- * 45→36→30→20→10 自动往下找。 */
-#define RTT_SWD_CLOCK_HZ 60000000UL
+/* 桥默认的 SWD 时钟档。
+ *
+ * 60 MHz 档现在能用了（斜坡换挡 + 换挡后热身 + 失败先清 sticky 错误），纯读 3312 KB/s、
+ * 交付 2954 KB/s，比 45 MHz 快 17% —— **但它在长跑里不稳**：实测 3 次 x10 秒里有一次
+ * 出现 rd_err=10 / wr_err=4 / 2 次重扫，并伴随约 1400 字节的流异常；45 MHz 同样条件
+ * 3/3 次 0 错误。既然要求"全程零丢包"，默认取 45 MHz；想要极限速度可以用 HID CMD_RTT
+ * action 7 切到 60（此时下面的自动降档会在链路抖动时把它自己退回稳的档）。
+ *
+ * 启动时若这一档用不了，会沿 45→36→30→20→10 自动往下找。 */
+#define RTT_SWD_CLOCK_HZ 45000000UL
+
+/* 累计多少次重扫（读失败触发的重新搜索）就自动降一档。60 MHz 那种"能跑但偶尔抖动"
+ * 的档靠这个自己退回稳的档，而不是一直丢数据。 */
+#define RTT_RESCANS_PER_STEP_DOWN 2U
 
 /* SEGGER RTT layout (SEGGER_RTT.h): CB header 24 bytes, then per up-buffer
  * {name, pBuffer, SizeOfBuffer, WrOff, RdOff, Flags} = 24 bytes. */
@@ -101,6 +110,7 @@ static uint32_t s_swd_clock_hz = RTT_SWD_CLOCK_HZ;  /* 当前实际使用的档�
 static uint8_t s_discard;
 static uint8_t s_swd_ready;
 static uint8_t s_delay_override = 0xFFU; /* 0xFF = 用 Set_Clock_Delay() 的档位值 */
+static uint8_t s_rescans_since_step;     /* 攒够次数自动降档，见 rtt_bridge_poll */
 
 static uint32_t s_drained;
 static uint32_t s_polls;
@@ -434,6 +444,7 @@ int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel)
     s_zips = 0U;
     s_last_poll_bytes = 0U;
     s_rd_pending_valid = 0U;
+    s_rescans_since_step = 0U;
 
     int rc = -3;
     uint32_t req_hz = s_swd_clock_hz;
@@ -807,6 +818,18 @@ void rtt_bridge_poll(void)
                 }
                 s_backoff_until = now + (RTT_ERROR_BACKOFF_MS * (RTT_MCHTMR_HZ / 1000U));
                 return;
+            }
+            /* 重扫成功但**反复**需要重扫 = 这一档在抖（典型是 60 MHz：能跑，
+             * 但每十几秒来一次采样错误，会打断数据流）。攒够次数就自动降一档，
+             * 别一直丢数据。 */
+            if (++s_rescans_since_step >= RTT_RESCANS_PER_STEP_DOWN)
+            {
+                s_rescans_since_step = 0U;
+                if (rtt_clock_step_down())
+                {
+                    s_swd_ready = 0U;
+                    (void)rtt_swd_init();
+                }
             }
         }
         s_backoff_until = now + (RTT_ERROR_BACKOFF_MS * (RTT_MCHTMR_HZ / 1000U));
