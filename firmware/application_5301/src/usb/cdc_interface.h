@@ -4,8 +4,13 @@
 #ifndef __CDC_INTERFACE__
 #define __CDC_INTERFACE__
 
-#define PIN_UART_TX IOC_PAD_PA08
-#define PIN_UART_RX IOC_PAD_PA09
+#include "board.h"
+
+/* CDC VCOM bridge UART and its pins come from the board definition:
+ * akaLinkPro:     UART2 on PA08/PA09 (shared with JTAG TDI/TDO)
+ * hpm5301evklite: UART3 on PB15/PB14 (J3.8/J3.10, "UART_TXD/UART_RXD" silk) */
+#define PIN_UART_TX BOARD_PIN_UART_TXD
+#define PIN_UART_RX BOARD_PIN_UART_RXD
 
 #ifdef __cplusplus
 extern "C"
@@ -16,10 +21,14 @@ extern "C"
 
     void uartx_preinit(void);
 
-    /* PA08/PA09 -> UART2 (COM mode): DAP in SWD mode, disconnected or idle. */
+    /* VCOM pins -> the CDC UART (COM mode): DAP in SWD mode, disconnected or idle.
+     * On boards where the UART shares pins with JTAG TDI/TDO this muxes the pads
+     * back to the UART; on dedicated-pin boards it is nearly a no-op. */
     void uartx_enter_com_mode(void);
 
-    /* PA08/PA09 -> JTAG TDI/TDO FGPIO: DAP in JTAG mode. */
+    /* Hand the TDI/TDO pins to the JTAG engine. Only affects boards whose UART
+     * pins overlap the JTAG pins; the CDC COM port stays enumerated but does not
+     * carry data there. */
     void uartx_enter_jtag_mode(void);
 
     void usb2uart_handler(void);

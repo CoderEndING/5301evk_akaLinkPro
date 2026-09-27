@@ -288,10 +288,17 @@ DAP 硬件 I/O 引脚访问函数
 */
 __STATIC_INLINE void PORT_JTAG_SETUP(void)
 {
-    gpiom_config_pin_to_gpio0(IOC_PAD_PA10);
-    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA10), GPIO_GET_PIN_INDEX(IOC_PAD_PA10));
-    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA10), GPIO_GET_PIN_INDEX(IOC_PAD_PA10), 0);
+#ifdef BOARD_JTAG_PARK_PIN
+    gpiom_config_pin_to_gpio0(BOARD_JTAG_PARK_PIN);
+    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_JTAG_PARK_PIN), GPIO_GET_PIN_INDEX(BOARD_JTAG_PARK_PIN));
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_JTAG_PARK_PIN), GPIO_GET_PIN_INDEX(BOARD_JTAG_PARK_PIN), 0);
+#endif
 
+    /* Released level of the target reset line (board-specific polarity). */
+#ifndef BOARD_NRESET_ACTIVE_LOW
+#define BOARD_NRESET_ACTIVE_LOW (0)
+#endif
+#define NRESET_RELEASE_LEVEL (BOARD_NRESET_ACTIVE_LOW ? 1U : 0U)
 
     // 设置 IO 由 FGPIO 驱动
     gpiom_config_pin_to_fgpio(BOARD_PIN_JTCK);
@@ -299,10 +306,14 @@ __STATIC_INLINE void PORT_JTAG_SETUP(void)
     gpiom_config_pin_to_fgpio(BOARD_PIN_JTDO);
     gpiom_config_pin_to_fgpio(BOARD_PIN_JTDI);
     gpiom_config_pin_to_fgpio(BOARD_PIN_JTMS);
-    
+
     gpiom_config_pin_to_gpio0(BOARD_PIN_nRESET);
+#if BOARD_HAS_SWDIO_DIR
     gpiom_config_pin_to_gpio0(BOARD_PIN_JTMS_DIR);
+#endif
+#if BOARD_HAS_JTRST
     gpiom_config_pin_to_gpio0(BOARD_PIN_JTRST);
+#endif
 
     // 设置输入输出模式
     gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTCK), GPIO_GET_PIN_INDEX(BOARD_PIN_JTCK));
@@ -310,21 +321,32 @@ __STATIC_INLINE void PORT_JTAG_SETUP(void)
     gpio_set_pin_input(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDO), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDO));
     gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDI), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDI));
     gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS));
-    
-    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_DIR), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_DIR));
+
     gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET));
+#if BOARD_HAS_SWDIO_DIR
+    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_DIR), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_DIR));
+#endif
+#if BOARD_HAS_JTRST
     gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTRST), GPIO_GET_PIN_INDEX(BOARD_PIN_JTRST));
+#endif
 
     // 设置默认输出电平
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTCK), GPIO_GET_PIN_INDEX(BOARD_PIN_JTCK), 1);
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS), 1);
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDI), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDI), 1);
 
+#if BOARD_HAS_SWDIO_DIR
     gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_DIR), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_DIR), 1); // output
-    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET), 0);
+#endif
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET), NRESET_RELEASE_LEVEL);
+#if BOARD_HAS_JTRST
     gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTRST), GPIO_GET_PIN_INDEX(BOARD_PIN_JTRST), 1);
+#endif
 
-    /* JTAG owns PA08(TDI)/PA09(TDO); the CDC COM port is muted. */
+#undef NRESET_RELEASE_LEVEL
+
+    /* JTAG owns the TDI/TDO pins (akaLinkPro: shared with UART2); the CDC
+     * COM port is muted on boards where they overlap. */
     uartx_enter_jtag_mode();
 }
 
@@ -339,39 +361,55 @@ __STATIC_INLINE void PORT_SWD_SETUP(void)
     gpiom_config_pin_to_fgpio(BOARD_PIN_JTCK);
     gpiom_config_pin_to_fgpio(BOARD_PIN_JTMS);
     // gpiom_config_pin_to_fgpio(BOARD_PIN_JTMS_OUT);
+#if BOARD_HAS_SWDIO_DIR
     gpiom_config_pin_to_fgpio(BOARD_PIN_JTMS_DIR);
+#endif
 
     gpiom_config_pin_to_gpio0(BOARD_PIN_nRESET);
+#if BOARD_HAS_JTRST
     gpiom_config_pin_to_gpio0(BOARD_PIN_JTRST);
-    /* NOTE: SWD does not use TDI/TDO. PA08/PA09 are kept as UART2 for the CDC
-     * COM port; do NOT reconfigure them here. Re-poking them on every
-     * DAP_Connect() injects glitches into the running UART2 and loses data
-     * (and then uartx_enter_com_mode() would have to flush the RX FIFO). */
-    // gpiom_config_pin_to_gpio0(BOARD_PIN_JTDO);
-    // gpiom_config_pin_to_gpio0(BOARD_PIN_JTDI);
+#endif
+#if !BOARD_UART2_SHARES_JTAG_PINS
+    /* UART2 lives on its own pins (PB08/PB09): TDI/TDO can be parked for SWD
+     * without disturbing the CDC COM port. */
+    gpiom_config_pin_to_fgpio(BOARD_PIN_JTDO);
+    gpiom_config_pin_to_fgpio(BOARD_PIN_JTDI);
+#endif
 
     // 设置输入输出模式
     gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTCK), GPIO_GET_PIN_INDEX(BOARD_PIN_JTCK));
     // gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_OUT), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_OUT));
+#if BOARD_HAS_SWDIO_DIR
     gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_DIR), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_DIR));
+#endif
     gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS));
 
     gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET));
+#if BOARD_HAS_JTRST
     gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTRST), GPIO_GET_PIN_INDEX(BOARD_PIN_JTRST));
-    // gpio_set_pin_input(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDO), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDO));
-    // gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDI), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDI));
+#endif
+#if !BOARD_UART2_SHARES_JTAG_PINS
+    gpio_set_pin_input(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDO), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDO));
+    gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDI), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDI));
+#endif
 
     // 设置默认输出电平
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTCK), GPIO_GET_PIN_INDEX(BOARD_PIN_JTCK), 1);
+#if BOARD_HAS_SWDIO_DIR
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_DIR), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_DIR), 1);
+#endif
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS), 1);
 
-    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET), 0);
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET), (BOARD_NRESET_ACTIVE_LOW ? 1U : 0U));
+#if BOARD_HAS_JTRST
     gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTRST), GPIO_GET_PIN_INDEX(BOARD_PIN_JTRST), 1);
-    // gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDI), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDI), 1);
+#endif
+#if !BOARD_UART2_SHARES_JTAG_PINS
+    gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTDI), GPIO_GET_PIN_INDEX(BOARD_PIN_JTDI), 1);
+#endif
 
-    /* Make sure PA08/PA09 are on UART2 (no-op if already, and no FIFO flush in
-     * that case). */
+    /* Make sure the UART2 pins are on UART2 (no-op if already, and no FIFO
+     * flush in that case). */
     uartx_enter_com_mode();
 }
 
@@ -475,7 +513,9 @@ __STATIC_FORCEINLINE void PIN_SWDIO_OUT(uint32_t bit)
 __STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void)
 {
     gpio_set_pin_output(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS));
+#if BOARD_HAS_SWDIO_DIR
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_DIR), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_DIR), 1);
+#endif
 }
 
 /** SWDIO I/O 引脚：切换到输入模式（仅在 SWD 模式下使用）。
@@ -485,7 +525,9 @@ __STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void)
 __STATIC_FORCEINLINE void PIN_SWDIO_OUT_DISABLE(void)
 {
     gpio_set_pin_input(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS));
+#if BOARD_HAS_SWDIO_DIR
     gpio_write_pin(HPM_FGPIO, GPIO_GET_PORT_INDEX(BOARD_PIN_JTMS_DIR), GPIO_GET_PIN_INDEX(BOARD_PIN_JTMS_DIR), 0);
+#endif
 }
 
 // TDI 引脚 I/O ---------------------------------------------
@@ -523,7 +565,11 @@ __STATIC_FORCEINLINE uint32_t PIN_TDO_IN(void)
 */
 __STATIC_FORCEINLINE uint32_t PIN_nTRST_IN(void)
 {
+#if BOARD_HAS_JTRST
     return (gpio_get_pin_output_status(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTRST), GPIO_GET_PIN_INDEX(BOARD_PIN_JTRST)));
+#else
+    return (1U);
+#endif
 }
 
 /** nTRST I/O 引脚：设置输出。
@@ -533,17 +579,28 @@ __STATIC_FORCEINLINE uint32_t PIN_nTRST_IN(void)
 */
 __STATIC_FORCEINLINE void PIN_nTRST_OUT(uint32_t bit)
 {
+#if BOARD_HAS_JTRST
     gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_JTRST), GPIO_GET_PIN_INDEX(BOARD_PIN_JTRST), (bit & 0x01));
+#else
+    (void)bit;
+#endif
 }
 
 // nRESET 引脚 I/O ------------------------------------------
 
 /** nRESET I/O 引脚：获取输入。
-\return nRESET DAP 硬件 I/O 引脚的当前状态。
+\return nRESET DAP 硬件 I/O 引脚的当前状态（1 = 复位已释放）。
 */
 __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN(void)
 {
-    return (!gpio_get_pin_output_status(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET)));
+    uint32_t level = gpio_get_pin_output_status(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET));
+#if BOARD_NRESET_ACTIVE_LOW
+    /* Direct wire: pin high = reset released. */
+    return (level);
+#else
+    /* Inverted drive (transistor): pin low = reset released. */
+    return (!level);
+#endif
 }
 
 /** nRESET I/O 引脚：设置输出。
@@ -553,7 +610,13 @@ __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN(void)
 */
 __STATIC_FORCEINLINE void PIN_nRESET_OUT(uint32_t bit)
 {
-    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET), !bit);
+#if BOARD_NRESET_ACTIVE_LOW
+    /* Direct wire, active low: released = drive high. */
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET), (bit & 0x01));
+#else
+    /* Inverted drive: released = drive low. */
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_PIN_nRESET), GPIO_GET_PIN_INDEX(BOARD_PIN_nRESET), !(bit & 0x01));
+#endif
 }
 
 ///@}
@@ -629,8 +692,9 @@ CMSIS-DAP 硬件 I/O 和 LED 引脚通过函数 \ref DAP_SETUP 进行初始化�
 */
 __STATIC_INLINE void DAP_SETUP(void)
 {
-    HPM_IOC->PAD[IOC_PAD_PA10].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
-    HPM_IOC->PAD[IOC_PAD_PA10].PAD_CTL =
+#ifdef BOARD_JTAG_PARK_PIN
+    HPM_IOC->PAD[BOARD_JTAG_PARK_PIN].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+    HPM_IOC->PAD[BOARD_JTAG_PARK_PIN].PAD_CTL =
         IOC_PAD_PAD_CTL_HYS_SET(0) | // 施密特触发器 失效
         IOC_PAD_PAD_CTL_PRS_SET(0) | // 上下拉强度 100k
         IOC_PAD_PAD_CTL_PS_SET(0) |  // 下拉
@@ -640,17 +704,22 @@ __STATIC_INLINE void DAP_SETUP(void)
         IOC_PAD_PAD_CTL_SR_SET(1) |  // 压摆率 快速
         IOC_PAD_PAD_CTL_SPD_SET(3) | // 最快压摆率
         IOC_PAD_PAD_CTL_DS_SET(4);   // 驱动能力 39 ohm(3.3V)
+#endif
 
 
     // 配置 IOC->PAD[FUNC_CTL] 为 GPIO
     HPM_IOC->PAD[BOARD_PIN_JTCK].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
     HPM_IOC->PAD[BOARD_PIN_JTMS].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
     // HPM_IOC->PAD[BOARD_PIN_JTMS_OUT].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+#if BOARD_HAS_SWDIO_DIR
     HPM_IOC->PAD[BOARD_PIN_JTMS_DIR].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+#endif
     HPM_IOC->PAD[BOARD_PIN_nRESET].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
     HPM_IOC->PAD[BOARD_PIN_JTDO].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
     HPM_IOC->PAD[BOARD_PIN_JTDI].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+#if BOARD_HAS_JTRST
     HPM_IOC->PAD[BOARD_PIN_JTRST].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+#endif
 
     // 配置 IOC->PAD[PAD_CTL]
     HPM_IOC->PAD[BOARD_PIN_JTCK].PAD_CTL =
@@ -683,6 +752,7 @@ __STATIC_INLINE void DAP_SETUP(void)
     //     IOC_PAD_PAD_CTL_SR_SET(1) |  // 压摆率 快速
     //     IOC_PAD_PAD_CTL_SPD_SET(3) | // 最快压摆率
     //     IOC_PAD_PAD_CTL_DS_SET(4);   // 驱动能力 39 ohm(3.3V)
+#if BOARD_HAS_SWDIO_DIR
     HPM_IOC->PAD[BOARD_PIN_JTMS_DIR].PAD_CTL =
         IOC_PAD_PAD_CTL_HYS_SET(0) | // 施密特触发器 失效
         IOC_PAD_PAD_CTL_PRS_SET(0) | // 上下拉强度 100k
@@ -693,11 +763,19 @@ __STATIC_INLINE void DAP_SETUP(void)
         IOC_PAD_PAD_CTL_SR_SET(1) |  // 压摆率 快速
         IOC_PAD_PAD_CTL_SPD_SET(3) | // 最快压摆率
         IOC_PAD_PAD_CTL_DS_SET(4);   // 驱动能力 39 ohm(3.3V)
+#endif
+    /* nRESET idle level = released: direct-wire boards (active low) idle high
+     * with pull-up; inverted-drive boards idle low with pull-down. */
     HPM_IOC->PAD[BOARD_PIN_nRESET].PAD_CTL =
         IOC_PAD_PAD_CTL_HYS_SET(0) | // 施密特触发器 失效
         IOC_PAD_PAD_CTL_PRS_SET(0) | // 上下拉强度 100k
+#if BOARD_NRESET_ACTIVE_LOW
+        IOC_PAD_PAD_CTL_PS_SET(1) |  // 上拉
+        IOC_PAD_PAD_CTL_PE_SET(1) |  // 上拉使能
+#else
         IOC_PAD_PAD_CTL_PS_SET(0) |  // 下拉
         IOC_PAD_PAD_CTL_PE_SET(1) |  // 下拉使能
+#endif
         IOC_PAD_PAD_CTL_KE_SET(0) |  // 保持能力 失效
         IOC_PAD_PAD_CTL_OD_SET(0) |  // 开漏输出 失效
         IOC_PAD_PAD_CTL_SR_SET(0) |  // 压摆率 慢速
@@ -723,6 +801,7 @@ __STATIC_INLINE void DAP_SETUP(void)
         IOC_PAD_PAD_CTL_SR_SET(1) |  // 压摆率 快速
         IOC_PAD_PAD_CTL_SPD_SET(3) | // 最快压摆率
         IOC_PAD_PAD_CTL_DS_SET(4);   // 驱动能力 39 ohm(3.3V)
+#if BOARD_HAS_JTRST
     HPM_IOC->PAD[BOARD_PIN_JTRST].PAD_CTL =
         IOC_PAD_PAD_CTL_HYS_SET(0) | // 施密特触发器 失效
         IOC_PAD_PAD_CTL_PRS_SET(0) | // 上下拉强度 100k
@@ -733,6 +812,7 @@ __STATIC_INLINE void DAP_SETUP(void)
         IOC_PAD_PAD_CTL_SR_SET(1) |  // 压摆率 快速
         IOC_PAD_PAD_CTL_SPD_SET(3) | // 最快压摆率
         IOC_PAD_PAD_CTL_DS_SET(4);   // 驱动能力 39 ohm(3.3V)
+#endif
 }
 
 /** 使用自定义特定的 I/O 引脚或命令序列复位目标设备。

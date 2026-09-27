@@ -94,6 +94,13 @@
 
 #define BOARD_PIN_UART_TXD      IOC_PAD_PA08
 #define BOARD_PIN_UART_RXD      IOC_PAD_PA09
+#define BOARD_UART_TX_FUNC      IOC_PA08_FUNC_CTL_UART2_TXD
+#define BOARD_UART_RX_FUNC      IOC_PA09_FUNC_CTL_UART2_RXD
+#define BOARD_CDC_UART_BASE     HPM_UART2
+#define BOARD_CDC_UART_IRQ      IRQn_UART2
+#define BOARD_CDC_UART_CLK_NAME clock_uart2
+#define BOARD_CDC_UART_RX_DMA   HPM_DMA_SRC_UART2_RX
+#define BOARD_CDC_UART_TX_DMA   HPM_DMA_SRC_UART2_TX
 
 #define BOARD_PIN_JTCK          IOC_PAD_PA27
 #define BOARD_PIN_JTMS          IOC_PAD_PA28
@@ -104,10 +111,40 @@
 #define BOARD_PIN_JTRST         IOC_PAD_PA31
 #define BOARD_PIN_nRESET        IOC_PAD_PA26
 
+#define BOARD_LED1_PIN          IOC_PAD_PB11
+#define BOARD_LED2_PIN          IOC_PAD_PB12
 
 #define PIN_GPIOM_BASE    HPM_GPIOM
 #define PIN_GPIO          HPM_FGPIO
 #define PIN_GPIOM         gpiom_core0_fast
+
+/* ------------------------------------------------------------------ */
+/* Board feature flags consumed by the shared application sources.     */
+/* (akaLinkPro hardware: external level shifter + JTAG/SWD mux)        */
+/* ------------------------------------------------------------------ */
+/* SWD bit-bang blobs use the akaLinkPro pin mapping (SWCLK=PA27/SWDIO=PA28). */
+#define BOARD_SWD_BLOB_EVKLITE (0)
+/* SWDIO is level-shifted: PA30 controls the buffer direction. */
+#define BOARD_HAS_SWDIO_DIR (1)
+/* Dedicated nTRST output on PA31. */
+#define BOARD_HAS_JTRST (1)
+/* nRESET (PA26) drives the target reset through an inverting transistor,
+ * so the firmware-level polarity is inverted (release = drive low). */
+#define BOARD_NRESET_ACTIVE_LOW (0)
+/* 5V level-shifter supply on PB13 and VREF divider on PB10 (ADC0.2). */
+#define BOARD_HAS_5V_EN (1)
+#define BOARD_HAS_VREF_ADC (1)
+/* LEDs PB11/PB12 are active high. */
+#define BOARD_LED_ACTIVE_LOW (0)
+/* UART2 (PA08/PA09) shares the pins with JTAG TDI/TDO. */
+#define BOARD_UART2_SHARES_JTAG_PINS (1)
+/* PA10 is parked (output low) while the JTAG engine owns the pads. */
+#define BOARD_JTAG_PARK_PIN IOC_PAD_PA10
+/* No long-press DFU entry on this board (dedicated DFU pin instead). */
+#define BOARD_HAS_USER_KEY_DFU (0)
+/* DTR/RTS nets exist on the schematic but are not driven by default. */
+#define BOARD_UART_DTR_PAD (IOC_PAD_PA06)
+#define BOARD_UART_RTS_PAD (IOC_PAD_PA07)
 
 
 #if defined(__cplusplus)

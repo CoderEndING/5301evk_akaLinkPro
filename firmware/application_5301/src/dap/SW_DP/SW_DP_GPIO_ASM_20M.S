@@ -13,9 +13,21 @@
 .equ FGPIO_OE_SET_OFFSET,       (0x204)
 .equ FGPIO_OE_CLR_OFFSET,       (0x208)
 
-.equ SWCLK_SHIFT,               (27)
-.equ SWDIO_SHIFT,               (28)
-.equ SWDIR_SHIFT,               (30)
+#ifndef SWD_PIN_SWCLK_SHIFT
+#define SWD_PIN_SWCLK_SHIFT 27
+#endif
+#ifndef SWD_PIN_SWDIO_SHIFT
+#define SWD_PIN_SWDIO_SHIFT 28
+#endif
+#ifndef SWD_PIN_SWDIR_SHIFT
+#define SWD_PIN_SWDIR_SHIFT 30
+#endif
+/* Default pin mapping: akaLinkPro (SWCLK=PA27, SWDIO=PA28, SWDIR=PA30).
+ * Other boards override the shifts via -D at build time, e.g.
+ * hpm5301evklite: SWCLK=PA06, SWDIO=PA07, SWDIR unused (=PA30). */
+.equ SWCLK_SHIFT,               (SWD_PIN_SWCLK_SHIFT)
+.equ SWDIO_SHIFT,               (SWD_PIN_SWDIO_SHIFT)
+.equ SWDIR_SHIFT,               (SWD_PIN_SWDIR_SHIFT)
 
 .equ SWCLK_OFFSET,              (1 << SWCLK_SHIFT)
 .equ SWDIO_OFFSET,              (1 << SWDIO_SHIFT)

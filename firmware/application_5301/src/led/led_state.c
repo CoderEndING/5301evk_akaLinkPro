@@ -10,11 +10,21 @@
 #include "led_state.h"
 #include "api_param.h"
 
-/* LED pins (active high): LED1 blue = PB11, LED2 yellow = PB12. */
-#define LED1_PIN IOC_PAD_PB11
-#define LED2_PIN IOC_PAD_PB12
+/* LED pins come from the board definition.
+ * akaLinkPro: LED1 blue = PB11, LED2 yellow = PB12 (active high).
+ * hpm5301evklite: single board LED on PA10 (active low). */
+#define LED1_PIN BOARD_LED1_PIN
+#define LED2_PIN BOARD_LED2_PIN
 
-/* External reference is divided by two 10k resistors on PB10 (ADC0.2). */
+#ifndef BOARD_LED_ACTIVE_LOW
+#define BOARD_LED_ACTIVE_LOW (0)
+#endif
+#ifndef BOARD_HAS_VREF_ADC
+#define BOARD_HAS_VREF_ADC (1)
+#endif
+
+/* External reference is divided by two 10k resistors on PB10 (ADC0.2).
+ * akaLinkPro only: no such divider exists on hpm5301evklite. */
 #define LED_ADC_PIN IOC_PAD_PB10
 #define LED_ADC_BASE HPM_ADC0
 #define LED_ADC_CH (2U)
@@ -51,7 +61,12 @@ static volatile uint16_t s_external_mv;
 
 static void led_write(uint16_t pin, uint8_t on)
 {
+    /* Board LEDs may be active low (hpm5301evklite PA10) or active high. */
+#if BOARD_LED_ACTIVE_LOW
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(pin), GPIO_GET_PIN_INDEX(pin), on ? 0U : 1U);
+#else
     gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(pin), GPIO_GET_PIN_INDEX(pin), on ? 1U : 0U);
+#endif
 }
 
 void led_state_set_dap_running(uint8_t on)
@@ -87,6 +102,7 @@ uint16_t led_state_get_external_mv(void)
 
 static void led_adc_init(void)
 {
+#if BOARD_HAS_VREF_ADC
     adc16_config_t cfg;
     adc16_channel_config_t ch_cfg;
 
@@ -117,6 +133,10 @@ static void led_adc_init(void)
 #endif
 
     s_adc_ready = 1U;
+#else
+    /* No external VREF divider on this board: keep s_adc_ready = 0 so the
+     * LED_MODE_VREF evaluation is bypassed. */
+#endif
 }
 
 /* Sample the divided reference and update the mode-5 state with hysteresis:

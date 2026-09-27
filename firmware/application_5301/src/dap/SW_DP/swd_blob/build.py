@@ -61,6 +61,7 @@ class Builder:
         self.toolchain_dir = args.toolchain
         self.src = args.src
         self.clean = args.clean
+        self.defines = args.define
         self.build_dir = Path("build")
         self.src_path = Path(self.src)
 
@@ -116,6 +117,7 @@ class Builder:
             "-c",
             "-mno-plt",
             "-mno-relax",
+        ] + [d if d.startswith("-D") else "-D" + d for d in self.defines] + [
             str(self.src_path),
             "-o", str(self.obj)
         ]
@@ -329,6 +331,8 @@ def main():
     parser.add_argument("--toolchain", help="RISC-V 工具链 bin 目录路径")
     parser.add_argument("--src", default=DEFAULT_SRC,
                         help="汇编源文件路径 (支持 $(VARIANT) 占位符)")
+    parser.add_argument("--define", action="append", default=[],
+                        help="额外的 -D 宏定义 (可多次指定), 例如引脚映射: -D SWD_PIN_SWCLK_SHIFT=6")
     parser.add_argument("--clean", action="store_true", help="清理 build 目录")
     args = parser.parse_args()
 

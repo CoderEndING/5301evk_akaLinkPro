@@ -54,10 +54,16 @@
 const api_param_t g_param_default = {
     .magic_number = PARAM_MAGIC_NUMBER,
     .output_mode = 0,
-    .usb5v_out_mode = 1, /* level-shifter supply, on by default */
+    .usb5v_out_mode = 1, /* level-shifter supply, on by default (no-op boards without one) */
     .clock_accel_mode = 0,
     .led1_mode = LED_MODE_POWER, /* LED1: debugger power, always on */
+#if BOARD_HAS_VREF_ADC
     .led2_mode = LED_MODE_VREF,  /* LED2: external reference detection */
+#else
+    /* No VREF divider on this board: keep LED2 dark. Both LED modes drive
+     * the same single LED there, so LED1 keeps priority. */
+    .led2_mode = LED_MODE_OFF,
+#endif
     .vref_mv = 3300,
 };
 

@@ -30,6 +30,16 @@
 #include "SW_DP.h"
 #include "hpm_common.h"
 
+/* SWD bit-bang engines ship as position-independent machine-code blobs.
+ * The blobs embed the GPIO bit numbers of the SWCLK/SWDIO pins, so each board
+ * pin mapping needs its own pre-generated set:
+ *  - akaLinkPro (default): SWCLK=PA27, SWDIO=PA28, arrays below.
+ *  - hpm5301evklite: SWCLK=PA06, SWDIO=PA07, arrays in swd_blob_evklite.h
+ *    (regenerate via src/dap/SW_DP/swd_blob/build.py --define ...).
+ */
+#if BOARD_SWD_BLOB_EVKLITE
+#include "swd_blob_evklite.h"
+#else
 #define SWJ_SEQUENCE_OFFSET_60M 0x00000000
 #define SWD_WRITE_OFFSET_60M 0x000000fc
 #define SWD_READ_OFFSET_60M 0x0000053c
@@ -1379,6 +1389,8 @@ const uint8_t swd_func_slow[3096] =
     0x72, 0x10, 0x01, 0x00, 0x01, 0x00, 0xEF, 0xF0, 0xAF, 0xBF, 0x23, 0xA2, 0xC2, 0x11, 0x23, 0xA2,
     0xC2, 0x21, 0x82, 0x40, 0x11, 0x01, 0x82, 0x80,
 };
+#endif /* BOARD_SWD_BLOB_EVKLITE */
+
 // clang-format on
 
 // SWD Dynamic load buffer

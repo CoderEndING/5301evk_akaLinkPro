@@ -17,10 +17,30 @@
 #include "led_state.h"
 #include "api_param.h"
 
-#define UART_BASE HPM_UART2
-#define UART_IRQ IRQn_UART2
-#define UART_CLK_NAME clock_uart2
-#define UART_RX_DMA HPM_DMA_SRC_UART2_RX
+/* CDC VCOM bridge UART instance - selected per board via board.h
+ * (akaLinkPro: UART2 on PA08/PA09; hpm5301evklite: UART3 on PB15/PB14,
+ * the pins labelled UART_TXD/UART_RXD on the J3 header). */
+#ifndef BOARD_CDC_UART_BASE
+#define BOARD_CDC_UART_BASE HPM_UART2
+#endif
+#ifndef BOARD_CDC_UART_IRQ
+#define BOARD_CDC_UART_IRQ IRQn_UART2
+#endif
+#ifndef BOARD_CDC_UART_CLK_NAME
+#define BOARD_CDC_UART_CLK_NAME clock_uart2
+#endif
+#ifndef BOARD_CDC_UART_RX_DMA
+#define BOARD_CDC_UART_RX_DMA HPM_DMA_SRC_UART2_RX
+#endif
+#ifndef BOARD_CDC_UART_TX_DMA
+#define BOARD_CDC_UART_TX_DMA HPM_DMA_SRC_UART2_TX
+#endif
+
+#define UART_BASE BOARD_CDC_UART_BASE
+#define UART_IRQ BOARD_CDC_UART_IRQ
+#define UART_CLK_NAME BOARD_CDC_UART_CLK_NAME
+#define UART_RX_DMA BOARD_CDC_UART_RX_DMA
+#define UART_TX_DMA BOARD_CDC_UART_TX_DMA
 #define UART_RX_DMA_RESOURCE_INDEX (0U)
 /* Single RX buffer, DMAV2 infinite-loop. The periodic flush timer drains it
  * into g_uartrx, so it only needs to cover the (short) IRQ latency caused by
@@ -45,7 +65,7 @@
 #define UART_FLUSH_MAX_US (10000U)
 #define UART_FLUSH_DEFAULT_US (1000U)
 
-#define UART_TX_DMA HPM_DMA_SRC_UART2_TX
+#define UART_TX_DMA BOARD_CDC_UART_TX_DMA
 #define UART_TX_DMA_RESOURCE_INDEX (1U)
 // #define UART_TX_DMA_BUFFER_SIZE    (8192U)
 
@@ -80,7 +100,10 @@
 /* Number of bytes of the single RX buffer that were already copied into
  * g_uartrx. Reset whenever the RX DMA is restarted. */
 static volatile uint32_t rb_write_pos = 0;
-/* 1 = PA08/PA09 are muxed to UART2 (COM mode), 0 = JTAG owns the pins. */
+
+
+/* 1 = the VCOM pins are muxed to UART2 (COM mode), 0 = JTAG owns the pins
+ * (only possible on boards where UART2 shares the JTAG pins). */
 static volatile uint8_t s_uart2_com_mode = 0;
 ATTR_PLACE_AT_NONCACHEABLE_BSS_WITH_ALIGNMENT(4)
 uint8_t uart_rx_buf[UART_RX_DMA_BUFFER_SIZE];
@@ -302,22 +325,22 @@ void usb2uart_handler(void)
     restore_global_irq(level);
 }
 
-/* Mux PA08 (TXD) / PA09 (RXD) to the UART2 alternate function. */
+/* Mux the VCOM pins (TXD/RXD) to the UART2 alternate function. */
 static void uartx_mux_to_uart(void)
 {
-    HPM_IOC->PAD[PIN_UART_RX].FUNC_CTL = IOC_PA09_FUNC_CTL_UART2_RXD;
-    HPM_IOC->PAD[PIN_UART_TX].FUNC_CTL = IOC_PA08_FUNC_CTL_UART2_TXD;
+    HPM_IOC->PAD[PIN_UART_RX].FUNC_CTL = BOARD_UART_RX_FUNC;
+    HPM_IOC->PAD[PIN_UART_TX].FUNC_CTL = BOARD_UART_TX_FUNC;
 }
 
-/* Switch PA08/PA09 to UART2 so the CDC COM port works.
+/* Switch the VCOM pins to UART2 so the CDC COM port works.
  * Used when the DAP is in SWD mode, disconnected, or idle. */
 void uartx_enter_com_mode(void)
 {
     uint32_t level = disable_global_irq(CSR_MSTATUS_MIE_MASK);
 
-    /* output_mode 1 = SWD+JTAG: VCOM is unavailable, PA08/09 stay reserved for
-     * JTAG TDI/TDO and must not be muxed to UART2. */
-    if (g_param.output_mode != 0U)
+    /* output_mode 1 = SWD+JTAG: on boards where UART2 shares pins with JTAG
+     * TDI/TDO the VCOM is unavailable and the pins stay reserved for JTAG. */
+    if (BOARD_UART2_SHARES_JTAG_PINS && (g_param.output_mode != 0U))
     {
         s_uart2_com_mode = 0;
         restore_global_irq(level);
@@ -340,10 +363,12 @@ void uartx_enter_com_mode(void)
     restore_global_irq(level);
 }
 
-/* Give PA08/PA09 back to the JTAG engine (TDI/TDO as FGPIO).
- * The CDC COM port stays enumerated but no longer carries data. */
+/* Give the TDI/TDO pins back to the JTAG engine (as FGPIO).
+ * Only meaningful when the UART2 pins overlap the JTAG pins (akaLinkPro);
+ * on dedicated-pin boards (hpm5301evklite) the CDC COM port keeps running. */
 void uartx_enter_jtag_mode(void)
 {
+#if BOARD_UART2_SHARES_JTAG_PINS
     uint32_t level = disable_global_irq(CSR_MSTATUS_MIE_MASK);
     /* Detach the pads from UART2 and hand them to the (F)GPIO path. The JTAG
      * code configures the GPIO direction/controller, but the pad function must
@@ -354,23 +379,29 @@ void uartx_enter_jtag_mode(void)
     uart_reset_rx_fifo(UART_BASE);
     uart_reset_tx_fifo(UART_BASE);
     restore_global_irq(level);
+#else
+    /* UART2 owns dedicated pins: nothing to release, VCOM keeps working. */
+#endif
 }
 
 void uartx_io_init(void)
 {
-    PIN_UART_DTR = IOC_PAD_PA06;
-    PIN_UART_RTS = IOC_PAD_PA07;
+    PIN_UART_DTR = BOARD_UART_DTR_PAD;
+    PIN_UART_RTS = BOARD_UART_RTS_PAD;
 
-    /* Default state: in VCOM mode UART2 owns PA08/PA09; in SWD+JTAG mode the
-     * pads are left for JTAG TDI/TDO and the bridge stays disabled. */
-    if (g_param.output_mode == 0U)
+    /* Default state: the VCOM UART owns its pins unless they are shared with
+     * the JTAG TDI/TDO pins (akaLinkPro) and the DAP is in SWD+JTAG mode. On
+     * boards with dedicated UART pins the bridge must always come up, whatever
+     * the DAP output mode is - otherwise selecting JTAG mode would silently
+     * kill the COM port until the next DAP_Connect(). */
+    if (BOARD_UART2_SHARES_JTAG_PINS && (g_param.output_mode != 0U))
     {
-        uartx_mux_to_uart();
-        s_uart2_com_mode = 1;
+        s_uart2_com_mode = 0;
     }
     else
     {
-        s_uart2_com_mode = 0;
+        uartx_mux_to_uart();
+        s_uart2_com_mode = 1;
     }
 
 #if UART2_DRIVE_DTR_RTS

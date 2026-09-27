@@ -28,10 +28,25 @@
 .equ FGPIO_DO_SET_OFFSET,       (0x104)
 .equ FGPIO_DO_CLR_OFFSET,       (0x108)
 
-.equ JTCK_SHIFT,                (27)
-.equ JTMS_SHIFT,                (28)
-.equ JTDI_SHIFT,                (8)
-.equ JTDO_SHIFT,                (9)
+#ifndef JTAG_PIN_JTCK_SHIFT
+#define JTAG_PIN_JTCK_SHIFT 27
+#endif
+#ifndef JTAG_PIN_JTMS_SHIFT
+#define JTAG_PIN_JTMS_SHIFT 28
+#endif
+#ifndef JTAG_PIN_JTDI_SHIFT
+#define JTAG_PIN_JTDI_SHIFT 8
+#endif
+#ifndef JTAG_PIN_JTDO_SHIFT
+#define JTAG_PIN_JTDO_SHIFT 9
+#endif
+/* Default pin mapping: akaLinkPro (TCK=PA27, TMS=PA28, TDI=PA08, TDO=PA09).
+ * Other boards override the shifts via -D at build time, e.g.
+ * hpm5301evklite: TCK=PA06, TMS=PA07, TDI=PA05, TDO=PA04. */
+.equ JTCK_SHIFT,                (JTAG_PIN_JTCK_SHIFT)
+.equ JTMS_SHIFT,                (JTAG_PIN_JTMS_SHIFT)
+.equ JTDI_SHIFT,                (JTAG_PIN_JTDI_SHIFT)
+.equ JTDO_SHIFT,                (JTAG_PIN_JTDO_SHIFT)
 
 .equ JTCK_OFFSET,               (1 << JTCK_SHIFT)
 .equ JTMS_OFFSET,               (1 << JTMS_SHIFT)
