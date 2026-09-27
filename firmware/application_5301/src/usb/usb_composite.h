@@ -10,6 +10,7 @@
 #include "usbd_hid.h"
 #include "chry_ringbuffer.h"
 #include "cdc_interface.h"
+#include "rtt_bridge.h"
 #include "DAP_config.h"
 #include "DAP.h"
 

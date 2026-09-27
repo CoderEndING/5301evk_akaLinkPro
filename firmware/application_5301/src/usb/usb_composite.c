@@ -720,6 +720,10 @@ void chry_dap_handle(void)
 
     // Process pending requests
     while (USB_RequestCountI != USB_RequestCountO) {
+        /* The probe-side RTT bridge shares the SWD bus, so tell it that the
+         * DAP is busy again. */
+        rtt_bridge_note_dap_activity();
+
         // Handle Queue Commands
         n = USB_RequestIndexO;
         while (USB_Request[n][0] == ID_DAP_QueueCommands) {
@@ -739,6 +743,8 @@ void chry_dap_handle(void)
         // Execute DAP Command (process request and prepare response)
         USB_RespSize[USB_ResponseIndexI] =
             (uint16_t)DAP_ExecuteCommand(USB_Request[USB_RequestIndexO], USB_Response[USB_ResponseIndexI]);
+        /* Bring-up debugging: record the host's DAP bytes (see rtt_bridge.c). */
+        rtt_bridge_trace_dap(USB_Request[USB_RequestIndexO], USB_Response[USB_ResponseIndexI]);
 
         // Update Request Index and Count
         USB_RequestIndexO++;

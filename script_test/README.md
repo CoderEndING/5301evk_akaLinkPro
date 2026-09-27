@@ -60,6 +60,11 @@ EVKLite 上 CDC 是复合设备的 `MI_01`，可用
 | `evk_verify.py` | 带 HID 状态读数的回环验证（需 TEMP-DIAG 诊断固件） |
 | `evk_diag.py` | 全量诊断（需诊断固件）：引脚直连自测 / UART 内部回环 / 计数器 / force-start |
 | `evk_watch_jumper.py` | 打开 TX 心跳并实时轮询 RX 计数，用于边插跳线边观察（需诊断固件） |
+| `rtt_probe_bridge.py` | **探针侧 RTT 桥测速**：boost 目标 → HID `CMD_RTT` 启动桥 → 只读串口测吞吐，并做全流零丢包校验 |
+| `rtt_bridge_sweep.py` | **调优扫描**：时钟 × clock_delay × 块大小，并排给出「纯 SWD 基准 / 丢弃模式搬运 / 端到端」三个数，直接指出天花板在哪一侧（`--clk=` 指定桥的请求档位） |
+| `rtt_rate_matrix.py` | **逐档对照表**：同一目标主频下逐档量「纯 SWD 读速」与「RTT 交付率」，给出占比与主导方（按每次搬运字节数实测判定），可直接贴进文档 |
+| `rtt_peek.py` | 读探针自身内存（HID `CMD_RTT` action 5），bring-up 期查 `DAP_Data`/trace 用 |
+| `rtt_rawdap.py` | 经探针主循环透传原始 CMSIS-DAP 请求（action 4/6），bring-up 期用 |
 
 ### RTT 测速为什么慢（实测结论，2026-09-27）
 
@@ -93,6 +98,18 @@ WrOff/RdOff → 读环形缓冲 → 写回 RdOff），每次轮询约 3 ms 固�
 > 想再往上只有一条路：**把轮询下沉到探针固件里**（探针自己用 SWD 轮询目标的 RTT
 > 控制块，再经 USB 推给主机），这样就没有主机往返开销，理论上限回到 SWD 读带宽
 > （~2 MB/s）。J-Link 就是这么做的，属于固件新功能。
+
+**这条路已经做完了**（已合入 `main`），实测：
+
+| 配置 | 吞吐 |
+| --- | --- |
+| 探针侧桥，20 MHz SWD | 1420 KB/s |
+| 探针侧桥，36 MHz SWD | **2190 KB/s（2.14 MB/s）**，全流 13.5 MB 零丢包零重包 |
+
+`python rtt_probe_bridge.py COM52 6 36000` 一把跑完（自动 boost 目标 → 启动桥 →
+只读串口测速 → 校验流完整性 → 读回状态字）。实现要点、三个坑（握手/提速顺序、
+RdOff 幂等重试、512 B 分块）见
+[`docs/HPM5301EVKLite_port.md` §5](../docs/HPM5301EVKLite_port.md#5-探针侧-rttcdc-桥分支-featprobe-rtt-bridge)。
 
 `rtt_speed_test.py` 走的是 OpenOCD 自带的 rtt server，它的 `rtt polling_interval`
 **默认 100 ms**，实测（20 MHz SWD、目标 64 MHz）：

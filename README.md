@@ -137,9 +137,52 @@ RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 
 | 目标停在复位默认 8 MHz（RTT 生产者在目标侧，此时封顶） | 277 KB/s |
 | `make rtt-test`（OpenOCD rtt server） | **919 KB/s** |
 | `make rtt-max`（轮询在 OpenOCD 内 + 32 位分块读 + 12 KB 环） | **1140 KB/s** |
+| **探针侧 RTT 桥**（`CMD_RTT` 0x31，固件自己轮询 RTT + CDC 转发） | **2190 KB/s（2.14 MB/s）** |
 
-另外：目标**运行中**时长块 SWD 读会失败（内核抢总线），必须限长分块 + 重试；
-把轮询下沉到探针固件（J-Link 式 RTT 桥）才能突破到 ~2 MB/s。详见
+### 探针侧 RTT→CDC 桥
+
+把轮询从主机搬到探针固件里，是 J-Link 式 RTT 的做法（参考实现：
+[MicroLink](https://github.com/minichao9901) 的同款 5301 工程）：固件自己在主循环里
+读 RTT 控制块 → 搬环形缓冲 → 写回 RdOff，数据直接进 CDC 的 `g_uartrx` 环，主机只管
+收串口。省掉的正是那 3 个 host↔探针来回。
+
+- **SWD 访问直接用 ARM DAPLink 官方 `swd_host.c`**（见 `firmware/application_5301/src/swd_host/`），
+  只裁掉 flash 算法/目标状态机部分，时序逻辑一字未改；平台胶水 `swd_host_port.c`
+  把 `SWD_Transfer()` 分派到本工程 `SW_DP.c` 的 `SWD_Read()/SWD_Write()`，即与 DAP
+  主机通路同一套按速度预编译的 bit-bang blob。
+- **握手用默认低速档、之后再提速**（真实主机也是这个顺序）：`swd_init_debug()` 内部会
+  再调一次 `swd_init()` → `DAP_Setup()` 把时钟重置回默认档，所以提速必须放在它之后。
+- **背压 + 幂等重试保证不丢不重**：每轮只搬 `min(目标可读, 2048 B, CDC 环剩余空间)`；
+  先交付到环再推进目标 RdOff，RdOff 写失败则记下来下轮补写（RdOff 是绝对值，重写无害）。
+  实测 2×13.5 MB 全流校验 0 丢包 0 重包。
+- 与 DAP 主机通路**互斥**：只在 DAP 空闲 ≥20 ms 时轮询，调试时最多多 ~1 ms 抖动。
+
+启动方式（HID 自定义命令 `CMD_RTT` 0x31）：
+
+```powershell
+python script_test\rtt_probe_bridge.py COM52 6 36000   # 自动 boost 目标 + 启动桥 + 测速
+```
+
+吞吐随 SWD 时钟上升，但会撞到两侧不同的天花板（详见
+[`docs/HPM5301EVKLite_port.md` §5.4](docs/HPM5301EVKLite_port.md#54-调优实测天花板在哪一侧2026-09-27)）：
+
+| 量的是什么 | 数字 |
+| --- | --- |
+| SWD 侧（纯读目标 SRAM，最快 blob） | **3431 KB/s**（60 MHz 起 plateau，45 MHz 2844、36 MHz 2412） |
+| 桥的搬运（丢弃模式，不送 CDC）@36 MHz | 2217 KB/s |
+| 端到端（CDC 读走）@36 MHz / @45 MHz | 2207 / **2218 KB/s，零丢包** |
+
+块大小 512 B → 2048 B 只多 1.2%（每块固定开销本来就只有 5 次传输）；
+`clock_delay` 覆盖无差别；`__inline__` 无收益（`-O3` 已把
+`swd_read_block`/`swd_transfer_retry`/`swd_read_word` 全部内联，符号表里已不存在）。
+
+高频档是**间歇性**的（同样 36 MHz，长块读全对而控制块扫描可能失败），所以固件带
+两处自愈：启动时从请求档位往下找可用档、运行中连续出错则降一档重来；控制块扫描
+也从 4 字节小读改成 512 B 重叠窗块读（传输数少一个数量级）。扫描脚本
+`script_test/rtt_bridge_sweep.py` 一次跑完「纯 SWD / 丢弃 / 端到端」三段对照。
+
+另外：目标**运行中**时长块 SWD 读会失败（内核抢总线），必须限长分块 + 重试
+（桥里默认 512 B/块）。详见
 [`script_test/README.md`](script_test/README.md#rtt-测速为什么慢实测结论2026-09-27)。
 
 脚本说明见 [`script_test/README.md`](script_test/README.md)；`sram/rtt` 脚本的工具路径
