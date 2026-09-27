@@ -464,8 +464,14 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
         USB_RequestIdle = 0U;
         usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_PACKET_SIZE);
         usbd_ep_start_read(0, CDC_OUT_EP, usb_tmpbuffer, DAP_PACKET_SIZE);
+        /* Re-arm the UART bridge as well: the reset above cleared
+         * config_uart_transfer and a host that reuses its previous line coding
+         * would otherwise never restart it. */
+        if (g_cdc_lincoding.dwDTERate != 0U)
+        {
+            config_uart = 1;
+        }
         break;
-
     case USBD_EVENT_SET_REMOTE_WAKEUP:
         break;
     case USBD_EVENT_CLR_REMOTE_WAKEUP:
@@ -773,11 +779,29 @@ void chry_dap_handle(void)
 void usbd_cdc_acm_set_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_coding *line_coding)
 {
     (void)busid;
+    /* The host sends SET_LINE_CODING every time it opens the port, almost always
+     * with the same values. The UART must still be (re)armed in that case:
+     * USBD_EVENT_RESET clears config_uart_transfer, and an unchanged line coding
+     * used to leave the bridge idle forever - the COM port accepted data, the
+     * bytes piled up in g_usbrx and nothing was ever echoed back. */
+    if (line_coding->dwDTERate == 0U)
+    {
+        /* Some host drivers push an all-zero line coding when the port is
+         * closed. It is not a usable configuration, so keep the last real one
+         * instead of reconfiguring the UART with a 0 baud divisor. */
+        return;
+    }
     if (memcmp(line_coding, (uint8_t *)&g_cdc_lincoding, sizeof(struct cdc_line_coding)) != 0)
     {
         memcpy((uint8_t *)&g_cdc_lincoding, line_coding, sizeof(struct cdc_line_coding));
         config_uart = 1;
         config_uart_transfer = 0;
+    }
+    else if (!config_uart_transfer)
+    {
+        /* Same parameters as last time but the bridge is not running (fresh
+         * boot, USB reset, previous error): reconfigure without losing data. */
+        config_uart = 1;
     }
 }
 
