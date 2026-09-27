@@ -182,11 +182,15 @@ def main():
             w0 = status(dev)
             d0, p0 = w0[3], w0[4] >> 16
             total = 0
+            rbuf = bytearray(1 << 20)
             t0 = time.perf_counter()
             while time.perf_counter() - t0 < SEC:
-                c = ser.read(65536)
-                if c:
-                    total += len(c)
+                # readinto 复用大缓冲：pyserial 的 read() 在 Windows 上每次都要新分配，
+                # 主机侧会被压到 2169 KB/s，readinto 能到 2956 KB/s（差 36%），
+                # 用 read() 测会把"主机读得慢"误读成"设备只能跑这么快"。
+                n = ser.readinto(rbuf)
+                if n:
+                    total += n
             dur = time.perf_counter() - t0
             rb.rtt_cmd(dev, rb.ACT_STOP)
         finally:

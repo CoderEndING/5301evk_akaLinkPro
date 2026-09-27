@@ -551,22 +551,20 @@ void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
     uint32_t level = disable_global_irq(CSR_MSTATUS_MIE_MASK);
 
     chry_ringbuffer_linear_read_done(&g_uartrx, nbytes);
-    if ((nbytes % DAP_PACKET_SIZE) == 0 && nbytes)
+
+    /* 这里原来在「长度是 512 整数倍」时补发一个 ZLP。CDC 是纯字节流，主机不需要
+     * 用它标记传输边界，而 RTT 桥是按 2048 字节往环里写的、线性窗经常正好是 512
+     * 的倍数 ⇒ 几乎每次传输都白白多一个事务。去掉。
+     * （如果真的需要 ZLP，也应该用 CDC_IN_EP 的 wMaxPacketSize 判断，而不是 DAP 的
+     *   DAP_PACKET_SIZE —— 虽然两者在本工程里同为 512，但语义是 CDC 端点的属性。） */
+    if (chry_ringbuffer_get_used(&g_uartrx))
     {
-        /* send zlp */
-        usbd_ep_start_write(0, CDC_IN_EP, NULL, 0);
+        buffer = chry_ringbuffer_linear_read_setup(&g_uartrx, &size);
+        usbd_ep_start_write(0, CDC_IN_EP, buffer, size);
     }
     else
     {
-        if (chry_ringbuffer_get_used(&g_uartrx))
-        {
-            buffer = chry_ringbuffer_linear_read_setup(&g_uartrx, &size);
-            usbd_ep_start_write(0, CDC_IN_EP, buffer, size);
-        }
-        else
-        {
-            usbtx_idle_flag = 1;
-        }
+        usbtx_idle_flag = 1;
     }
 
     restore_global_irq(level);

@@ -33,11 +33,11 @@
 /* Debug port / AHB-AP 的寄存器与传输编码由官方 swd_host.c / debug_cm.h 负责，
  * 这里只留桥自己的配置常量。 */
 
-/* 桥默认的 SWD 时钟档。四处链路健壮性修复（见文件末的自愈逻辑说明）之后，
- * 45 MHz 档已经稳定：目标 72 MHz 时交付 2477 KB/s、目标 128 MHz 时 2637 KB/s，
- * 都是零丢包。再往上（60/80 MHz）那两档 blob 仍有少量错误会自动降档，故默认取 45。
- * 启动时若这一档扫不到控制块，会沿 36→30→20→10 自动往下找。 */
-#define RTT_SWD_CLOCK_HZ 45000000UL
+/* 桥默认的 SWD 时钟档。60 MHz 档在加上「斜坡换挡 + 换挡后热身 + 读失败先清
+ * sticky 错误重试」之后已经可用：纯 SWD 读 3312 KB/s、交付 2956 KB/s（主机用
+ * readinto 读时），比 45 MHz 档的 2519 KB/s 高 17%。启动时若这一档用不了，会沿
+ * 45→36→30→20→10 自动往下找。 */
+#define RTT_SWD_CLOCK_HZ 60000000UL
 
 /* SEGGER RTT layout (SEGGER_RTT.h): CB header 24 bytes, then per up-buffer
  * {name, pBuffer, SizeOfBuffer, WrOff, RdOff, Flags} = 24 bytes. */
@@ -51,6 +51,9 @@
  * 2048 B 3476 KB/s（+1.2%），再大无收益，故默认取 2048。 */
 #define RTT_SWD_CHUNK 2048U
 
+/* 换挡斜坡的中间档（见 rtt_swd_init 里的说明）。 */
+#define RTT_SWD_RAMP_HZ 20000000UL
+
 /* 每次轮询最多搬运的字节数。 */
 #define RTT_MAX_DRAIN 2048U
 
@@ -59,8 +62,8 @@
 #define RTT_CB_SCAN_INTERVAL_MS 20U
 
 /* 启动失败时自动降档的候选（只在低于请求频率时使用）。 */
-#define RTT_CLOCK_LADDER {36000000UL, 30000000UL, 20000000UL, 10000000UL}
-#define RTT_CLOCK_LADDER_LEN 4U
+#define RTT_CLOCK_LADDER {60000000UL, 45000000UL, 36000000UL, 30000000UL, 20000000UL, 10000000UL}
+#define RTT_CLOCK_LADDER_LEN 6U
 
 /* MCHTMR runs at 24 MHz (osc24m). */
 #define RTT_MCHTMR_HZ 24000000UL
@@ -167,15 +170,24 @@ static int rtt_swd_set_clock(uint32_t hz)
  * （含一次 nRESET 硬复位）。 */
 static int rtt_swd_init(void)
 {
+    uint32_t idcode = 0U;
+
     swd_init();     /* DAP_Setup + PORT_SWD_SETUP + DAP_Data.debug_port = SWD */
 
-    /* 先在默认（低速）档完成 JTAG2SWD 握手与 DP 上电 —— 和真实主机一样，
+    /* 先在默认（4 MHz Slow 档）完成 JTAG2SWD 握手与 DP 上电 —— 和真实主机一样，
      * 连接阶段不用高速档。注意 swd_init_debug() 内部还会再调一次 swd_init()，
      * 其 DAP_Setup() 会把时钟档重置回默认，所以提速只能放在它之后。 */
     if (swd_init_debug() == 0U)
     {
         return -2;
     }
+
+    /* 斜坡换挡：先切到 20 MHz 档（把 20M blob 装进去），再切到目标档。
+     * 实测「4 MHz Slow 档直跳 60/80 MHz」在换挡后的头几次访问上就失败，而
+     * 「20 MHz 档跳到 60/80 MHz」是稳的（低档初始化后切上去，60/80 MHz 稳态
+     * 能跑 3431/3476 KB/s），这里就显式复现那条能工作的路径。 */
+    (void)rtt_swd_set_clock(RTT_SWD_RAMP_HZ);
+    (void)swd_clear_errors();
 
     if (rtt_swd_set_clock(s_swd_clock_hz) != 0)
     {
@@ -186,8 +198,20 @@ static int rtt_swd_init(void)
         DAP_Data.clock_delay = s_delay_override; /* SWJ_Clock 会重设，压回覆盖值 */
     }
 
-    s_swd_ready = 1U;
-    return 0;
+    /* 换挡后的第一次访问最容易踩到瞬态；先读一次 DP IDCODE 把它吃掉。真读不动
+     * 就清 sticky 错误再试一次，仍不行返回 -4 让上层降档（-4 = 链路在该档不可用，
+     * 与握手失败的 -1/-2 区分开）。 */
+    for (uint32_t attempt = 0U; attempt < 2U; attempt++)
+    {
+        if (swd_read_dp(0U /* DP_IDCODE */, &idcode) != 0U)
+        {
+            s_swd_ready = 1U;
+            return 0;
+        }
+        (void)swd_clear_errors();
+    }
+
+    return -4;
 }
 
 /* Read `len` bytes from an arbitrary (possibly unaligned) address.
@@ -242,10 +266,15 @@ static int rtt_find_cb(void)
         if (rtt_read_bytes(s_search_addr + off, s_scan, want) != 0)
         {
             s_read_err++;
-            /* 这一段读不动通常意味着已经走出目标 SRAM（搜索区间默认 64 KB，
-             * 而 F103C8 只有 20 KB）：后面全是未映射区，再扫没有意义，直接收工。
-             * 这也避免了每次启动白记几十次读错误。 */
-            break;
+            /* 一次失败先清 sticky 错误重试同一段（换挡后的瞬态很常见）；仍失败才
+             * 认为已经走出目标 SRAM（搜索区间默认 64 KB，而 F103C8 只有 20 KB），
+             * 后面全是未映射区，再扫没有意义，直接收工。 */
+            (void)swd_clear_errors();
+            if (rtt_read_bytes(s_search_addr + off, s_scan, want) != 0)
+            {
+                s_read_err++;
+                break;
+            }
         }
         for (uint32_t i = 0U; (i + RTT_BRIDGE_SIG_LEN) <= want; i++)
         {
@@ -408,7 +437,7 @@ int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel)
 
     int rc = -3;
     uint32_t req_hz = s_swd_clock_hz;
-    uint32_t try_hz[4];
+    uint32_t try_hz[RTT_CLOCK_LADDER_LEN];
     uint32_t ntry = 0U;
     static const uint32_t ladder[RTT_CLOCK_LADDER_LEN] = RTT_CLOCK_LADDER;
 
@@ -417,7 +446,7 @@ int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel)
      * 不如从请求频率往下走，用第一次能扫到控制块的档位 —— 用户直接要
      * 60 MHz 也能自动落到当下可用的最快档。 */
     try_hz[ntry++] = req_hz;
-    for (uint32_t i = 0U; i < RTT_CLOCK_LADDER_LEN && ntry < 4U; i++)
+    for (uint32_t i = 0U; i < RTT_CLOCK_LADDER_LEN && ntry < RTT_CLOCK_LADDER_LEN; i++)
     {
         uint32_t x = ladder[i];
         if (x < req_hz)
@@ -670,14 +699,26 @@ static void rtt_bridge_run_bench(void)
     }
 
     uint32_t t0 = mchtmr_now();
-    for (uint32_t i = 0U; i < s_bench_iters; i++)
+    uint32_t i = 0U;
+    uint32_t retried = 0U;
+
+    while (i < s_bench_iters)
     {
         if (rtt_read_bytes(s_bench_addr, s_stage, s_bench_bytes) != 0)
         {
-            s_bench_err = -2;
+            /* 换挡后的瞬态读失败：清掉 AP 上的 sticky 错误再试同一轮；只有连重试
+             * 都失败才判 -4（初始化成功但读不动），与初始化步骤的 -1/-2 区分开。 */
+            if (retried == 0U)
+            {
+                retried = 1U;
+                (void)swd_clear_errors();
+                continue;
+            }
+            s_bench_err = -4;
             break;
         }
         s_bench_moved += s_bench_bytes;
+        i++;
     }
     s_bench_ticks = mchtmr_now() - t0;
     s_bench_valid = 1U;
