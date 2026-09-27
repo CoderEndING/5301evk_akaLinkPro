@@ -53,9 +53,29 @@ EVKLite 上 CDC 是复合设备的 `MI_01`，可用
 | `evk_dfu_enter.py` | 只发 HID 进 DFU 命令（不烧录） |
 | `evk_jtag_mode_test.py` | 验证切到 SWD+JTAG 模式后 COM 口仍可用（引脚复用回归） |
 | `evk_probe.py` | 快速探测：CDC 有无自发数据 + HID 应答格式 |
+| `evk_ident.py` | 读运行中固件的版本/编译时间/参数（确认板上到底是哪一版） |
+| `evk_pyocd_sram.py` | 同一 SRAM 测速改用 pyOCD（换一套主机栈交叉验证瓶颈在哪一侧） |
+| `evk_swd_probe.py` | 固定 SWD 时钟做传输并打印 OpenOCD 的完整日志（找重试/ACK 异常） |
+| `evk_target_clock_test.py` | 读 STM32F103 的 RCC，对比「复位默认 8MHz」与「提到 64MHz」下的吞吐 |
 | `evk_verify.py` | 带 HID 状态读数的回环验证（需 TEMP-DIAG 诊断固件） |
 | `evk_diag.py` | 全量诊断（需诊断固件）：引脚直连自测 / UART 内部回环 / 计数器 / force-start |
 | `evk_watch_jumper.py` | 打开 TX 心跳并实时轮询 RX 计数，用于边插跳线边观察（需诊断固件） |
+
+### SRAM 测速为什么必须固定目标主频 ⚠️
+
+SWD 的每次 AHB-AP 事务要花掉目标机好几个 HCLK，所以吞吐上限是
+`min(SWD 时钟, 目标 HCLK)`。STM32F103 **上电后 RCC 默认是 HSI 8MHz**，此时无论把
+SWD 时钟拉到 45/60MHz，吞吐都会卡在 ~1.4MB/s；而 STM32F1 的 `reset halt` 是
+**核心级复位、不会清 RCC**，所以只要之前有固件把 PLL 配起来过，测速又会变成
+~2.8MB/s —— 同一个探针、同一份固件，数字却能差一倍。
+
+`sram_speed_test.py` 因此默认在每轮 `reset halt` 之后把目标提到
+**64MHz（HSI/2 ×16，无需外部晶振）**，并打印实测的 SYSCLK/HCLK：
+
+```bat
+python script_test\sram_speed_test.py              :: 归一化目标主频（推荐，数字可复现）
+python script_test\sram_speed_test.py --no-boost   :: 保留目标复位后的原始状态
+```
 
 ### 运行示例
 

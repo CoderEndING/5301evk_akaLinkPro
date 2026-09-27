@@ -66,6 +66,9 @@ reset-usb:
 # --- hardware tests ---------------------------------------------------------
 # STM32F103 SRAM read/write speed: OpenOCD load_image/dump_image of 20 KB at
 # 0x20000000 across SWD clocks 1..60 MHz, byte-compared every run.
+# The target is normalised to 64 MHz first: an STM32F1 left at its reset
+# default (HSI 8 MHz) caps the throughput near 1.4 MB/s whatever the SWD clock
+# is. Use `python script_test\sram_speed_test.py --no-boost` to keep it as-is.
 sram-test:
 	@echo [make] STM32F103 SRAM read/write benchmark (CMSIS-DAP + OpenOCD) ...
 	$(PYTHON) script_test\sram_speed_test.py

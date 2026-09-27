@@ -9,6 +9,7 @@ STM32F103 SRAM at 0x20000000 across several SWD clock speeds.
 Data integrity is verified per run by comparing the dumped file.
 """
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -29,6 +30,18 @@ WORKDIR = HERE
 SRAM_ADDR = 0x20000000
 SIZE = 20 * 1024  # 20480 bytes = full SRAM of STM32F103C8
 SPEEDS_KHZ = [1000, 2000, 4000, 10000, 20000, 36000, 45000, 60000]
+
+# Target clock normalisation (see main()): STM32F103 RCC/FLASH registers.
+BOOST = "--no-boost" not in sys.argv
+BOOST_LABEL = "64 MHz (PLL from HSI/2)"
+RCC_CR = 0x40021000
+RCC_CFGR = 0x40021004
+FLASH_ACR = 0x40022000
+SWS_NAME = {0: "HSI", 1: "HSE", 2: "PLL", 3: "n/a"}
+HPRE_DIV = {0: 1, 1: 2, 2: 4, 3: 8, 4: 16, 5: 64, 6: 128, 7: 256,
+            8: 2, 9: 4, 10: 8, 11: 16, 12: 64, 13: 128, 14: 256, 15: 512}
+PLLMUL = {0: 2, 1: 3, 2: 4, 3: 5, 4: 6, 5: 7, 6: 8, 7: 9, 8: 10, 9: 11,
+          10: 12, 11: 13, 12: 14, 13: 15, 14: 16, 15: 16}
 
 TELNET_PORT = 4444
 
@@ -72,6 +85,45 @@ def gen_test_file(path):
         data.append(x & 0xFF)
     with open(path, "wb") as f:
         f.write(bytes(data))
+
+
+def _rd(tn, addr):
+    """Read one 32-bit word through the target."""
+    out = tn.cmd("mdw 0x%08X" % addr)
+    m = re.search(r"0x%08x:\s*([0-9a-fA-F]{8})" % addr, out) or \
+        re.search(r":\s*([0-9a-fA-F]{8})", out)
+    return int(m.group(1), 16) if m else None
+
+
+def describe_clock(tn):
+    """Human readable SYSCLK/HCLK + flash latency of the STM32F1 target."""
+    cr = _rd(tn, RCC_CR)
+    cfgr = _rd(tn, RCC_CFGR)
+    acr = _rd(tn, FLASH_ACR)
+    if None in (cr, cfgr, acr):
+        return "unknown (RCC read failed)"
+    sws = (cfgr >> 2) & 3
+    base = {0: 8.0, 1: 8.0, 2: (4.0 if not (cfgr >> 16) & 1 else 8.0) * PLLMUL[(cfgr >> 18) & 0xF]}[sws]
+    hclk = base / HPRE_DIV[(cfgr >> 4) & 0xF]
+    return "SYSCLK=%s %.1f MHz, HCLK=%.1f MHz, flash latency=%d" % (SWS_NAME[sws], base, hclk, acr & 7)
+
+
+def boost_target_clock(tn):
+    """Run the target from its PLL: HSI/2 * 16 = 64 MHz (works without a crystal).
+
+    Must be re-applied after every 'reset halt' - the reset restores the RCC
+    defaults and the throughput would silently fall back to the 8 MHz HSI rate.
+    """
+    tn.cmd("mww 0x%08X 0x00000012" % FLASH_ACR)        # 2 wait states + prefetch
+    tn.cmd("mww 0x%08X 0x00380400" % RCC_CFGR)         # PLLSRC=HSI/2, x16, HPRE=/1, PPRE1=/2
+    cr = _rd(tn, RCC_CR) or 0
+    tn.cmd("mww 0x%08X 0x%08X" % (RCC_CR, cr | 0x01000000))  # PLLON
+    for _ in range(50):
+        if (_rd(tn, RCC_CR) or 0) & 0x02000000:        # PLLRDY
+            break
+        time.sleep(0.02)
+    tn.cmd("mww 0x%08X 0x00380402" % RCC_CFGR)         # SW = PLL
+    time.sleep(0.05)
 
 
 def main():
@@ -125,6 +177,17 @@ def main():
         print(tn.cmd("targets").strip())
         print()
 
+        # The measured throughput is capped by min(SWD clock, target AHB clock):
+        # every AP transaction costs several HCLK cycles, so a target left at its
+        # reset default (STM32F103: HSI 8 MHz) saturates near 1.4 MB/s no matter
+        # how fast the SWD clock is. Normalise it unless --no-boost was given.
+        print("target clock:", describe_clock(tn))
+        if BOOST:
+            print("normalising target clock to %s ..." % BOOST_LABEL)
+            boost_target_clock(tn)
+            print("target clock:", describe_clock(tn))
+        print()
+
         results = []
         consecutive_fail = 0
         for spd in SPEEDS_KHZ:
@@ -134,6 +197,9 @@ def main():
             # warmup / baseline small transfer (overhead context)
             ok = True
             tn.cmd("reset halt")
+            if BOOST:
+                # the reset puts the RCC back to its default, re-apply every round
+                boost_target_clock(tn)
 
             t0 = time.perf_counter()
             out_w = tn.cmd(f'load_image "{src_tel}" 0x{SRAM_ADDR:X} bin')

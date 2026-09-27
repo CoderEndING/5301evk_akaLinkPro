@@ -108,14 +108,21 @@ make uart-echo   :: EVKLite CDC 回环快检（先短接 J3.8 <-> J3.10）
 make uart-loop   :: EVKLite CDC 全速率回环扫描
 ```
 
-`make sram-test` 实测（20 KB @ `0x20000000`，OpenOCD `load_image`/`dump_image`）：
+`make sram-test` 实测（20 KB @ `0x20000000`，OpenOCD `load_image`/`dump_image`，
+目标已归一到 64 MHz）：
 
 | SWD 时钟 | 写 | 读 |
 | --- | --- | --- |
-| 1 MHz | 85.5 KB/s | 85.9 KB/s |
-| 10 MHz | 749.5 KB/s | 770.5 KB/s |
-| 36 MHz | 2081.2 KB/s | 1903.0 KB/s |
-| 60 MHz | 2847.6 KB/s | 2566.6 KB/s |
+| 1 MHz | 85.4 KB/s | 85.8 KB/s |
+| 10 MHz | 748.1 KB/s | 768.7 KB/s |
+| 36 MHz | 1958.7 KB/s | 1944.6 KB/s |
+| 60 MHz | 2640.3 KB/s | 2375.7 KB/s |
+
+> ⚠️ 这个数字受**目标机主频**限制（每次 SWD AHB-AP 事务要花几个目标 HCLK）：
+> STM32F103 上电默认 HSI 8 MHz 时，无论 SWD 时钟拉到多高都会卡在 ~1.4 MB/s，
+> 而 F1 的 `reset halt` 是核心级复位、不清 RCC，所以数字会随目标上电后的状态
+> 变化一倍。`sram_speed_test.py` 因此默认在每轮复位后把目标提到 64 MHz 并打印
+> 实测时钟（`--no-boost` 可关闭）。
 
 脚本说明见 [`script_test/README.md`](script_test/README.md)；`sram/rtt` 脚本的工具路径
 可用 `OPENOCD_EXE`、`OPENOCD_SCRIPTS`、`HPM_SDK_ENV_DIR` 覆盖。

@@ -1,0 +1,37 @@
+Open On-Chip Debugger 0.12.0+dev-04410-g45e78b300 (2025-12-01-02:07)
+Licensed under GNU GPL v2
+For bug reports, read
+	http://openocd.org/doc/doxygen/bugs.html
+Info : tcl server disabled
+Info : Listening on port 4448 for telnet connections
+Info : Using CMSIS-DAPv2 interface with VID:PID=0x0d28:0x0204, serial=B4444F2110DDDAFE44800BBB0AE800E0
+Info : CMSIS-DAP: SWD supported
+Info : CMSIS-DAP: Atomic commands supported
+Info : CMSIS-DAP: Test domain timer supported
+Info : CMSIS-DAP: UART via USB COM port supported
+Info : CMSIS-DAP: FW Version = 2.1.2
+Info : CMSIS-DAP: Interface Initialised (SWD)
+Info : SWCLK/TCK = 1 SWDIO/TMS = 0 TDI = 1 TDO = 0 nTRST = 1 nRESET = 1
+Info : CMSIS-DAP: Interface ready
+Info : clock speed 1000 kHz
+Info : SWD DPIDR 0x1ba01477
+Info : [stm32f1x.cpu] Cortex-M3 r1p1 processor detected
+Info : [stm32f1x.cpu] target has 6 breakpoints, 4 watchpoints
+[stm32f1x.cpu] Target successfully examined.
+Info : [stm32f1x.cpu] Examination succeed
+Info : [stm32f1x.cpu] gdb port disabled
+Info : accepting 'telnet' connection on tcp/4448
+Info : SWD DPIDR 0x05c01839
+Warn : [stm32f1x.cpu] Only resetting the Cortex-M core, use a reset-init event handler to reset any peripherals or configure hardware srst support.
+Info : [stm32f1x.cpu] Cortex-M3 r1p1 processor detected
+Info : [stm32f1x.cpu] target has 6 breakpoints, 4 watchpoints
+[stm32f1x.cpu] halted due to breakpoint, current mode: Thread 
+xPSR: 0x01000000 pc: 0x080000b0 msp: 0x20005000
+Warn : [stm32f1x.cpu] Only resetting the Cortex-M core, use a reset-init event handler to reset any peripherals or configure hardware srst support.
+[stm32f1x.cpu] halted due to breakpoint, current mode: Thread 
+xPSR: 0x01000000 pc: 0x080000b0 msp: 0x20005000
+Warn : [stm32f1x.cpu] Only resetting the Cortex-M core, use a reset-init event handler to reset any peripherals or configure hardware srst support.
+[stm32f1x.cpu] halted due to breakpoint, current mode: Thread 
+xPSR: 0x01000000 pc: 0x080000b0 msp: 0x20005000
+shutdown command invoked
+Info : dropped 'telnet' connection
