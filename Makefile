@@ -35,7 +35,7 @@ PYTHON ?= python
 COM    ?= COM52
 
 .PHONY: all help build build-boot build-app flash flash-app dfu reset-usb clean \
-        sram-test rtt-test uart-echo uart-loop
+        sram-test rtt-test rtt-max rtt-link uart-echo uart-loop
 all: help
 
 build: build-boot build-app
@@ -74,9 +74,25 @@ sram-test:
 	$(PYTHON) script_test\sram_speed_test.py
 
 # SEGGER RTT throughput from the bundled STM32F103 test firmware.
+# The target clock is normalised to 64 MHz first: an STM32F1 out of reset runs
+# at 8 MHz and its RTT write loop then caps the stream at ~277 KB/s whatever
+# the SWD clock is.
 rtt-test:
-	@echo [make] STM32F103 SEGGER RTT throughput test ...
+	@echo [make] STM32F103 SEGGER RTT throughput test (OpenOCD rtt server) ...
 	$(PYTHON) script_test\rtt_speed_test.py
+
+# Ceiling measurement: the poll loop runs inside OpenOCD (no telnet round
+# trips), 32-bit reads in bounded chunks. ~1.1 MB/s at 60 MHz.
+rtt-max:
+	@echo [make] RTT drain ceiling (poll loop inside OpenOCD) ...
+	$(PYTHON) script_test\rtt_drain_bench.py
+
+# SWD read reliability while the target RUNS (AP reads fail at high clocks).
+rtt-link:
+	@echo [make] SWD link matrix while the target runs ...
+	$(OPENOCD_EXE) -s "$(OPENOCD_SCRIPTS)" -f script_test\openocd_stm32f1_swd.cfg \
+	  -c "gdb port disabled" -c "tcl port disabled" -c "telnet port disabled" \
+	  -c "init" -c "reset run" -c "source script_test/rtt_link_matrix.tcl" -c "shutdown"
 
 # EVKLite CDC loopback (short J3.8 = UART_TXD to J3.10 = UART_RXD first).
 uart-echo:
@@ -102,7 +118,9 @@ help:
 	@echo   make dfu         dfu-util download of the APP
 	@echo   make reset-usb   force USB re-enumeration of the probe
 	@echo   make sram-test   STM32F103 SRAM read/write speed test (OpenOCD)
-	@echo   make rtt-test    STM32F103 SEGGER RTT throughput test
+	@echo   make rtt-test    STM32F103 SEGGER RTT throughput (rtt server)
+	@echo   make rtt-max     RTT drain ceiling (poll loop inside OpenOCD)
+	@echo   make rtt-link    SWD read reliability while the target runs
 	@echo   make uart-echo   CDC loopback check (COM=COMx)
 	@echo   make uart-loop   CDC loopback sweep 9600..10M (COM=COMx)
 	@echo   make clean       remove evklite build directories

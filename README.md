@@ -103,7 +103,9 @@ make clean
 
 ```bat
 make sram-test   :: STM32F103 SRAM 读写测速（CMSIS-DAP + OpenOCD，1~60 MHz，逐字节校验）
-make rtt-test    :: STM32F103 SEGGER RTT 吞吐
+make rtt-test    :: STM32F103 SEGGER RTT 吞吐（OpenOCD rtt server）
+make rtt-max     :: RTT 取数上限（轮询跑在 OpenOCD 内部，无 telnet 往返）
+make rtt-link    :: 目标运行中 SWD 读的可靠性矩阵
 make uart-echo   :: EVKLite CDC 回环快检（先短接 J3.8 <-> J3.10）
 make uart-loop   :: EVKLite CDC 全速率回环扫描
 ```
@@ -123,6 +125,22 @@ make uart-loop   :: EVKLite CDC 全速率回环扫描
 > 而 F1 的 `reset halt` 是核心级复位、不清 RCC，所以数字会随目标上电后的状态
 > 变化一倍。`sram_speed_test.py` 因此默认在每轮复位后把目标提到 64 MHz 并打印
 > 实测时钟（`--no-boost` 可关闭）。
+
+### SEGGER RTT 吞吐（同一块探针，为什么不是 2 MB/s）
+
+RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 WrOff/RdOff → 读环形
+缓冲 → 写回 RdOff），而 SRAM 测速是一次大块流水传输，所以两者不可比。实测阶梯
+（目标均归一到 64 MHz）：
+
+| 配置 | 吞吐 |
+| --- | --- |
+| 目标停在复位默认 8 MHz（RTT 生产者在目标侧，此时封顶） | 277 KB/s |
+| `make rtt-test`（OpenOCD rtt server） | **919 KB/s** |
+| `make rtt-max`（轮询在 OpenOCD 内 + 32 位分块读 + 12 KB 环） | **1140 KB/s** |
+
+另外：目标**运行中**时长块 SWD 读会失败（内核抢总线），必须限长分块 + 重试；
+把轮询下沉到探针固件（J-Link 式 RTT 桥）才能突破到 ~2 MB/s。详见
+[`script_test/README.md`](script_test/README.md#rtt-测速为什么慢实测结论2026-09-27)。
 
 脚本说明见 [`script_test/README.md`](script_test/README.md)；`sram/rtt` 脚本的工具路径
 可用 `OPENOCD_EXE`、`OPENOCD_SCRIPTS`、`HPM_SDK_ENV_DIR` 覆盖。

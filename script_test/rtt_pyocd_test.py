@@ -48,9 +48,10 @@ def main():
 
     session = ConnectHelper.session_with_chosen_probe(
         unique_id=uid,
-        target_override="stm32f103ze",   # proper F1 target: creates the core
+           # proper F1 target: creates the core
         blocking=False,
         options={
+            "target_override": "stm32f103c8",
             "frequency": SPEEDS_HZ[0],
             "cmsis_dap.prefer_v1": False,   # prefer the v2 bulk backend
         },
