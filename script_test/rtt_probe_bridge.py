@@ -23,9 +23,18 @@ import time
 import hid
 import serial
 
-COM = sys.argv[1] if len(sys.argv) > 1 else "COM52"
-WINDOW_S = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
-KHZ = int(sys.argv[3]) if len(sys.argv) > 3 else 36000
+def _arg(idx, default, cast=str):
+    """Tolerant argv read: also lets other scripts import this one as a module
+    (their own flags must not blow up the import)."""
+    try:
+        return cast(sys.argv[idx])
+    except (IndexError, ValueError):
+        return default
+
+
+COM = _arg(1, "COM52")
+WINDOW_S = _arg(2, 5.0, float)
+KHZ = _arg(3, 36000, int)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SDK_ENV = os.environ.get("HPM_SDK_ENV_DIR", r"E:\sdk_env_v1.11.0")
