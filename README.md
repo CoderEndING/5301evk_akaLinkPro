@@ -139,7 +139,7 @@ RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 
 | `make rtt-max`（轮询在 OpenOCD 内 + 32 位分块读 + 12 KB 环） | **1140 KB/s** |
 | **探针侧 RTT 桥**（`CMD_RTT` 0x31，固件自己轮询 RTT + CDC 转发） | **2190 KB/s（2.14 MB/s）** |
 
-### 探针侧 RTT→CDC 桥（`feat/probe-rtt-bridge`）
+### 探针侧 RTT→CDC 桥
 
 把轮询从主机搬到探针固件里，是 J-Link 式 RTT 的做法（参考实现：
 [MicroLink](https://github.com/minichao9901) 的同款 5301 工程）：固件自己在主循环里

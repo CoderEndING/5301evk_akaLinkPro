@@ -60,7 +60,7 @@ EVKLite 上 CDC 是复合设备的 `MI_01`，可用
 | `evk_verify.py` | 带 HID 状态读数的回环验证（需 TEMP-DIAG 诊断固件） |
 | `evk_diag.py` | 全量诊断（需诊断固件）：引脚直连自测 / UART 内部回环 / 计数器 / force-start |
 | `evk_watch_jumper.py` | 打开 TX 心跳并实时轮询 RX 计数，用于边插跳线边观察（需诊断固件） |
-| `rtt_probe_bridge.py` | **探针侧 RTT 桥测速**：boost 目标 → HID `CMD_RTT` 启动桥 → 只读串口测吞吐，并做全流零丢包校验（分支 `feat/probe-rtt-bridge`） |
+| `rtt_probe_bridge.py` | **探针侧 RTT 桥测速**：boost 目标 → HID `CMD_RTT` 启动桥 → 只读串口测吞吐，并做全流零丢包校验 |
 | `rtt_bridge_sweep.py` | **调优扫描**：时钟 × clock_delay × 块大小，并排给出「纯 SWD 基准 / 丢弃模式搬运 / 端到端」三个数，直接指出天花板在哪一侧（`--clk=` 指定桥的请求档位） |
 | `rtt_rate_matrix.py` | **逐档对照表**：同一目标主频下逐档量「纯 SWD 读速」与「RTT 交付率」，给出占比与主导方（按每次搬运字节数实测判定），可直接贴进文档 |
 | `rtt_peek.py` | 读探针自身内存（HID `CMD_RTT` action 5），bring-up 期查 `DAP_Data`/trace 用 |
@@ -99,7 +99,7 @@ WrOff/RdOff → 读环形缓冲 → 写回 RdOff），每次轮询约 3 ms 固�
 > 控制块，再经 USB 推给主机），这样就没有主机往返开销，理论上限回到 SWD 读带宽
 > （~2 MB/s）。J-Link 就是这么做的，属于固件新功能。
 
-**这条路已经在分支 `feat/probe-rtt-bridge` 上做完了**，实测：
+**这条路已经做完了**（已合入 `main`），实测：
 
 | 配置 | 吞吐 |
 | --- | --- |

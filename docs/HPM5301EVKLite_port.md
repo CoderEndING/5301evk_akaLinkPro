@@ -148,7 +148,7 @@ DAP 目标脚（PA04–PA08）就是芯片自身的 JTAG 引脚：
 
 ---
 
-## 5. 探针侧 RTT→CDC 桥（分支 `feat/probe-rtt-bridge`）
+## 5. 探针侧 RTT→CDC 桥（已合入 `main`）
 
 普通 RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 WrOff/RdOff → 读环形
 缓冲 → 写回 RdOff），上限 ~1.1 MB/s。这个分支把轮询下沉进探针固件（J-Link 式），
