@@ -5,6 +5,9 @@ akaLinkPro 是一个基于 HPM5300 的高性能 CMSIS-DAP 调试器。
 - 主固件：`firmware/application_5301`
 - DFU/MSC Bootloader：`firmware/bootloader_dfu`
 - 配置上位机（WebHID）：`docs/index.html`
+- 板级：`boards/akaLinkPro`（原板）与 `boards/hpm5301evklite`
+  （HPM5301EVKLite 移植，DAP 输出走 J5 JTAG 座，
+  见 [docs/HPM5301EVKLite_port.md](docs/HPM5301EVKLite_port.md)）
 
 构建 / 烧录 / 调试说明见 `.opencode/skills/akalinkpro-firmware/SKILL.md`。
 
