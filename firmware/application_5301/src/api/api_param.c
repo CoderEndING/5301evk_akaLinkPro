@@ -53,6 +53,9 @@
 #define RTT_ACT_RAW_DAP 4U
 #define RTT_ACT_PEEK 5U
 #define RTT_ACT_RAW_RESULT 6U
+#define RTT_ACT_CONFIG 7U
+#define RTT_ACT_BENCH 8U
+#define RTT_ACT_BENCH_RESULT 9U
 
 #define PARAM_MAGIC_NUMBER (0x0D000721UL)
 /* EasyFlash ENV key that stores the whole api_param_t blob. */
@@ -272,14 +275,56 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
             rc = (int8_t)n;
             break;
         }
+        case RTT_ACT_CONFIG:
+        {
+            /* Runtime tuning: req_hid[4..7] = SWD clock (Hz, 0 = keep),
+             * req_hid[8..9] = block bytes (0 = keep), req_hid[10] = flags
+             * (bit0 = discard: drain the target ring without feeding the CDC,
+             * which measures the raw SWD side), req_hid[11] = clock_delay
+             * override (0xFF = use the value Set_Clock_Delay picked). */
+            uint32_t hz = (uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                          ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24);
+            uint32_t chunk = (uint32_t)req_hid[8] | ((uint32_t)req_hid[9] << 8);
+
+            rtt_bridge_configure(hz, chunk, req_hid[10], req_hid[11]);
+            break;
+        }
+        case RTT_ACT_BENCH:
+        {
+            /* Pure SWD read benchmark: req_hid[4..7] = target address,
+             * req_hid[8..9] = bytes per iteration, req_hid[10..11] = iterations. */
+            uint32_t addr = (uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                            ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24);
+            uint32_t bytes = (uint32_t)req_hid[8] | ((uint32_t)req_hid[9] << 8);
+            uint32_t iters = (uint32_t)req_hid[10] | ((uint32_t)req_hid[11] << 8);
+
+            rtt_bridge_request_bench(addr, bytes, iters);
+            break;
+        }
+        case RTT_ACT_BENCH_RESULT:
+        {
+            uint32_t bytes = 0U;
+            uint32_t ticks = 0U;
+            int32_t err = 0;
+
+            if (rtt_bridge_bench_result(&bytes, &ticks, &err))
+            {
+                out[0] = (uint32_t)err; /* 0 = ok, -1/-2 = SWD 初始化/读失败 */
+                out[1] = bytes;
+                out[2] = ticks;         /* MCHTMR tick，24 MHz */
+                rc = 1;
+            }
+            break;
+        }
         case RTT_ACT_STATUS:
         default:
             break;
         }
 
-        /* PEEK and RAW_RESULT fill out[] themselves; everything else reports
-         * the bridge status words. */
-        if ((req_hid[3] != RTT_ACT_PEEK) && (req_hid[3] != RTT_ACT_RAW_RESULT))
+        /* PEEK / RAW_RESULT / BENCH_RESULT fill out[] themselves; everything
+         * else reports the bridge status words. */
+        if ((req_hid[3] != RTT_ACT_PEEK) && (req_hid[3] != RTT_ACT_RAW_RESULT) &&
+            (req_hid[3] != RTT_ACT_BENCH_RESULT))
         {
             (void)rtt_bridge_status(out, 12U);
             out[10] = (uint32_t)(int32_t)rtt_bridge_start_result();

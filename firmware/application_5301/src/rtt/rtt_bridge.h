@@ -35,6 +35,23 @@ int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel);
 void rtt_bridge_request_start(uint32_t addr, uint32_t size, uint8_t channel);
 int  rtt_bridge_start_result(void);
 
+/* Runtime tuning (HID CMD_RTT action 7). chunk_bytes is the block size of one
+ * swd_read_memory() call (clamped to [64, 4096]); swd_clock_hz = 0 keeps the
+ * current setting. `discard` = 1 drops the drained bytes instead of pushing
+ * them into the CDC ring, which isolates the raw SWD drain rate from the USB
+ * path. delay_override != 0xFF forces DAP_Data.clock_delay (the one timing
+ * knob the bit-bang blobs expose) instead of the value Set_Clock_Delay()
+ * picked for the requested clock. Takes effect immediately. */
+void rtt_bridge_configure(uint32_t swd_clock_hz, uint32_t chunk_bytes, uint8_t discard,
+                          uint8_t delay_override);
+
+/* Pure SWD read benchmark (HID CMD_RTT actions 8/9): read `bytes` from `addr`
+ * of the TARGET `iters` times through the same swd_host path the bridge uses,
+ * measuring MCHTMR ticks. Deferred to the main loop like every other SWD op. */
+void rtt_bridge_request_bench(uint32_t addr, uint32_t bytes, uint32_t iters);
+/* Returns 1 once a result is available, 0 while pending. */
+int  rtt_bridge_bench_result(uint32_t *bytes, uint32_t *ticks, int32_t *err);
+
 /* Bring-up debugging: record the last host DAP request/response pair. */
 extern volatile uint8_t g_dap_trace[64];
 void rtt_bridge_trace_dap(const uint8_t *req, const uint8_t *resp);

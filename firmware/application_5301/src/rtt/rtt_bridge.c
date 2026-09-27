@@ -28,6 +28,7 @@
 #include "cdc_interface.h"
 #include "rtt_bridge.h"
 #include "swd_host.h"   /* ARM DAPLink 官方 SWD 访问层（见 src/swd_host/） */
+#include "hpm_clock_drv.h" /* clock_cpu_delay_ms() */
 
 /* Debug port / AHB-AP 的寄存器与传输编码由官方 swd_host.c / debug_cm.h 负责，
  * 这里只留桥自己的配置常量。 */
@@ -43,8 +44,21 @@
 #define RTT_UP_WROFF_OFF 12U
 #define RTT_UP_RDOFF_OFF 16U
 
+/* 单次块读的字节数（默认值，运行时可经 HID CMD_RTT action 7 改）：
+ * 官方 swd_read_memory() 内部按 1 KB 页切分，这里再限到 512 B（=128 字）
+ * —— 实测这是目标运行中长块读不会 WAIT/FAULT 的可靠尺寸。 */
+#define RTT_SWD_CHUNK 512U
+
 /* 每次轮询最多搬运的字节数。 */
 #define RTT_MAX_DRAIN 2048U
+
+/* 找不到 RTT 控制块时的重试（见 rtt_bridge_start 里的说明）。 */
+#define RTT_CB_SCAN_ATTEMPTS 3U
+#define RTT_CB_SCAN_INTERVAL_MS 20U
+
+/* 启动失败时自动降档的候选（只在低于请求频率时使用）。 */
+#define RTT_CLOCK_LADDER {36000000UL, 30000000UL, 20000000UL, 10000000UL}
+#define RTT_CLOCK_LADDER_LEN 4U
 
 /* MCHTMR runs at 24 MHz (osc24m). */
 #define RTT_MCHTMR_HZ 24000000UL
@@ -73,6 +87,15 @@ static uint32_t s_backoff_until;
 /* 上次没写成功、待幂等补写的 RdOff（0 值有效，用 valid 标志区分） */
 static uint32_t s_rd_pending;
 static uint8_t s_rd_pending_valid;
+
+/* 运行时可调参数（HID CMD_RTT action 7）：块读字节数、SWD 时钟、丢弃模式。
+ * 块读越大，每块的固定开销（CSW/TAR/prime/RDBUFF 共 5 次传输）摊得越薄。 */
+static uint32_t s_chunk = RTT_SWD_CHUNK;
+static uint32_t s_swd_clock_req = RTT_SWD_CLOCK_HZ; /* 用户请求的档位 */
+static uint32_t s_swd_clock_hz = RTT_SWD_CLOCK_HZ;  /* 当前实际使用的档位 */
+static uint8_t s_discard;
+static uint8_t s_swd_ready;
+static uint8_t s_delay_override = 0xFFU; /* 0xFF = 用 Set_Clock_Delay() 的档位值 */
 
 static uint32_t s_drained;
 static uint32_t s_polls;
@@ -118,9 +141,7 @@ static void dap_cmd(const uint8_t *req, uint8_t *resp)
                  ((uint32_t)resp[2] << 16) | ((uint32_t)resp[3] << 24);
 }
 
-/* 单次块读的字节数：官方 swd_read_memory() 内部按 1 KB 页切分，这里再限到
- * 512 B（=128 字）—— 实测这是目标运行中长块读不会 WAIT/FAULT 的可靠尺寸。 */
-#define RTT_SWD_CHUNK 512U
+/* 单次块读的字节数：见文件头部的 RTT_SWD_CHUNK（默认值），此处用的是运行时值。 */
 
 /* Load the fast bit-bang blob and set the SWD timing. Uses the DAP command
  * only to reach Set_Clock_Delay(); it performs no SWD traffic. */
@@ -154,17 +175,22 @@ static int rtt_swd_init(void)
         return -2;
     }
 
-    if (rtt_swd_set_clock(RTT_SWD_CLOCK_HZ) != 0)
+    if (rtt_swd_set_clock(s_swd_clock_hz) != 0)
     {
         return -1;
     }
+    if (s_delay_override != 0xFFU)
+    {
+        DAP_Data.clock_delay = s_delay_override; /* SWJ_Clock 会重设，压回覆盖值 */
+    }
 
+    s_swd_ready = 1U;
     return 0;
 }
 
 /* Read `len` bytes from an arbitrary (possibly unaligned) address.
  * 官方 swd_read_memory() 自己会处理未对齐的头/尾字节，这里只负责把它切成
- * 512 B 的块（目标运行中长块读会 WAIT/FAULT）。 */
+ * s_chunk 大小的块（目标运行中长块读会 WAIT/FAULT）。 */
 static int rtt_read_bytes(uint32_t addr, uint8_t *dst, uint32_t len)
 {
     uint32_t done = 0U;
@@ -172,9 +198,9 @@ static int rtt_read_bytes(uint32_t addr, uint8_t *dst, uint32_t len)
     while (done < len)
     {
         uint32_t n = len - done;
-        if (n > RTT_SWD_CHUNK)
+        if (n > s_chunk)
         {
-            n = RTT_SWD_CHUNK;
+            n = s_chunk;
         }
         if (swd_read_memory(addr + done, &dst[done], n) == 0U)
         {
@@ -189,23 +215,41 @@ static int rtt_read_bytes(uint32_t addr, uint8_t *dst, uint32_t len)
 /* Control block discovery                                             */
 /* ------------------------------------------------------------------ */
 
+/* 512 B 重叠窗扫描：窗口 512 B、步进 503 B（重叠 9 B，保证跨窗签名不漏）。
+ * 早先的 4 字节步进小读每步要 11 次传输（2 字块读 + 2 次字节读），扫 64 KB
+ * 就是 18 万次传输 —— 在 45 MHz 那档上必然踩到临界，导致控制块找不到。
+ * 换成块读后传输数少一个数量级，扫描本身也快得多。 */
+#define RTT_SCAN_BLOCK 512U
+#define RTT_SCAN_STEP  (RTT_SCAN_BLOCK - RTT_BRIDGE_SIG_LEN + 1U)
+
+static uint8_t s_scan[RTT_SCAN_BLOCK];
+
 static int rtt_find_cb(void)
 {
-    uint8_t sig[RTT_BRIDGE_SIG_LEN];
+    const uint32_t end = s_search_addr + s_search_size;
+    uint32_t off;
 
     s_cb_addr = 0U;
-    for (uint32_t addr = s_search_addr; addr + RTT_BRIDGE_SIG_LEN <= s_search_addr + s_search_size; addr += 4U)
+    for (off = 0U; (s_search_addr + off + RTT_BRIDGE_SIG_LEN) <= end; off += RTT_SCAN_STEP)
     {
-        if (rtt_read_bytes(addr, sig, RTT_BRIDGE_SIG_LEN) != 0)
+        uint32_t want = end - (s_search_addr + off);
+        if (want > RTT_SCAN_BLOCK)
+        {
+            want = RTT_SCAN_BLOCK;
+        }
+        if (rtt_read_bytes(s_search_addr + off, s_scan, want) != 0)
         {
             s_read_err++;
-            continue;
+            continue; /* 这一段读不动（例如超出目标 SRAM），跳过 */
         }
-        if (memcmp(sig, RTT_BRIDGE_SIGNATURE, RTT_BRIDGE_SIG_LEN) == 0)
+        for (uint32_t i = 0U; (i + RTT_BRIDGE_SIG_LEN) <= want; i++)
         {
-            s_cb_addr = addr;
-            s_up_addr = addr + RTT_CB_UP_OFFSET + (uint32_t)s_channel * RTT_UP_DESC_SIZE;
-            return 0;
+            if (memcmp(&s_scan[i], RTT_BRIDGE_SIGNATURE, RTT_BRIDGE_SIG_LEN) == 0)
+            {
+                s_cb_addr = s_search_addr + off + i;
+                s_up_addr = s_cb_addr + RTT_CB_UP_OFFSET + (uint32_t)s_channel * RTT_UP_DESC_SIZE;
+                return 0;
+            }
         }
     }
     return -1;
@@ -261,13 +305,16 @@ static int rtt_poll_once(uint32_t *moved)
     {
         target = RTT_MAX_DRAIN;
     }
-    if (target > free_space)
+    if (s_discard == 0U)
     {
-        target = free_space;
-    }
-    if (target == 0U)
-    {
-        return 0; /* the host is not draining fast enough */
+        if (target > free_space)
+        {
+            target = free_space;
+        }
+        if (target == 0U)
+        {
+            return 0; /* the host is not draining fast enough */
+        }
     }
 
     first = up.size - up.rd;
@@ -290,8 +337,12 @@ static int rtt_poll_once(uint32_t *moved)
     }
 
     /* 先交付到 CDC 环，再推进目标侧 RdOff：这样即使 RdOff 写失败，字节也已经
-     * 送到了主机，绝不会丢；RdOff 由上面的幂等重试补齐，也不会重。 */
-    chry_ringbuffer_write(&g_uartrx, s_stage, target);
+     * 送到了主机，绝不会丢；RdOff 由上面的幂等重试补齐，也不会重。
+     * 丢弃模式（基准测试用）只计数、不送环，用来量纯 SWD 侧的天花板。 */
+    if (s_discard == 0U)
+    {
+        chry_ringbuffer_write(&g_uartrx, s_stage, target);
+    }
 
     s_drained += target;
     s_drains++;
@@ -309,6 +360,22 @@ static int rtt_poll_once(uint32_t *moved)
     return 0;
 }
 
+/* 链路变差时自愈：降一档（只降不升，避免来回抖）。返回 1 表示档位变了。 */
+static int rtt_clock_step_down(void)
+{
+    static const uint32_t ladder[RTT_CLOCK_LADDER_LEN] = RTT_CLOCK_LADDER;
+
+    for (uint32_t i = 0U; i < RTT_CLOCK_LADDER_LEN; i++)
+    {
+        if (ladder[i] < s_swd_clock_hz)
+        {
+            s_swd_clock_hz = ladder[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
@@ -320,6 +387,7 @@ int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel)
     s_channel = channel;
     s_search_addr = (addr != 0U) ? addr : RTT_BRIDGE_DEFAULT_ADDR;
     s_search_size = (size != 0U) ? size : RTT_BRIDGE_DEFAULT_SIZE;
+    s_swd_clock_hz = s_swd_clock_req; /* 每次启动都从用户请求的档位开始 */
 
     /* 每次启动清零计数器：一次实验的读数只反映这一次。 */
     s_drained = 0U;
@@ -333,14 +401,57 @@ int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel)
     s_last_poll_bytes = 0U;
     s_rd_pending_valid = 0U;
 
-    int rc = rtt_swd_init();
+    int rc = -3;
+    uint32_t req_hz = s_swd_clock_hz;
+    uint32_t try_hz[4];
+    uint32_t ntry = 0U;
+    static const uint32_t ladder[RTT_CLOCK_LADDER_LEN] = RTT_CLOCK_LADDER;
+
+    /* 高频档在这条链路上是间歇性的：同样的 36 MHz，长块读能跑满而控制块扫描
+     * 会失败（blob 是固定时序，短读/字节读的余量小得多）。与其赌一个档位，
+     * 不如从请求频率往下走，用第一次能扫到控制块的档位 —— 用户直接要
+     * 60 MHz 也能自动落到当下可用的最快档。 */
+    try_hz[ntry++] = req_hz;
+    for (uint32_t i = 0U; i < RTT_CLOCK_LADDER_LEN && ntry < 4U; i++)
+    {
+        uint32_t x = ladder[i];
+        if (x < req_hz)
+        {
+            try_hz[ntry++] = x;
+        }
+    }
+
+    for (uint32_t a = 0U; a < ntry; a++)
+    {
+        s_swd_clock_hz = try_hz[a];
+        rc = rtt_swd_init();
+        if (rc != 0)
+        {
+            continue;
+        }
+        /* swd_init_debug() 的 abort 路径会拉一次目标 nRESET（DAPLink 的既定
+         * 行为），目标此时可能才刚开始启动、RTT 控制块还没建好；给它一点时间，
+         * 而不是一次扫描失败就换档。 */
+        for (uint32_t attempt = 0U; attempt < RTT_CB_SCAN_ATTEMPTS; attempt++)
+        {
+            if (rtt_find_cb() == 0)
+            {
+                rc = 0;
+                break;
+            }
+            clock_cpu_delay_ms(RTT_CB_SCAN_INTERVAL_MS);
+        }
+        if (rc == 0)
+        {
+            break;
+        }
+        rc = -3;
+    }
+
     if (rc != 0)
     {
+        s_swd_clock_hz = req_hz; /* 都没成功：留住用户要的档位，下次再试 */
         return rc;
-    }
-    if (rtt_find_cb() != 0)
-    {
-        return -3;
     }
 
     /* The UART must not feed the same CDC ringbuffer while RTT does. */
@@ -362,6 +473,7 @@ void rtt_bridge_stop(void)
     s_cb_addr = 0U;
     s_up_addr = 0U;
     s_rd_pending_valid = 0U;
+    s_swd_ready = 0U; /* 主机随时可能重新接管 SWD，下次用前重新初始化 */
 }
 
 int rtt_bridge_is_running(void)
@@ -372,6 +484,9 @@ int rtt_bridge_is_running(void)
 void rtt_bridge_note_dap_activity(void)
 {
     s_last_dap = mchtmr_now();
+    /* 主机用过 DAP（例如 OpenOCD 刚连过），DP 的时钟档/供电状态就不再由我们
+     * 掌握：下次启动或基准测试必须重新初始化，不能复用旧状态。 */
+    s_swd_ready = 0U;
 }
 
 /* Bring-up debugging: keep the last host DAP request/response so the exact
@@ -401,6 +516,14 @@ static uint32_t s_raw_req_len;
 static uint8_t s_raw_rsp[24];
 static volatile uint32_t s_raw_rsp_len;
 static volatile int8_t s_start_rc = -100;
+static uint32_t s_bench_addr;
+static uint32_t s_bench_bytes;
+static uint32_t s_bench_iters;
+static volatile uint8_t s_bench_pending;
+static volatile uint8_t s_bench_valid;
+static uint32_t s_bench_moved;
+static uint32_t s_bench_ticks;
+static volatile int32_t s_bench_err;
 
 void rtt_bridge_request_start(uint32_t addr, uint32_t size, uint8_t channel)
 {
@@ -440,6 +563,121 @@ uint32_t rtt_bridge_raw_result(uint8_t *out, uint32_t max)
     return n;
 }
 
+/* ------------------------------------------------------------------ */
+/* 运行时可调参数 + 纯 SWD 读基准                                       */
+/* ------------------------------------------------------------------ */
+
+void rtt_bridge_configure(uint32_t swd_clock_hz, uint32_t chunk_bytes, uint8_t discard,
+                          uint8_t delay_override)
+{
+    if (chunk_bytes != 0U)
+    {
+        if (chunk_bytes < 64U)
+        {
+            chunk_bytes = 64U;
+        }
+        if (chunk_bytes > 4096U)
+        {
+            chunk_bytes = 4096U;
+        }
+        s_chunk = chunk_bytes;
+    }
+
+    if (delay_override != 0xFFU)
+    {
+        s_delay_override = delay_override;
+    }
+
+    if (swd_clock_hz != 0U)
+    {
+        s_swd_clock_req = swd_clock_hz;
+        s_swd_clock_hz = swd_clock_hz;
+        if (s_swd_ready)
+        {
+            (void)rtt_swd_set_clock(swd_clock_hz); /* 运行中也能改档 */
+        }
+    }
+
+    /* clock_delay 是 blob 唯一暴露的时序参数，主机档位表之外还能再压一档。 */
+    if (s_delay_override != 0xFFU)
+    {
+        DAP_Data.clock_delay = s_delay_override;
+    }
+
+    s_discard = (discard != 0U) ? 1U : 0U;
+}
+
+void rtt_bridge_request_bench(uint32_t addr, uint32_t bytes, uint32_t iters)
+{
+    if (bytes == 0U)
+    {
+        bytes = 512U;
+    }
+    if (bytes > RTT_MAX_DRAIN)
+    {
+        bytes = RTT_MAX_DRAIN;
+    }
+    if (iters == 0U)
+    {
+        iters = 1U;
+    }
+    if (iters > 64U)
+    {
+        iters = 64U; /* 一次最多 128 KB，别让主循环停太久 */
+    }
+
+    s_bench_addr = addr;
+    s_bench_bytes = bytes;
+    s_bench_iters = iters;
+    s_bench_valid = 0U;
+    s_bench_pending = 1U;
+}
+
+int rtt_bridge_bench_result(uint32_t *bytes, uint32_t *ticks, int32_t *err)
+{
+    if (s_bench_valid == 0U)
+    {
+        return 0;
+    }
+    *bytes = s_bench_moved;
+    *ticks = s_bench_ticks;
+    *err = s_bench_err;
+    return 1;
+}
+
+/* Runs from the main loop: reads a fixed target region over and over through
+ * the very same swd_host path the bridge uses, so the number is the SWD side
+ * only (no CDC, no USB, no target-side producer). */
+static void rtt_bridge_run_bench(void)
+{
+    s_bench_err = 0;
+    s_bench_moved = 0U;
+    s_bench_ticks = 0U;
+
+    if (s_swd_ready == 0U)
+    {
+        s_bench_err = (int32_t)rtt_swd_init();
+        if (s_bench_err != 0)
+        {
+            s_bench_valid = 1U;
+            return;
+        }
+    }
+
+    uint32_t t0 = mchtmr_now();
+    for (uint32_t i = 0U; i < s_bench_iters; i++)
+    {
+        if (rtt_read_bytes(s_bench_addr, s_stage, s_bench_bytes) != 0)
+        {
+            s_bench_err = -2;
+            break;
+        }
+        s_bench_moved += s_bench_bytes;
+    }
+    s_bench_ticks = mchtmr_now() - t0;
+    s_bench_valid = 1U;
+}
+
 /* Runs from the main loop: performs any queued SWD work. */
 static void rtt_bridge_service_requests(void)
 {
@@ -457,6 +695,11 @@ static void rtt_bridge_service_requests(void)
     {
         s_start_pending = 0U;
         s_start_rc = (int8_t)rtt_bridge_start(s_req_addr, s_req_size, s_req_channel);
+    }
+    if (s_bench_pending)
+    {
+        s_bench_pending = 0U;
+        rtt_bridge_run_bench();
     }
 }
 
@@ -499,6 +742,12 @@ void rtt_bridge_poll(void)
         {
             err_run = 0U;
             s_rescans++;
+            /* 链路变差（高频档余量不够）时自愈：降一档并重新初始化，再重扫。 */
+            if (rtt_clock_step_down())
+            {
+                s_swd_ready = 0U;
+                (void)rtt_swd_init();
+            }
             s_cb_addr = 0U;
             if (rtt_find_cb() != 0)
             {
@@ -516,7 +765,7 @@ void rtt_bridge_poll(void)
 
 uint32_t rtt_bridge_status(uint32_t *out, uint32_t words)
 {
-    uint32_t w[10];
+    uint32_t w[12];
 
     w[0] = (uint32_t)s_running | ((uint32_t)s_channel << 8) |
            ((DAP_Data.debug_port == DAP_PORT_SWD) ? (1UL << 16) : 0UL) |
@@ -530,8 +779,11 @@ uint32_t rtt_bridge_status(uint32_t *out, uint32_t words)
     w[7] = s_gate_hits | (s_rescans << 16);
     w[8] = s_last_cmd;
     w[9] = s_last_rsp; /* [0]=id [1]=count_lo [2]=count_hi/port [3]=response value */
+    w[10] = 0U;        /* 调用方（api_param）会把它覆盖成 start_rc */
+    w[11] = s_chunk | ((uint32_t)s_discard << 16) |
+            ((uint32_t)(s_swd_clock_hz / 1000000U) << 24); /* 低16=块字节, bit16=丢弃, 高8=时钟MHz */
 
-    for (uint32_t i = 0; i < words && i < 10U; i++)
+    for (uint32_t i = 0; i < words && i < 12U; i++)
     {
         out[i] = w[i];
     }
