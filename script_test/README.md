@@ -1,16 +1,26 @@
 # script_test
 
-akaLinkPro (HPM5301) 固件测试脚本集合。这些脚本用于验证 **UART2 ↔ CDC 串口桥**、
-**DAP 模式切换**（SWD/空闲 = UART2，JTAG = FGPIO）以及设备枚举状态。
+akaLinkPro (HPM5301) 固件测试脚本集合。这些脚本用于验证 **UART ↔ CDC 串口桥**、
+**DAP 模式切换**（SWD/空闲 = UART，JTAG = FGPIO）以及设备枚举状态。
+
+## 回环接线（两台板子不同！）
+
+| 板子 | CDC VCOM 引脚 | 回环短接位置 |
+| --- | --- | --- |
+| akaLinkPro | UART2 PA08(TXD)/PA09(RXD) | PA08 ↔ PA09 |
+| HPM5301EVKLite | UART3 PB15(TXD)/PB14(RXD) | **J3.8 ↔ J3.10**（丝印 UART_TXD/UART_RXD） |
+
+> 接逻辑分析仪**不算**回环，必须把 TX 和 RX 两个脚真正短接。
 
 ## 依赖
 
 - Python 3.11 + `pyserial`、`pyusb`（`pip install pyserial pyusb`）
 - Windows 上需已安装 libusb/WinUSB 驱动（pyusb 后端）
-- 硬件：将 **PA08(TXD) 与 PA09(RXD) 短接**（串口回环）
 - 设备运行 `application_5301` 固件，并在系统中枚举出 CDC 串口（COMx）
 
 COM 端口号在不同机器上会变化，脚本支持通过参数传入，默认 `COM75`。
+EVKLite 上 CDC 是复合设备的 `MI_01`，可用
+`Get-PnpDevice -PresentOnly | Where-Object InstanceId -match 'VID_0D28&PID_0204&MI_01'` 确认。
 
 ## 脚本说明
 
@@ -26,6 +36,26 @@ COM 端口号在不同机器上会变化，脚本支持通过参数传入，默�
 | `list_usb.ps1` | 列出 `VID_0D28` 相关 USB 设备与 CDC 端口（状态检查） |
 | `hold_port.py` | 打开串口并保持若干秒，便于用 J-Link/GDB 在线检查运行状态 |
 | `swd/run_benchmark.py` | 生成指定 `adapter speed`/`iterations` 的 OpenOCD SWD 读写校验并运行 |
+
+> `stm32f103_rtt_speed/` 是 RTT 测速用的 STM32F103 测试固件（SEGGER RTT + 计数
+> 全局变量），`rtt_*.py` 需要它编译出的 `build/fw.bin`：先跑
+> `powershell -File stm32f103_rtt_speed\build.ps1`（需要 arm-none-eabi 工具链），
+> 或自带一份已编译的 `fw.bin`（`build/` 不入库）。
+> `sram_speed_test.py` / `rtt_*.py` 走 OpenOCD，路径由环境变量
+> `OPENOCD_EXE` / `OPENOCD_SCRIPTS` / `HPM_SDK_ENV_DIR` 覆盖。
+
+### EVKLite（HPM5301EVKLite）专用
+
+| 文件 | 用途 |
+| --- | --- |
+| `evk_echo.py` | **最常用**：打开 CDC 写 27 字节并比对回环，退出码 0=PASS |
+| `evk_flash.py` | HID `CMD_ENTER_DFU` → DFU 虚拟盘拖入 `_pack.bin` → 等 APP 回来 |
+| `evk_dfu_enter.py` | 只发 HID 进 DFU 命令（不烧录） |
+| `evk_jtag_mode_test.py` | 验证切到 SWD+JTAG 模式后 COM 口仍可用（引脚复用回归） |
+| `evk_probe.py` | 快速探测：CDC 有无自发数据 + HID 应答格式 |
+| `evk_verify.py` | 带 HID 状态读数的回环验证（需 TEMP-DIAG 诊断固件） |
+| `evk_diag.py` | 全量诊断（需诊断固件）：引脚直连自测 / UART 内部回环 / 计数器 / force-start |
+| `evk_watch_jumper.py` | 打开 TX 心跳并实时轮询 RX 计数，用于边插跳线边观察（需诊断固件） |
 
 ### 运行示例
 
