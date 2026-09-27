@@ -17,6 +17,20 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 `BOARD_HAS_SWDIO_DIR`、`BOARD_NRESET_ACTIVE_LOW`、`BOARD_LED_ACTIVE_LOW`、
 `BOARD_HAS_VREF_ADC`、`BOARD_SWD_BLOB_EVKLITE` 等），两块板共用同一套 `src/`。
 
+## 主要特性
+
+- **CMSIS-DAP 调试器**：USB-HS 复合设备（DAP + CDC + 自定义 HID + WebUSB + DFU Runtime），
+  SWJ 支持 SWD/JTAG；bit-bang 引擎按速度预编译（20/30/36/45/60 MHz 档 + Slow C 版），
+  实测目标 SRAM 读在 60 MHz 档达 2376~2640 KB/s。
+- **探针侧 SEGGER RTT→CDC 桥**（HID `CMD_RTT` 0x31）：把 RTT 轮询从主机下沉进探针固件
+  （J-Link 式），主机只读一个串口。**默认 45 MHz 档：2527 KB/s（2.47 MB/s）零丢包**；
+  切 60 MHz 档：**2954 KB/s（2.89 MB/s）** —— 比主机轮询上限（1140 KB/s）快 **2.6 倍**。
+  详见 [探针侧 RTT→CDC 桥](#探针侧-rttcdc-桥)。
+- **DFU/MSC Bootloader**：长按 USER 键进 DFU，虚拟 U 盘 `AKALINKPRO` 拖入 `.bin` 即升级；
+  APP 带签名 + 长度 + CRC32 校验，校验失败停在 DFU。
+- **配置持久化 + WebHID 上位机**：配置存 QSPI NOR（EasyFlash），`docs/index.html` 可直接改。
+- **两块硬件一套源码**：akaLinkPro 原板与 HPM5301EVKLite 移植板，靠 `board.h` 特性宏切换。
+
 ## HPM5301EVKLite 引脚与接线
 
 ### DAP 目标调试口（J5，同时是芯片自身 JTAG）
@@ -110,6 +124,14 @@ make uart-echo   :: EVKLite CDC 回环快检（先短接 J3.8 <-> J3.10）
 make uart-loop   :: EVKLite CDC 全速率回环扫描
 ```
 
+探针侧 RTT 桥的三个脚本（需要目标板跑 `script_test/stm32f103_rtt_speed`，默认自带 96 MHz 超频）：
+
+```bat
+python script_test\rtt_probe_bridge.py COM52 10       :: 桥测速 + 全流零丢包校验（最常用）
+python script_test\rtt_rate_matrix.py COM52           :: 逐档对照：SWD 读速 / 交付率 / 占比 / 谁主导
+python script_test\rtt_bridge_sweep.py COM52 --clk=60 :: 调优扫描：时钟 x 块大小 x 丢弃模式
+```
+
 `make sram-test` 实测（20 KB @ `0x20000000`，OpenOCD `load_image`/`dump_image`，
 目标已归一到 64 MHz）：
 
@@ -126,7 +148,7 @@ make uart-loop   :: EVKLite CDC 全速率回环扫描
 > 变化一倍。`sram_speed_test.py` 因此默认在每轮复位后把目标提到 64 MHz 并打印
 > 实测时钟（`--no-boost` 可关闭）。
 
-### SEGGER RTT 吞吐（同一块探针，为什么不是 2 MB/s）
+### SEGGER RTT 吞吐：从 919 KB/s 到 2.9 MB/s
 
 RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 WrOff/RdOff → 读环形
 缓冲 → 写回 RdOff），而 SRAM 测速是一次大块流水传输，所以两者不可比。实测阶梯
