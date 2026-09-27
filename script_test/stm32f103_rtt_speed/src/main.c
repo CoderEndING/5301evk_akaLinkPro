@@ -24,13 +24,15 @@
  * 就是 128 MHz。想要 144 MHz 必须换晶振（9 MHz ×16 或 12 MHz ×12）或从 OSC_IN
  * 灌外部时钟 —— ×18 这一档 F103 的 PLL 不存在。
  *
- * 这里默认 72 MHz（= HSE ×9，F103 的额定上限，flash latency 2 即可满足）。
- * 再往上到 128 MHz 时 flash 就喂不动核心了：latency 最多 2（3 周期 ≈ 23 ns），
- * 而 F103 的 flash 实际需要 ~40 ns —— 实测固件自己在开头切到 128 MHz 会立刻
- * 触发硬故障（HFSR=FORCED、CFSR=IACCVIOL|STKERR，即取指错误跳飞）。
- * 想稳跑 128 MHz 得把热代码搬到 SRAM 执行；目前 128 MHz 只由上位机在
- * halted 状态下切换（见 script_test 里的 boost），让固件从复位向量就以该频率
- * 启动，能跑但余量很小（紧凑循环靠预取缓冲命中）。
+ * 这里默认 96 MHz（= HSE ×12）。F103 额定上限是 72 MHz，96 MHz 属于超频，但
+ * flash 余量还够：latency 最多 2（3 周期），96 MHz 下 = 31 ns，而 F103 flash 实际
+ * 需要 ~40 ns —— 仍在超，但比 128 MHz（23 ns）安全得多。实测 96 MHz 下固件自切
+ * 不会硬故障、RTT 生产者跑到 ~3.3 MB/s（72 MHz 时 2.5 MB/s）。
+ *
+ * 再往上到 128 MHz（HSE ×16）就不行了：实测固件自己在开头切过去会立刻硬故障
+ * （HFSR=FORCED、CFSR=IACCVIOL|STKERR，即取指出错跳飞）。128 MHz 只能在 halted
+ * 状态下由上位机切换，让固件从复位向量就以该频率启动，紧凑循环靠预取缓冲勉强跑；
+ * 想稳跑 128 MHz 应把热代码搬到 SRAM 执行。
  *
  * 超频三件套缺一不可：
  *   1. FLASH_ACR 先给足等待周期 + 预取；
@@ -38,7 +40,7 @@
  *   3. 换频必须走完整时序：SW→HSI、关 PLL、改倍频、开 PLL、SW→PLL ——
  *      PLL 的配置位在 PLLON=1 时是写保护的，直接改无效（最容易踩的一条）。
  * --------------------------------------------------------------------------- */
-#define TARGET_HCLK_MHZ 72
+#define TARGET_HCLK_MHZ 96
 
 #define FLASH_ACR (*(volatile uint32_t *)0x40022000)
 #define RCC_CR_HSEON (1u << 16)
