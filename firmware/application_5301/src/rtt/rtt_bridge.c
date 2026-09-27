@@ -33,9 +33,11 @@
 /* Debug port / AHB-AP 的寄存器与传输编码由官方 swd_host.c / debug_cm.h 负责，
  * 这里只留桥自己的配置常量。 */
 
-/* SWD clock used by the bridge: fast enough to move a 12 KB ring, slow enough
- * to stay reliable while the target runs (45/60 MHz start failing there). */
-#define RTT_SWD_CLOCK_HZ 36000000UL
+/* 桥默认的 SWD 时钟档。四处链路健壮性修复（见文件末的自愈逻辑说明）之后，
+ * 45 MHz 档已经稳定：目标 72 MHz 时交付 2477 KB/s、目标 128 MHz 时 2637 KB/s，
+ * 都是零丢包。再往上（60/80 MHz）那两档 blob 仍有少量错误会自动降档，故默认取 45。
+ * 启动时若这一档扫不到控制块，会沿 36→30→20→10 自动往下找。 */
+#define RTT_SWD_CLOCK_HZ 45000000UL
 
 /* SEGGER RTT layout (SEGGER_RTT.h): CB header 24 bytes, then per up-buffer
  * {name, pBuffer, SizeOfBuffer, WrOff, RdOff, Flags} = 24 bytes. */
@@ -44,10 +46,10 @@
 #define RTT_UP_WROFF_OFF 12U
 #define RTT_UP_RDOFF_OFF 16U
 
-/* 单次块读的字节数（默认值，运行时可经 HID CMD_RTT action 7 改）：
- * 官方 swd_read_memory() 内部按 1 KB 页切分，这里再限到 512 B（=128 字）
- * —— 实测这是目标运行中长块读不会 WAIT/FAULT 的可靠尺寸。 */
-#define RTT_SWD_CHUNK 512U
+/* 单次块读的字节数（默认值，运行时可经 HID CMD_RTT action 7 改）。
+ * 官方 swd_read_memory() 内部按 1 KB 页切分；实测纯 SWD 基准 512 B 3434 KB/s、
+ * 2048 B 3476 KB/s（+1.2%），再大无收益，故默认取 2048。 */
+#define RTT_SWD_CHUNK 2048U
 
 /* 每次轮询最多搬运的字节数。 */
 #define RTT_MAX_DRAIN 2048U
