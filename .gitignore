@@ -22,7 +22,6 @@ script_test/sram_test.bin
 script_test/sram_out.bin
 script_test/stm32f103_rtt_speed/build/
 
-# local reference material / vendor documentation (kept out of the repo)
+# local reference material (kept out of the repo)
 /webusb_spec.html
 /webusb_chrome.cc
-/docs/HPM5301EVKLite_UG_V1.1.pdf
