@@ -222,12 +222,13 @@ openocd.exe -s <sdk>\tools\openocd\tcl -f script_test\openocd_stm32f1_swd.cfg `
 2. 因此 J-Link 的 RTT 数字（692.9 KB/s）**不能**用来证明目标侧天花板，上一版推论作废。
 3. 仍然成立的：**本探针在等效路径上不输 J-Link** —— OpenOCD 路径 2685.9 vs 691.7；
    RTT 路径 45 MHz 下 676.9~724.4 vs J-Link 50 MHz 下 692.9。
-4. **仍未解**：本探针的 **RTT 桥**在 H743 上只有 ~700 KB/s，而同一探针的 OpenOCD dump
-   有 2685.9 ⇒ 差距出在 RTT 这条路上（"CPU 正在跑" vs "CPU halt" 是首要嫌疑），
-   但 J-Link 已无法当参照。待做的判别实验（**需要把探针插回来**）：
-   - halt 住 CPU，让桥去 drain 那个已经灌满的 12 KB 缓冲 ⇒ 看能否跑出 2 MB/s 量级；
-   - 或用桥的 **discard 模式**（`CMD_RTT` action 7 的 `discard=1`，只轮询+搬运、不推 CDC）
-     看纯 SWD 侧的速率 ⇒ 分开"SWD 轮询慢"与"CDC 段慢"。
+4. **已解（2026-09-28 晚）：本探针的 RTT 桥在 H743 上只有 ~700 KB/s，是因为目标当时
+   跑在复位默认的 HSI 64 MHz。** 用厂商 `Stm32_Clock_Init` 序列把 H743 顶到
+   **480 MHz** 后（`script_test/stm32h743_rtt_speed`，见源码注释里的两个坑），
+   探针桥交付变成 **1379.6 / 2162.3 / 2486.6 / 2931.2 KB/s**（20/36/45/60 MHz），
+   **与 F103@96 MHz 完全一致** ⇒ 瓶颈换成了探针自己，目标侧不再是。
+   同时 J-Link 在同目标同主频下只有 **1473 KB/s**（400 与 480 MHz 都是 1473，说明
+   那是 J-Link 自己的上限）⇒ 探针是它的 **2 倍**。
 
 > 顺带修好了板子：sdk_env 的 OpenOCD 烧不进去的 H743 flash，**用 J-Link 一次成功**
 > （`loadbin fw.bin, 0x08000000` + `verifybin` ⇒ `O.K.` / `Verify successful`），
