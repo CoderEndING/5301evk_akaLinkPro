@@ -326,7 +326,8 @@ Byte[0x03-0x3F] = Command data（可选）
 
     type：`0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=f32 7=f64`
     flags：bit0 允许 60 MHz；bit1 丢弃模式；bit2 触发；bit3 不让路（独占链路）；
-           bit4 SWD 空闲拍压到 0（`DAP_Data.clock_delay=0`）
+           bit4 SWD 空闲拍压到 0（`DAP_Data.clock_delay=0`）；
+           bit5 采样期间自动暂停 CDC/串口桥（停采样自动恢复，见第 18 条）
 
     响应：Byte[0x01] = 长度，Byte[0x02] = 0x32，**Byte[0x03] = 启动码**（网页读 `res[2]`，
     -100 = 排队中，0 = 正常，-1/-2/-3/-4 见 scopeRcText），Byte[0x04..0x33] = 12 个状态字。
@@ -415,6 +416,36 @@ Byte[0x03-0x3F] = Command data（可选）
       25 MHz，当前引擎跑在 ~16.4 MHz（一次 DMI 访问 54 TCK）。
     - action 2/3/5 会**直接读写目标内存**，别指向目标正在用的区域。
     - 完整背景、接线坑与失败实验见 `docs/hpm6800evk-jtag.md`。
+18. 主循环 CDC/串口桥开关指令 0x34（网页面板用）
+    探针主循环每轮都要服务 CDC/串口桥（VCOM 转发 + RTT-over-USB 转发）：一次读 DMA
+    的 `DSTADDR`、两次关中断、三次环形缓冲查询。**这几百个 CPU 周期正是高频 J-Scope
+    采样时缺的那一块** —— 单变量 u32、5 µs 周期下关掉它，端到端从 ~180 kHz 提到
+    **~197 kHz**，丢包从 10.6% 降到 1.9%。采样数据走的是另一条 bulk IN `0x83`，与
+    本开关无关；代价只是**暂停期间 COM 口不通**（CDC 的 bulk OUT 被 NAK，主机自行重试）、
+    RTT-over-USB 也停 —— 但采样器与 RTT 桥本来就互斥（第 16 条的启动分支会互相 stop）。
+
+    主机发送 request
+    Byte[0x00] = 0x01 // Report ID
+    Byte[0x01] = 0x02 // Data Length = action(1) + 参数(1)
+    Byte[0x02] = 0x34 // Command type
+    Byte[0x03] = action（0 = 查状态，1 = 设置）
+    Byte[0x04] = 参数（action=1 时：0 = 关桥，1 = 开桥）
+
+    设备回应 response
+    Byte[0x00] = 0x02 // Report ID
+    Byte[0x01] = 0x06 // Data Length = 1(回显 action) + 1 + 4
+    Byte[0x02] = 0x34 // Command type
+    Byte[0x03] = **回显 action**
+    Byte[0x04..0x07] = 状态字（小端）：bit0 = 桥当前是开的；bit8 = 本命令被支持（探活用）
+
+    说明与约束：
+    - **默认是开的**（bit0 = 1）。开→关再开时，探针会把暂停期间积压的串口数据丢掉并把
+      DMA 定位追平（`uartx_rx_resync()`），不会在恢复瞬间灌一整圈陈旧字节给主机。
+    - 状态**不持久化**，探针复位/重插即恢复为开。
+    - 第 16 条的 `SCOPE` flags **bit5** 是"采样期间自动关、停采样自动恢复"，一般用那个
+      就够了（网页只要在已有的 CONFIG 报文里加一位，不必自己管状态）；本命令是给面板
+      做**显式勾选框**用的。自动暂停只恢复"自己关过的那一次"，不会覆盖手动关掉的状态。
+    - 关着的时候别去开 RTT —— 桥被关了，RTT 的数据没有出口。
 
 ## 配置说明
 

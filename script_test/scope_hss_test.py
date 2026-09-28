@@ -2,23 +2,33 @@
 
 控制面走 HID 0x32（与网页 app/scope/protocol.js 逐字节一致），数据面用 pyusb 直接
 读 interface 0 上的 bulk IN **0x83**（网页走 WebUSB，同一根管子）。
+CDC/串口桥开关走 HID **0x34**（`--bridge`），也可以让固件在采样期间自己关
+（`--flags 0x20` = SCOPE_FLAG_CDC_OFF）。
 
 用法:
-  python scope_hss_test.py status
-  python scope_hss_test.py bench  [--set pack|cross] [--clock 45000000] [--iters 2000]
-  python scope_hss_test.py run    [--set pack|cross] [--period 100] [--secs 3]
+  python scope_hss_test.py status [--bridge on|off]
+  python scope_hss_test.py bench  [--set pack|cross|one] [--clock 45000000] [--iters 2000]
+  python scope_hss_test.py run    [--set pack|cross|one] [--period 100] [--secs 3] [--flags 0x20]
+
+  --flags 位: 0x01 允许 60 MHz / 0x02 丢弃(只采样不推 USB) / 0x08 不让路
+              0x10 SWD 空闲拍压 0 / **0x20 采样期间自动关 CDC 桥**
+  常用组合: 0x20 = 最快端到端；0x22 = 只量探针本体（丢包就全是探针 CPU 的账）
 
 靶子固件: web-serial-rtt-tools/tools/target-firmware/stm32f103_scope（10 kHz 契约波形）
 """
+import sys
+
+# ⚠️ 必须在任何中文 print 之前：GBK 控制台编不出 ⚠️/★ 之类的字符会抛 UnicodeEncodeError，
+#    直接把脚本自己打崩（曾经因此把一次正常的 cross 采样误判成固件故障）。
+#    原来这段写在 `import sys` **之前**，NameError 被 except 吞掉 → 一直是失效的。
 try:
-    sys.stdout.reconfigure(encoding="utf-8")   # GBK 控制台编不出 ⚠️ 之类的字符，会把脚本自己打崩
+    sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
 import argparse
 import os
 import struct
-import sys
 import threading
 import time
 
@@ -29,9 +39,12 @@ import usb.util
 VID, PID = 0x0D28, 0x0204
 EP_IN = 0x83
 HID_CMD = 0x32
+CMD_BRIDGE = 0x34
 
 ACT = {'STOP': 0, 'START': 1, 'STATUS': 2, 'CLOCK': 3, 'TRIGGER': 4,
        'CONFIG': 7, 'BENCH': 8, 'BENCH_RESULT': 9}
+
+BRIDGE = {'STATUS': 0, 'SET': 1}
 
 KIND = {1: 'DEF', 2: 'DATA', 3: 'STAT', 4: 'EVT'}
 MAGIC = 0x4A53
@@ -91,6 +104,32 @@ def hid_xfer(dev, data, tmo=3.0):
         if r and r[0] == 0x02 and r[2] == HID_CMD:
             return list(r)[1:]
     return None
+
+
+def hid_xfer_raw(dev, cmd, data, tmo=3.0):
+    """任意命令号的 HID 收发；返回**已剥掉 Report ID** 的响应。"""
+    req = [0x01, 2 + len(data), cmd] + list(data)
+    req += [0] * (64 - len(req))
+    dev.write(req)
+    t0 = time.time()
+    while time.time() - t0 < tmo:
+        r = dev.read(64, timeout_ms=200)
+        if r and r[0] == 0x02 and r[2] == cmd:
+            return list(r)[1:]
+    return None
+
+
+def bridge_set(dev, enable):
+    """HID 0x34：主循环级 CDC/串口桥开关。返回设置后的实际状态，None = 无响应。"""
+    r = hid_xfer_raw(dev, CMD_BRIDGE, [BRIDGE['SET'], 1 if enable else 0])
+    if not r:
+        return None
+    return bool(r[3] & 1)
+
+
+def bridge_get(dev):
+    r = hid_xfer_raw(dev, CMD_BRIDGE, [BRIDGE['STATUS']])
+    return None if not r else bool(r[3] & 1)
 
 
 def s8(v):
@@ -197,10 +236,23 @@ def main():
     ap.add_argument('--iters', type=int, default=2000)
     ap.add_argument('--flags', type=lambda s: int(s, 0), default=0, help='flags 位（0x10 = clock_delay 压 0）')
     ap.add_argument('--secs', type=float, default=3.0)
+    ap.add_argument('--readsize', type=int, default=8192,
+                    help='每次 ep.read 要多少字节。pyusb 是同步读：一个 URB 满了才返回，'
+                         '两次 URB 之间的空档里设备发不出东西，所以小读=空档多、大读=空档少但延迟高。'
+                         'pack 这种"每包只装 20 个样本"的高包率场景对这个数很敏感。')
+    ap.add_argument('--bridge', choices=['on', 'off', 'keep'], default='keep',
+                    help='HID 0x34：主循环 CDC/串口桥开关（off = 采样期间不用服务 COM 口，省几百周期/轮）')
     a = ap.parse_args()
 
     vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE}[a.vset]
     dev = open_hid()
+
+    if a.bridge != 'keep':
+        got = bridge_set(dev, a.bridge == 'on')
+        if got is None:
+            print("⚠️ HID 0x34 无响应（固件太旧？）")
+        else:
+            print("CDC/串口桥 = %s" % ('开' if got else '关'))
 
     if a.clock:
         hid_xfer(dev, [ACT['CLOCK']] + list(struct.pack('<I', a.clock)))
@@ -244,6 +296,7 @@ def main():
     dropped0, seq0 = st['dropped'], st['seq']
     stream = PktStream()
     chunks = []
+    raw = []
     stop = threading.Event()
     nb = {'bytes': 0}
 
@@ -251,16 +304,21 @@ def main():
     #    轮询至少 120 ms）里探针会把包缓冲填满并开始丢拍 —— 实测 period=40us 时
     #    dropped=3192 ≈ 120 ms × 25 kHz − 8 个缓冲，全是这一段的账，看着却像固件丢数据。
     #    同一个坑在 RTT 交付率脚本里已经踩过一次（见 docs/hpm6800evk-jtag.md §5.3）。
+    #
+    # 🚨 读线程里**只搬字节、不解析**：早先在读线程里直接 PktStream.push()，每个包都建
+    #    dict + 496 B 的 bytes 对象，GIL 上与主线程抢，Python 那边一停顿超过
+    #    8×512 B 的缓冲深度（pack 组只有 2.1 ms）就真丢数据 —— 而且丢的账会被算到
+    #    固件头上（s_usb_drop）。解析挪到窗口结束之后做。
     def reader():
         while not stop.is_set():
             try:
-                b = bytes(ep.read(2048, timeout=200))
+                b = bytes(ep.read(a.readsize, timeout=200))
             except usb.core.USBTimeoutError:
                 continue
             except Exception:
                 break
+            raw.append(b)
             nb['bytes'] += len(b)
-            chunks.extend(stream.push(b))
 
     th = threading.Thread(target=reader, daemon=True)
     th.start()
@@ -281,7 +339,8 @@ def main():
 
     # 从这一刻起才计入速率与丢包统计（启动瞬态已经过去）
     nb['bytes'] = 0
-    chunks.clear()
+    raw.clear()
+    st_begin = status(dev)          # 窗口起点的计数器快照，用来分离「探针丢」与「USB 丢」
     t0 = time.perf_counter()
     time.sleep(a.secs)
     dt = time.perf_counter() - t0
@@ -300,9 +359,20 @@ def main():
         except usb.core.USBTimeoutError:
             break
         total += len(b)
-        chunks += stream.push(b)
+        raw.append(b)
     st = status(dev)
     usb.util.dispose_resources(ud)
+
+    chunks = stream.push(b"".join(raw))     # 解析放到窗口之后（见 reader() 的说明）
+    raw.clear()
+
+    if a.bridge == 'off' or (a.flags & 0x20):
+        # 采完就把 COM 口还回去，免得下一次跑脚本时"串口怎么不通了"。
+        # flags 0x20（SCOPE_FLAG_CDC_OFF）时这一步应该由固件在 STOP 里做完 —— 这里只是对账。
+        bs = bridge_get(dev)
+        print("（采样结束后 CDC/串口桥 = %s）" % ('开' if bs else '关'))
+        if a.bridge == 'off' and not bs:
+            print("（手动恢复 CDC/串口桥 = 开：%s）" % bridge_set(dev, True))
 
     print("主机收到 %d B / %.2f s -> %.1f KB/s；包数 %d，重同步 %d"
           % (total, dt, total / dt / 1024.0, stream.pkts, stream.resync))
@@ -348,6 +418,19 @@ def main():
                 fo += size
             samples.append(row)
     print("解出 %d 个样本（frame %d B，期望 %d 个/包）" % (len(samples), fb, PAYLOAD // fb))
+
+    # ★ 端到端速率：窗口内**主机实收**的样本数 ÷ 窗口时长。探针侧的 produced 增量
+    #   用来把「探针自己跳拍」和「USB 没送到」分开 —— 两者看着都是掉数据，成因差很远。
+    dprod = st['produced'] - st_begin['produced']
+    ddrop = st['dropped'] - st_begin['dropped']
+    # w4 高 16 位 = s_usb_drop（缓冲耗尽而丢的），低 16 位 = s_bytes。
+    # 必须取**窗口增量**：累计值把启动瞬态也算进去，会把结论带偏。
+    dusb = (st['raw'][4] >> 16) - (st_begin['raw'][4] >> 16)
+    if dt > 0:
+        print("★ 端到端 %.1f kHz（主机实收 %d 样本 / %.3f s）" % (len(samples) / dt / 1000.0, len(samples), dt))
+        print("  探针窗口内产 %d 拍（%.1f kHz），丢 %d 拍 = %.1f%%（其中 USB 缓冲耗尽 %d 拍 = 丢包的 %.0f%%）"
+              % (dprod, dprod / dt / 1000.0, ddrop, 100.0 * ddrop / max(dprod + ddrop, 1),
+                 dusb, 100.0 * dusb / max(ddrop, 1)))
     # 校验按"这组里实际有哪些变量"自适应 —— 单选一个 g_tick 时没有 i_tick/u_hi
     if len(samples) >= 2:
         tkey = next((k for k in ('i_tick', 'g_tick', 'g_far_cnt') if k in samples[0]), None)

@@ -5,6 +5,7 @@
 #include "hpm_dfu_trigger.h"
 #include "hpm_otp_drv.h"
 #include "DAP.h"
+#include "cdc_interface.h"
 
 #define CMSIS_DAP_INTERFACE_SIZE (9 + 7 + 7 + 7)
 #define CUSTOM_HID_LEN (9 + 9 + 7 + 7)
@@ -437,6 +438,9 @@ static volatile uint8_t usbrx_idle_flag = 0;
 static volatile uint8_t usbtx_idle_flag = 0;
 static volatile uint8_t uarttx_idle_flag = 0;
 
+/* 主循环级 CDC/串口桥总开关（默认开）。见 chry_dap_usb2uart_set_enabled()。 */
+volatile uint8_t usb2uart_bridge_enabled = 1U;
+
 USB_NOCACHE_RAM_SECTION chry_ringbuffer_t g_uartrx;
 USB_NOCACHE_RAM_SECTION chry_ringbuffer_t g_usbrx;
 
@@ -820,6 +824,44 @@ void usbd_cdc_acm_get_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_c
     (void)busid;
     memcpy(line_coding, (uint8_t *)&g_cdc_lincoding, sizeof(struct cdc_line_coding));
 }
+/* 主循环级 CDC/串口桥总开关。
+ *
+ * 关掉之后 main() 连 chry_dap_usb2uart_handle() 都不调 —— 每轮省下：
+ *   · usb2uart_handler() 的一次关中断 + 一次读 DMA 的 DSTADDR 寄存器（外设总线）
+ *   · usb→uart 方向的 chry_ringbuffer_get_used() 与 uart→usb 方向的关中断 + get_used()
+ *   · usb rx 方向的 chry_ringbuffer_get_free()
+ * 量级是**几百个 CPU 周期**，正是高频采样时缺的那一块（见 docs/scope-page.md 的
+ * 「端到端 vs 探针能力」一节）。
+ *
+ * 代价：暂停期间 COM 口不通（CDC 的 bulk OUT 会被 NAK，主机自己重试），
+ * 以及 RTT 桥的 USB 转发也会停 —— 但采样器与 RTT 桥本来就互斥，正常用法碰不到。
+ * 采样期间数据走的是另一条 bulk IN 0x83，跟这里无关。 */
+void chry_dap_usb2uart_set_enabled(uint8_t enable)
+{
+    if ((enable ? 1U : 0U) == usb2uart_bridge_enabled)
+    {
+        return;
+    }
+
+    if (enable)
+    {
+        /* 暂停期间 DMA 照转，这里把定位追平并丢掉陈旧数据，再放行主循环。
+         * 两个方向的 idle 标志不动：在飞的传输完成回调自己会把它们摆平，
+         * 强行置位反而可能在端点上重复起一次读。 */
+        uartx_rx_resync();
+        usb2uart_bridge_enabled = 1U;
+    }
+    else
+    {
+        usb2uart_bridge_enabled = 0U;
+    }
+}
+
+uint8_t chry_dap_usb2uart_is_enabled(void)
+{
+    return usb2uart_bridge_enabled;
+}
+
 #if 1
 void chry_dap_usb2uart_handle(void)
 {

@@ -27,15 +27,35 @@
 #define DFU_KEY_HOLD_US (1000000U)
 #define MCHTMR_MTIME_LO_REG (*(volatile uint32_t *)(HPM_MCHTMR_BASE + 0x00))
 
+/* 按键轮询的分频。按住 1 秒才算数，而这个主循环在采样时能跑到 20 万圈/秒 ——
+ * 每圈都去读 GPIO 和 MCHTMR 是纯浪费，而且那两次外设总线读正是高频采样时
+ * 每拍那几百周期余量里的一大块。每 256 圈看一次：最慢的主循环下也有几百 Hz 的
+ * 采样率，1 秒的按住时长照样抓得住。 */
+#define DFU_KEY_POLL_DIV (256U)
+
 static void dfu_key_poll(void)
 {
     static uint8_t pressed;
     static uint32_t press_start;
     static uint32_t mchtmr_freq;
+    static uint32_t div = DFU_KEY_POLL_DIV;
+
+    if (--div != 0U)
+    {
+        return;
+    }
+    div = DFU_KEY_POLL_DIV;
 
     uint8_t now_pressed = (gpio_read_pin(BOARD_APP_GPIO_CTRL,
                                          BOARD_APP_GPIO_INDEX,
                                          BOARD_APP_GPIO_PIN) == BOARD_BUTTON_PRESSED_VALUE) ? 1U : 0U;
+
+    /* 没按过、当前也没按：连 MCHTMR 都不用读（松开后的复位靠下面那支兜住）。 */
+    if (!now_pressed && !pressed)
+    {
+        return;
+    }
+
     uint32_t now = MCHTMR_MTIME_LO_REG;
 
     if (mchtmr_freq == 0U)
@@ -79,7 +99,12 @@ int main(void)
     while (1)
     {
         chry_dap_handle();
-        chry_dap_usb2uart_handle();
+        /* CDC/串口桥：每轮两次关中断 + 三次环形缓冲查询 + 一次 DMA 寄存器读。
+         * HID 0x34 可以把它整个关掉（采样器要跑满周期时缺的就是这几百周期）。 */
+        if (usb2uart_bridge_enabled)
+        {
+            chry_dap_usb2uart_handle();
+        }
         api_param_poll();
         dfu_key_poll();
         /* Probe-side RTT bridge: polls the target itself (only while the DAP

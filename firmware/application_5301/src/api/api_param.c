@@ -80,6 +80,16 @@
 #define SCOPE_ACT_BENCH 8U
 #define SCOPE_ACT_BENCH_RESULT 9U
 
+/* ---- CMD 0x34 BRIDGE：主循环级 CDC/串口桥开关（网页面板用）----
+ * 关掉之后 main() 不再调 chry_dap_usb2uart_handle()，每轮省下几百个 CPU 周期。
+ * 高频 J-Scope 采样时这是端到端速率的瓶颈所在；代价是暂停期间 COM 口与
+ * RTT-over-USB 都不可用（采样数据走另一条 bulk IN 0x83，不受影响）。
+ *   req_hid[3] = 动作号，req_hid[4] = 参数（SET 时 0/1）
+ * 响应形状照抄 0x31/0x32：res_hid[3] = 动作号回显，res_hid[4..7] = 状态字。 */
+#define CMD_BRIDGE (0x34)
+#define BRIDGE_ACT_STATUS 0U
+#define BRIDGE_ACT_SET 1U
+
 #define PARAM_MAGIC_NUMBER (0x0D000721UL)
 /* EasyFlash ENV key that stores the whole api_param_t blob. */
 #define API_PARAM_ENV_KEY "cfg"
@@ -551,6 +561,26 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
             res_hid[4U + i * 4U + 2U] = (uint8_t)(out[i] >> 16);
             res_hid[4U + i * 4U + 3U] = (uint8_t)(out[i] >> 24);
         }
+        break;
+    }
+    case CMD_BRIDGE:
+    {
+        /* status[0] = bit0 当前开关 / bit8 = 该命令是否被支持（恒 1，给网页探活） */
+        uint32_t st = (uint32_t)chry_dap_usb2uart_is_enabled() | (1UL << 8);
+
+        if (req_hid[3] == BRIDGE_ACT_SET)
+        {
+            chry_dap_usb2uart_set_enabled(req_hid[4] ? 1U : 0U);
+            st = (uint32_t)chry_dap_usb2uart_is_enabled() | (1UL << 8);
+        }
+
+        res_hid[1] = 1U + 1U + 4U;
+        res_hid[2] = CMD_BRIDGE;
+        res_hid[3] = req_hid[3];
+        res_hid[4] = (uint8_t)(st >> 0);
+        res_hid[5] = (uint8_t)(st >> 8);
+        res_hid[6] = (uint8_t)(st >> 16);
+        res_hid[7] = (uint8_t)(st >> 24);
         break;
     }
     case CMD_RESET_DEVICE:

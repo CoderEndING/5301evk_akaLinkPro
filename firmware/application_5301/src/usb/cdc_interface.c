@@ -203,6 +203,25 @@ static void uartx_rx_flush_locked(void)
     led_state_notify_uart_rx(copied);
 }
 
+/* Skip whatever the RX DMA picked up while the CDC bridge was suspended.
+ *
+ * The DMA runs in infinite-loop mode and cannot be paused cheaply, so during a
+ * suspend `rb_write_pos` simply stops advancing. Without this the first flush
+ * after a resume would dump the whole backlog - and after a long suspend
+ * (seconds of high-rate serial traffic) more than a full lap, i.e. stale bytes
+ * that are no longer meaningful. Drop them instead and resume from "now". */
+void uartx_rx_resync(void)
+{
+    uint32_t level = disable_global_irq(CSR_MSTATUS_MIE_MASK);
+
+    if (!s_cdc_src_rtt)
+    {
+        rb_write_pos = uartx_rx_written();
+        chry_ringbuffer_reset(&g_uartrx);
+    }
+    restore_global_irq(level);
+}
+
 /* (Re)start the circular RX DMA from the beginning of uart_rx_buf.
  * Must be called with interrupts disabled (or from an ISR). */
 static void uartx_rx_dma_start(void)

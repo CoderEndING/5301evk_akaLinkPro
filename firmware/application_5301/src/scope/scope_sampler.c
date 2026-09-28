@@ -116,6 +116,8 @@ static uint32_t s_tx_done;                    /* USB 完成回调次数（诊断
 static uint32_t s_bench_req, s_bench_valid, s_bench_iters, s_bench_ticks;
 static int32_t  s_bench_err;
 static uint32_t s_hdr_t;                      /* 正在组的那一包的时间戳（DATA 用首样本时刻） */
+static uint32_t s_period_ticks = 1U;          /* s_period_us 换算好的 MCHTMR tick 数（configure 时算一次） */
+static uint8_t  s_cdc_suspended;              /* 是我们因为 SCOPE_FLAG_CDC_OFF 关掉 CDC 桥的吗 */
 
 static void scope_push_stat(void);
 
@@ -556,8 +558,17 @@ static int scope_start_now(void)
     s_fill_t0 = 0U;
 
     scope_push_def();                            /* 先发变量表 */
-    s_next_tick = mchtmr_now() + us_to_ticks(s_period_us);
+    s_next_tick = mchtmr_now() + s_period_ticks;
     s_running = 1U;
+
+    /* SCOPE_FLAG_CDC_OFF：采样期间把主循环里的 CDC/串口桥让出去。
+     * 只记"是我们关的"，停采样时只恢复自己关过的那一次 —— 免得把主机
+     * 用 HID 0x34 手动关掉的状态也给"恢复"了。 */
+    if ((s_flags & SCOPE_FLAG_CDC_OFF) && chry_dap_usb2uart_is_enabled())
+    {
+        chry_dap_usb2uart_set_enabled(0U);
+        s_cdc_suspended = 1U;
+    }
     return 0;
 }
 
@@ -619,7 +630,7 @@ void scope_sampler_poll(void)
         if ((last_dap != 0U) && ((uint32_t)(now - last_dap) < SCOPE_YIELD_TICKS))
         {
             s_yield++;
-            s_next_tick = now + us_to_ticks(s_period_us);
+            s_next_tick = now + s_period_ticks;
             return;
         }
     }
@@ -627,7 +638,7 @@ void scope_sampler_poll(void)
     if (scope_sample_once() != 0)
     {
         s_swd_err++;
-        s_next_tick = now + us_to_ticks(s_period_us);
+        s_next_tick = now + s_period_ticks;
         return;
     }
 
@@ -636,12 +647,10 @@ void scope_sampler_poll(void)
      *    也被记成丢了 1 拍 —— 实测 10 kHz 采样下 produced=31222、dropped=31174，
      *    界面上会显示成丢了一半，而 seq 缺口是 0、实际速率也正好 10 kHz。
      *    现在用 while 逐拍推进，只有 now 真的越过了下一拍的时刻才算丢。 */
-    uint32_t period_ticks = us_to_ticks(s_period_us);
-    if (period_ticks == 0U) { period_ticks = 1U; }
-    s_next_tick += period_ticks;
+    s_next_tick += s_period_ticks;
     while ((int32_t)(now - s_next_tick) > 0)
     {
-        s_next_tick += period_ticks;
+        s_next_tick += s_period_ticks;
         s_dropped++;
         s_t_us += s_period_us;
     }
@@ -655,6 +664,8 @@ void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, c
     if (period_us < SCOPE_MIN_PERIOD_US) { period_us = SCOPE_MIN_PERIOD_US; }
     if (period_us > SCOPE_MAX_PERIOD_US) { period_us = SCOPE_MAX_PERIOD_US; }
     s_period_us = period_us;
+    /* 每拍都要用；一次 64 位除法的代价不该落在热路径上 */
+    s_period_ticks = us_to_ticks(period_us);
     s_flags = flags;
     s_nvars = nvars;
     for (uint8_t i = 0U; i < nvars; i++) { s_var[i] = vars[i]; }
@@ -672,6 +683,12 @@ void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, c
         /* 运行中改配置：停掉再等主机启动 —— 免得半新半旧地跑（周期/变量表混用） */
         s_running = 0U;
         s_start_rc = -100;
+        /* 这条路径也在"停"，所以自动暂停的 CDC 桥同样要还回去 */
+        if (s_cdc_suspended)
+        {
+            s_cdc_suspended = 0U;
+            chry_dap_usb2uart_set_enabled(1U);
+        }
     }
     s_last_cmd = 7U;
 }
@@ -701,6 +718,13 @@ void scope_sampler_stop(void)
     s_start_req = 0U;
     s_start_rc = -100;
     s_last_cmd = 0U;
+
+    /* 只在"是我们关的"那一次恢复（见 scope_start_now 的说明） */
+    if (s_cdc_suspended)
+    {
+        s_cdc_suspended = 0U;
+        chry_dap_usb2uart_set_enabled(1U);
+    }
 }
 
 int scope_sampler_is_running(void)
