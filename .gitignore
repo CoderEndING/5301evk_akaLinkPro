@@ -45,3 +45,6 @@ script_test/_openocd_probe.log
 
 # python cache
 __pycache__/
+
+# H743 SRAM 基准临时目录
+script_test/_h743bench/
