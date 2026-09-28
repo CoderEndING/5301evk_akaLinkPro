@@ -57,6 +57,11 @@ uint8_t swd_write_word(uint32_t addr, uint32_t val);
 uint8_t swd_read_byte(uint32_t addr, uint8_t *val);
 uint8_t swd_write_byte(uint32_t addr, uint8_t val);
 uint8_t swd_read_memory(uint32_t address, uint8_t *data, uint32_t size);
+
+/* 对齐块读的快速路径（给 scope 采样器用）：调用方保证 address 4 字节对齐、size 是 4 的
+ * 倍数、且整段不跨 1 KB 自增页 —— 于是可以跳过 swd_read_memory() 里的头尾字节处理与
+ * 分页循环。实测每次采样的框架开销里有相当一部分就花在那两层包装上。 */
+uint8_t swd_read_block4(uint32_t address, uint8_t *data, uint32_t size);
 uint8_t swd_write_memory(uint32_t address, uint8_t *data, uint32_t size);
 uint8_t swd_read_core_register(uint32_t n, uint32_t *val);
 uint8_t swd_write_core_register(uint32_t n, uint32_t val);

@@ -350,6 +350,22 @@ static uint8_t swd_read_block(uint32_t address, uint8_t *data, uint32_t size)
     return (ack == 0x01);
 }
 
+/* 对齐块读的快速路径（见 swd_host.h）：调用方保证 4 字节对齐、size 是 4 的倍数、
+ * 不跨 1 KB 自增页 —— 于是直接进 swd_read_block，跳过 swd_read_memory() 的头尾字节
+ * 处理与分页循环。scope 采样器每个样本要调 1~3 次，那两层的开销是量的出来的。 */
+uint8_t swd_read_block4(uint32_t address, uint8_t *data, uint32_t size)
+{
+    if ((size == 0U) || ((address & 3U) != 0U) || ((size & 3U) != 0U))
+    {
+        return 0U;
+    }
+    if ((address & (TARGET_AUTO_INCREMENT_PAGE_SIZE - 1U)) + size > TARGET_AUTO_INCREMENT_PAGE_SIZE)
+    {
+        return 0U;      /* 跨页：让调用方退回 swd_read_memory() */
+    }
+    return swd_read_block(address, data, size);
+}
+
 // Read target memory.
 static uint8_t swd_read_data(uint32_t addr, uint32_t *val)
 {

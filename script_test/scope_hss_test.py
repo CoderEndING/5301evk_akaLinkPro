@@ -187,6 +187,7 @@ def main():
     ap.add_argument('--clock', type=int, default=0, help='SWD Hz，0=不动')
     ap.add_argument('--period', type=int, default=100, help='采样周期 us')
     ap.add_argument('--iters', type=int, default=2000)
+    ap.add_argument('--flags', type=lambda s: int(s, 0), default=0, help='flags 位（0x10 = clock_delay 压 0）')
     ap.add_argument('--secs', type=float, default=3.0)
     a = ap.parse_args()
 
@@ -202,7 +203,7 @@ def main():
         print(st)
         return 0
 
-    do_config(dev, a.period, vars_)
+    do_config(dev, a.period, vars_, a.flags)
     st = status(dev)
     print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
           % (len(vars_), a.period, st['spans'], 1 if a.vset == 'pack' else 2))

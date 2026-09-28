@@ -432,7 +432,24 @@ static void scope_req_init(void)
  * 跟外面包了几层 C 函数无关。所以唯一有效的方向是**减少传输次数**，不是优化调用链。 */
 static int scope_read_span(const scope_span_t *sp)
 {
-    return rtt_bridge_read(sp->start, s_stage, sp->len);
+    /* 直接走对齐块读的快速路径：span 的起点/长度在 scope_make_plan() 里已经扩到
+     * 4 字节对齐，也不会跨 1 KB 自增页（SCOPE_SPAN_MAX=64），所以能跳过
+     * rtt_bridge_read → rtt_read_bytes 的分块循环和 swd_read_memory 的头尾/分页处理。 */
+    return (swd_read_block4(sp->start, s_stage, sp->len) != 0U) ? 0 : -1;
+}
+
+/* 按变量宽度搬字节。
+ * 🚨 别用 memcpy()：1/2/4 字节的 memcpy 会**真的走一次函数调用**，而一个样本有 8 个
+ *    变量 —— 实测这一项就是框架开销里的大头（纯传输 10.30 µs vs 带框架 11.55 µs）。 */
+static inline void scope_copy_var(uint8_t *dst, const uint8_t *src, uint8_t size)
+{
+    switch (size)
+    {
+    case 1U: dst[0] = src[0]; break;
+    case 2U: dst[0] = src[0]; dst[1] = src[1]; break;
+    case 4U: dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; break;
+    default: memcpy(dst, src, size); break;      /* f64 */
+    }
 }
 
 /* 采一拍，把变量字节写进"本样本在包里的槽位"。
@@ -447,7 +464,8 @@ static int scope_sample_bytes(uint8_t *dst)
 
         if (s->direct)
         {
-            /* span 的字节序 == 帧内布局：整段搬（24 B 就是 6 个字） */
+            /* span 的字节序 == 帧内布局：整段搬（24 B 就是 6 个字），这条路仍用 memcpy
+             * 划算 —— 一次 24 B 的调用比 6 次展开赋值还省 */
             memcpy(dst + s->frame_off, s_stage, s->len);
         }
         else
@@ -456,7 +474,7 @@ static int scope_sample_bytes(uint8_t *dst)
             {
                 uint8_t vi = (uint8_t)(s->first + k);
                 uint32_t src = (s_var[vi].addr - s->start);
-                memcpy(dst + s_frame_off[vi], &s_stage[src], s_var[vi].size);
+                scope_copy_var(dst + s_frame_off[vi], &s_stage[src], s_var[vi].size);
             }
         }
     }
