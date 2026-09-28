@@ -144,3 +144,53 @@ openocd.exe -s <sdk>\tools\openocd\tcl -f script_test\openocd_stm32f1_swd.cfg `
 
 > ⚠️ 跑 64 KB `load_image` 基准会把**整片 SRAM**（含 RTT 控制块与所有变量）覆盖掉，
 > 跑完要重新烧固件；目标被留在 halted 状态。
+
+## 6. 附：H743（正点原子阿波罗）实测与一个未解之谜
+
+同一块探针、同一档（60000 kHz）、同样 64 KB、数据哈希校验通过：
+
+| 目标 | 内存 | 写 (KiB/s) | 读 (KiB/s) |
+| --- | --- | --- | --- |
+| **H743** | AXI SRAM `0x24000000` | 3421.9 | 2685.9 |
+| F103ZET6 | SRAM `0x20000000` | 3471.4 | 2958.1 |
+| 原作者截图 | — | 3645.959 | 3045.310 |
+
+⇒ **探针的 SWD 性能与目标无关**（H743 只低 1.5% / 9%），"AXI SRAM 经 AHB-AP 慢"
+这个猜想可以排除。基准方法：`openocd -s <tcl> -f script_test/openocd_stm32h7_swd.cfg \
+-c "init" -c "adapter speed 60000" -c "halt" -c "load_image … 0x24000000 bin" \
+-c "dump_image … 0x24000000 65536"`，再比对哈希。
+
+### 但 RTT 交付只有 ~720 KB/s（未解）
+
+`rtt_h743_bridge.py`（**与 F103 同一个 RTT→CDC 桥**，同一块探针、同一段主机读法）
+扫了四档，**完全不随 SWD 时钟变化**：
+
+| SWD 档 | 20 MHz | 36 MHz | 45 MHz | 60 MHz |
+| --- | --- | --- | --- | --- |
+| H743 交付 | 676.9 | 723.4 | 717.1 | 717.5 KB/s |
+| （对照）F103ZET6 | — | — | — | **2486 KB/s** |
+
+已排除的解释（都有实测）：
+
+1. **不是链路/SWD 侧**：四档曲线是平的，链路还有大量余量（同档 in-probe 一直能跑 3 MB/s）。
+2. **不是 AXI SRAM 本身慢**：CPU 停住时同一块内存 64 KB 读 2686 KB/s（见上表）。
+   注意该值由 `rtt_h743_bridge.py` 的 `fw_ram.elf` 全 RAM 版测的，**测试时 I/D cache 是关的**。
+3. **不是取指争用**：全 RAM 版代码就在 AXI SRAM 上，I-cache 关着 → M7 取指与探针调试读
+   抢同一块内存 —— 这个假设**看着很美，实测被否**：`H743_CCR=0x20000` 只开 I-cache 后，
+   四档数字与关掉时**完全相同**（675.9/724.0/717.2/717.8 vs 676.9/723.4/717.1/717.5）。
+4. **不是配置差异**：H743 的 `SEGGER_RTT_Conf.h` 与 F103 逐行相同（12 KB、BLOCK_IF_FIFO_FULL、
+   空 LOCK/UNLOCK）。
+
+数字本身指向**每次搬运的固定开销**：~1840 B/次、391 次/秒 ⇒ **2.56 ms/次**（F103 是
+~0.8 ms/次），且与 SWD 时钟无关 ⇒ 瓶颈在"每次搬运"而不是"每字节"。下一步的判别实验
+（还没做）：用桥的 **discard 模式**（`CMD_RTT` action 7 的 discard=1，只轮询不推 CDC）
+读桥自己的 `drained` 计数器 —— 若能到 2.5 MB/s 就是 CDC/USB 那一段的问题；
+若仍是 720 KB/s，则是探针轮询这个目标的 RTT 本身就慢（下一步看 CB 的 Flags/RdOff 语义
+或 H7 的 cache-line 对齐缓冲是否让轮询失效）。
+
+> 工具已就位：`rtt_h743_bridge.py` 现在支持 `python rtt_h743_bridge.py <COM> <秒>`、
+> 环境变量 `H743_CCR`（CCR 值，默认 0=关 cache）、`H743_NO_LOAD=1`（跳过载入
+> `fw_ram.elf`，用于板上已有 flash 版固件时）。
+> 另注：**H743 的 flash 版烧不进去**（`flash write algorithm aborted by target`，
+> sdk_env 的 OpenOCD + 最小 cfg 下 H7 flash 算法跑不起来）—— 这正是当初做"全 RAM 版"
+> 的原因，所以"代码在 flash、缓冲在 AXI SRAM"那种布局目前无法在本机验证。

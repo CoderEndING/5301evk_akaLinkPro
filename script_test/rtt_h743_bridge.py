@@ -25,8 +25,8 @@ import serial
 
 import rtt_probe_bridge as rb
 
-COM = "COM52"
-SEC = 6.0
+COM = sys.argv[1] if len(sys.argv) > 1 else "COM52"
+SEC = float(sys.argv[2]) if len(sys.argv) > 2 else 6.0
 CLOCKS = [20, 36, 45, 60]
 
 SDK = os.environ.get("HPM_SDK_ENV_DIR", r"E:\sdk_env_v1.11.0")
@@ -38,6 +38,13 @@ ELF = os.path.join(HERE, "stm32h743_rtt_speed", "build", "fw_ram.elf")
 
 CB_ADDR = 0x24000000     # AXI SRAM：RTT 控制块在这里
 CB_SIZE = 0x00080000
+
+# Cortex-M7 的 CCR（0xE000ED14）：bit17=IC(指令 cache)、bit16=DC(数据 cache)。
+# 默认 0 = 都关（原行为）。H743_CCR=0x20000 只开 I-cache 用来做对照实验：
+# 全 RAM 版的代码就在 AXI SRAM 上，I-cache 一关，M7 每条取指都和探针的调试读
+# 抢同一块内存；开 I-cache 后取指流量几乎归零，可以验证这是不是掉速的原因。
+# （不要开 DC：RTT 缓冲一旦被 cache 住，探针写的 RdOff 目标看不见，数据也会陈旧。）
+CCR = int(os.environ.get("H743_CCR", "0"), 0)
 
 
 def watchdog(sec):
@@ -68,11 +75,18 @@ def symbols():
 
 
 def load_into_ram():
+    if os.environ.get("H743_NO_LOAD"):
+        # 板上已经烧好 **flash 版**（代码在 0x08000000、CB+栈在 AXI SRAM）时用它：
+        # 再用 fw_ram.elf 覆盖 AXI SRAM 就把 flash 版冲掉了。
+        # 用途：对比 "代码在 AXI SRAM（全 RAM 版）" 与 "代码在 flash" 两种布局下
+        # 探针轮询 RTT 的交付率 —— 前者 M7 每条取指都打在探针正在读的同一块内存上。
+        print("1. H743_NO_LOAD=1：跳过载入，直接用板上已运行的固件")
+        return True
     pc, sp = symbols()
     print("1. 把 %s 载入 AXI SRAM 并运行（pc=0x%08X sp=0x%08X）" % (os.path.basename(ELF), pc, sp))
     cmd = [OPENOCD, "-s", SCRIPTS, "-f", CFG,
            "-c", "init", "-c", "halt",
-           "-c", "mww 0xE000ED14 0x00000000",   # CCR: 关 I/D cache，防陈旧取指
+           "-c", "mww 0xE000ED14 0x%08X" % CCR,  # CCR：默认 0 关 I/D cache；H743_CCR 可只开 IC
            "-c", "mww 0xE000EF50 0x00000000",   # ICIALLU
            "-c", 'load_image "%s" 0 elf' % ELF.replace("\\", "/"),
            "-c", "reg sp 0x%08X" % sp, "-c", "reg pc 0x%08X" % pc,
