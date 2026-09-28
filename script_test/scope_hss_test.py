@@ -77,6 +77,13 @@ V_MIXED = [  # 🚨 混合：一个 3 字 span（自增块读）+ 一个单字 s
     ("g_far_cnt",  0x20000008, 4, 4),
     ("g_tick",     0x20001044, 4, 4),   # 远处孤零零一个字
 ]
+V_TWO = [   # 🚨 两个**远离**的单字 span：都是"4 字节直读"，但地址不同 ⇒ 每拍都得重写 TAR，
+            # "抱住 TAR"的前提不成立。守卫必须是 **s_nspans == 1**，不能只是"所有 span
+            # 都是单字"：那种情况下 swd_read_word_held 的 TAR 写带一次 RDBUFF 收尾
+            # （2 次传输），比 swd_read_block 的裸 TAR 写（1 次）还贵 ⇒ 反而更慢。
+    ("g_lfsr",     0x20000000, 4, 4),
+    ("g_tick",     0x20001044, 4, 4),
+]
 
 
 def watchdog(sec):
@@ -247,7 +254,7 @@ class PktStream:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cmd', choices=['status', 'bench', 'run'])
-    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one', 'mixed'])
+    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one', 'mixed', 'two'])
     ap.add_argument('--clock', type=int, default=0, help='SWD Hz，0=不动')
     ap.add_argument('--period', type=int, default=100, help='采样周期 us')
     ap.add_argument('--iters', type=int, default=2000)
@@ -261,7 +268,7 @@ def main():
                     help='HID 0x34：主循环 CDC/串口桥开关（off = 采样期间不用服务 COM 口，省几百周期/轮）')
     a = ap.parse_args()
 
-    vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE, 'mixed': V_MIXED}[a.vset]
+    vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE, 'mixed': V_MIXED, 'two': V_TWO}[a.vset]
     dev = open_hid()
 
     if a.bridge != 'keep':
@@ -283,8 +290,8 @@ def main():
     do_config(dev, a.period, vars_, a.flags)
     st = status(dev)
     print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
-          % (len(vars_), a.period, st['spans'], {'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2}[a.vset]))
-    if st['spans'] != ({'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2}[a.vset]):
+          % (len(vars_), a.period, st['spans'], {'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2, 'two': 2}[a.vset]))
+    if st['spans'] != ({'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2, 'two': 2}[a.vset]):
         print("⚠️ span 数与本地计划不一致 —— 检查合并规则/地址")
 
     if a.cmd == 'bench':
@@ -365,6 +372,10 @@ def main():
     stop.set()
     th.join(timeout=1.5)
     total = nb['bytes']
+    # 🚨 窗口内实收的字节数 —— 只有这一段能算进"端到端速率"。drain 阶段（下面那 0.4 s）
+    #    读回来的数据是窗口之后才产生的，混进去会把速率算高：读缓冲开得越大虚高越多
+    #    （262144 B 时能虚高到 349 kHz，而探针只产了 339 kHz）。
+    win_bytes = total
     st = status(dev)
 
     hid_xfer(dev, [ACT['STOP']])
@@ -381,7 +392,8 @@ def main():
     st = status(dev)
     usb.util.dispose_resources(ud)
 
-    chunks = stream.push(b"".join(raw))     # 解析放到窗口之后（见 reader() 的说明）
+    # 只解析窗口内那 win_bytes 字节（reader 是按顺序追加的，前 win_bytes 就是窗口内的）
+    chunks = stream.push(b"".join(raw)[:win_bytes])
     raw.clear()
 
     if a.bridge == 'off' or (a.flags & 0x20):

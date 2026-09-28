@@ -43,11 +43,10 @@
 #define SCOPE_KIND_STAT   3U
 #define SCOPE_KIND_EVT    4U
 
-#define SCOPE_MIN_PERIOD_US    3U             /* 原来写 5（"一次读都做不完"）—— 那时单变量一次
-                                              * 采样要 4.478 µs（3 次传输）。现在走单字快路径
-                                              * 只要 2.681 µs（DRW + RDBUFF 两次传输），
-                                              * 3 µs 周期才有意义。周期是整数 µs，所以这就是
-                                              * 下限：再快得改协议的时间轴单位。 */
+#define SCOPE_MIN_PERIOD_US    2U             /* 一次次往下放过：5（"一次读 4.478 µs 做不完"）
+                                              * → 3（单字快路径 2.681 µs）→ 2（流水读 1.589 µs，
+                                              * 1 次传输/拍）。周期是整数 µs，所以 2 就是下限；
+                                              * 再快要同时改协议的时间轴单位和 USB 那一段。 */
 #define SCOPE_MAX_PERIOD_US    1000000UL
 /* 合并阈值：与网页 planReads() 的成本模型同源。
  * 间隙 g 字节要多读 g×0.284 µs；拆成两个 span 则多付一次 TAR+prime+RDBUFF ≈
@@ -122,9 +121,11 @@ static int32_t  s_bench_err;
 static uint32_t s_hdr_t;                      /* 正在组的那一包的时间戳（DATA 用首样本时刻） */
 static uint32_t s_period_ticks = 1U;          /* s_period_us 换算好的 MCHTMR tick 数（configure 时算一次） */
 static uint8_t  s_cdc_suspended;              /* 是我们因为 SCOPE_FLAG_CDC_OFF 关掉 CDC 桥的吗 */
-static uint8_t  s_all_word;                   /* 所有 span 都是 4 字节直读 ⇒ 可用单字快路径 */
+static uint8_t  s_pipe_ok;                    /* 本配置能用单字流水读（只有一个 4 字节直读 span）*/
+static uint8_t *s_pipe_dst;                   /* 等待回填的样本槽位；NULL = 管线空，下次读的结果要丢 */
 
 static void scope_push_stat(void);
+static int  scope_pipe_flush(void);
 
 /* MCHTMR 低 32 位（24 MHz → 约 179 s 绕回一次；这里只算"到点没有"，差值运算天然安全） */
 static uint32_t mchtmr_now(void)
@@ -220,7 +221,7 @@ static void scope_make_plan(void)
     /* 每个 span 定下"怎么读"：先判零拷贝（用未扩边的原始范围），
      * 再把起点向下、终点向上各扩到 4 字节 —— 只是多读几个字节，不改语义。
      * 对零拷贝的 span 这一步是空操作（它们本来就两端对齐）。 */
-    s_all_word = 1U;
+    s_pipe_ok = 0U;
     for (uint8_t i = 0U; i < s_nspans; i++)
     {
         scope_span_t *sp = &s_span[i];
@@ -231,13 +232,18 @@ static void scope_make_plan(void)
         uint32_t aend = (sp->start + sp->len + 3U) & ~3U;
         sp->start = aligned;
         sp->len = (uint16_t)(aend - aligned);
-
-        /* "所有 span 都是 4 字节直读" = 可以用单字快路径（swd_read_word_held，
-        * 每拍 2 次传输而不是 3 次）。必须是**全部** —— 那条路要把 CSW 切成不自增，
-        * 只要有一个多字 span 混进来就会来回切，切一次赔 2 次传输。 */
-        if ((sp->direct == 0U) || (sp->len != 4U)) { s_all_word = 0U; }
     }
-    if (s_nspans == 0U) { s_all_word = 0U; }
+
+    /* 单字流水读的前提：**只有一个 span**，而且它是 4 字节直读。
+     *
+     * 🚨 守卫必须是 s_nspans == 1，不能只是"所有 span 都是单字"：两个远离的单字
+     * span 交替读时每拍都要重写 TAR，而那条路的 TAR 写带一次 RDBUFF 收尾（2 次传输），
+     * 比 swd_read_block 的裸 TAR 写（1 次）还贵 —— 实测 8.6 µs 变成 11.2 µs（-31%）。
+     * `--set two` 就是守这条的用例。 */
+    if ((s_nspans == 1U) && (s_span[0].direct != 0U) && (s_span[0].len == 4U))
+    {
+        s_pipe_ok = 1U;
+    }
 }
 
 uint32_t scope_sampler_plan_hash(void)
@@ -480,11 +486,17 @@ static int scope_sample_bytes(uint8_t *dst)
             /* **零拷贝**：span 的字节序 == 帧内布局，且落点 4 字节对齐 —— 直接把 SWD
              * 读进包里的槽位，连 s_stage 那趟中转都省了。单变量时这是每样本省一次
              * memcpy（小 memcpy 会真的走函数调用）。落点不对齐就退回下面。 */
-            if (s_all_word)
+            if (s_pipe_ok)
             {
-                /* 4 字节直读 + 全部 span 都如此 ⇒ 走"抱住 TAR"的单字快路径：
-                 * 每拍 2 次传输（DRW + RDBUFF）而不是 3 次。见 swd_read_word_held()。 */
-                if (swd_read_word_held(s->start, fdst) == 0U) { return -1; }
+                /* 单字流水读：**每拍只发一次 DRW 读**，而它返回的是上一次 DRW 读的结果
+                 * （AHB-AP 的读是 posted 的）。于是把拿到的值回填给**上一拍自己的槽位**
+                 * —— 时间戳、帧布局、包边界全都不用动，只是写入晚了一拍。
+                 * 包里最后一拍的值由 scope_pipe_flush() 在推包前收回来。 */
+                uint32_t v;
+                if (swd_read_word_hold_prepare(s->start) == 0U) { return -1; }
+                if (swd_read_word_pipe(&v) == 0U) { return -1; }
+                if (s_pipe_dst != NULL) { put32(s_pipe_dst, v); }
+                s_pipe_dst = fdst;
             }
             else if (swd_read_block4(s->start, fdst, s->len) == 0U) { return -1; }
             continue;
@@ -528,14 +540,39 @@ static int scope_sample_once(void)
      * （scope_run_bench）里更新，那里不在乎这点开销。 */
     uint8_t *dst = &s_pkt[s_fill_buf][SCOPE_HDR + ((uint32_t)s_fill_n * s_frame_bytes)];
 
-    if (scope_sample_bytes(dst) != 0) { return -1; }
+    /* 读失败：管线状态已经不可信（那次 DRW 可能发出去了也可能没发），清空它 ——
+     * 下一拍读回来的值会被丢掉、重新起链。不这么做的话，这一拍的值会被写进
+     * 上一拍的槽位，而上一拍的值永远收不回来。 */
+    if (scope_sample_bytes(dst) != 0) { s_pipe_dst = NULL; return -1; }
 
     if (s_fill_n == 0U) { s_fill_t0 = s_t_us; }
     s_fill_n++;
     s_produced++;
     s_t_us += s_period_us;                 /* 名义时间轴：跳拍也要推进，否则主机的轴会压缩 */
 
-    if (s_fill_n >= s_per_packet) { scope_push_packet(); }
+    if (s_fill_n >= s_per_packet)
+    {
+        /* 单字流水：包满了，最后一拍的值还押在管线里（要等下一次 DRW 读才回来），
+         * 所以推包前先补一次读把它收回来 —— 每包一次，摊到每拍是 1/124 次传输。
+         * 收不回来也照推：那一拍的值是旧的，但**绝不能把"包已满"这个状态留着**，
+         * 否则下一拍的 dst 会算到帧区外面去。 */
+        int frc = scope_pipe_flush();
+        scope_push_packet();
+        if (frc != 0) { return -1; }
+    }
+    return 0;
+}
+
+/* 把管线里押着的那一拍的值收回来（一次 DRW 读）。收完管线清空：下一次读回来的值
+ * 对应的是"补读那一刻"，不属于任何一拍，由调用方丢掉。0 = ok。 */
+static int scope_pipe_flush(void)
+{
+    uint32_t v;
+
+    if (s_pipe_dst == NULL) { return 0; }
+    if (swd_read_word_pipe(&v) == 0U) { s_pipe_dst = NULL; return -1; }
+    put32(s_pipe_dst, v);
+    s_pipe_dst = NULL;
     return 0;
 }
 
@@ -579,6 +616,7 @@ static int scope_start_now(void)
     s_fill_buf = scope_alloc_buf();
     s_fill_n = 0U;
     s_fill_t0 = 0U;
+    s_pipe_dst = NULL;                           /* 单字流水从空管线开始 */
 
     scope_push_def();                            /* 先发变量表 */
     s_next_tick = mchtmr_now() + s_period_ticks;

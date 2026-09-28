@@ -63,11 +63,20 @@ uint8_t swd_read_memory(uint32_t address, uint8_t *data, uint32_t size);
  * 分页循环。实测每次采样的框架开销里有相当一部分就花在那两层包装上。 */
 uint8_t swd_read_block4(uint32_t address, uint8_t *data, uint32_t size);
 
-/* 同一个字反复读的快速路径：CSW 切成不自增 + 缓存 TAR，稳态每拍只剩
- * **DRW + RDBUFF 两次传输**（swd_read_block4 是 3 次）。只在"整段会话都读同一个字"
- * 时用 —— 夹进一次多字块读就会把 CSW 切回自增，来回切反而更慢。
+/* 同一个字反复读的快速路径：CSW 切成不自增 + 缓存 TAR。
+ *
+ * 两个层次，见 swd_host.c 里的长注释：
+ *   - swd_read_word_held()：一次调用完成，**2 次传输**（DRW + RDBUFF），原路径是 3 次；
+ *   - swd_read_word_hold_prepare() + swd_read_word_pipe()：把它当流水线用，
+ *     每拍**只发 1 次 DRW 读**，返回值是上一拍的结果，由调用方回填进上一拍的槽位。
+ *
+ * 🚨 只能在**同一个地址**上连续读时用（调用方保证只有一个 span）。地址一变就要重写
+ * TAR，而这里的 TAR 写带 RDBUFF 收尾（2 次传输），比 swd_read_block 的裸写（1 次）还贵
+ * —— 实测两个远离的单字 span 会从 8.6 µs 变成 11.2 µs。
  * 返回 1 = 成功，0 = 失败（与 swd_read_block4 同约定）。 */
 uint8_t swd_read_word_held(uint32_t address, uint8_t *data);
+uint8_t swd_read_word_hold_prepare(uint32_t address);
+uint8_t swd_read_word_pipe(uint32_t *data);
 
 /* 清掉 swd_host 对 AP/DP 的影子寄存器缓存（select / CSW / TAR）。
  * 主机自己碰过 DAP（走 DAP_SWD_Transfer 那条路，绕过 swd_host）之后必须调，

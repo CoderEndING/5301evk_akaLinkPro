@@ -409,24 +409,30 @@ uint8_t swd_read_block4(uint32_t address, uint8_t *data, uint32_t size)
     return swd_read_block(address, data, size);
 }
 
-/* 同一个字反复读的快速路径：**2 次传输**（DRW + RDBUFF），原来是 3 次。
+/* ================= 单字"抱住地址"读：2 次传输 / 1 次传输 =================
  *
- * 省掉的是 TAR 写。为什么能省：AHB-AP 的读是 posted 的 —— DRW 读回来的是"上一次
- * DRW 读"的结果，所以"取当前值"这件事本身只需要 DRW + RDBUFF；而 TAR 之所以每次
- * 都要重写，是因为 CSW 里 AddrInc=1，读完一个字 TAR 就自己走到了 addr+4。
- * 这里把 CSW 切成不自增，地址不变时 TAR 就一直成立（swd_write_ap(AP_TAR) 里做了缓存），
- * 于是稳态每拍只剩两次传输。
+ * 背景：AHB-AP 的读是 **posted** 的 —— DRW 读回来的是"上一次 DRW 读"的结果，
+ * 同时发起一次新的 AHB 读。所以同一地址连续读时：
  *
- * 实测（F103ZE，60 MHz 档，每次传输 401 周期）：4.503 µs → 3.39 µs（222 → 295 kHz）。
+ *   · TAR 根本不用重写（前提是 CSW 里 AddrInc=0，见 CSW_VALUE_HOLD）；
+ *   · 想要"当前值"，一次 DRW + 一次 RDBUFF 就够（swd_read_word_held 的老形态）；
+ *   · 更快的是**把它当流水线**：每拍只发一次 DRW 读，它返回的是上一拍的值，
+ *     调用方把那个值回填进上一拍自己的槽位 —— 每拍 **1 次传输**。
  *
- * ⚠️ 只能整段会话都用它：CSW 被切成不自增之后，只要有一次多字块读（swd_read_block）
- * 就会把 CSW 切回自增，来回切一次是 2 次传输，省下的 1 次就赔光了。调用方
- * （scope 采样器）为此只在"所有 span 都是 4 字节直读"时才走这条路。
- * 返回 1 = 成功，0 = 失败（与 swd_read_block4 同约定）。 */
-uint8_t swd_read_word_held(uint32_t address, uint8_t *data)
+ * 实测（F103ZE，60 MHz 档）：3 次 → 2 次把 4.503 µs 压到 2.681 µs；
+ * 再上流水线只剩 1 次读，约 1.57 µs。
+ *
+ * ⚠️ 只能在**同一个地址**上连续读时用。地址一变（哪怕只是两个单字 span 交替），
+ * 每次都要重写 TAR，而这里的 TAR 写走 swd_write_ap（写 + RDBUFF 收尾 = 2 次传输），
+ * 比 swd_read_block 的裸 TAR 写（1 次）还贵 —— 那种配置反而更慢，实测两个远离的
+ * 单字 span 从 8.6 µs 变成 11.2 µs。守卫必须是"**只有一个 span**"。
+ * ======================================================================== */
+
+/* 把 AP 准备成"抱住地址"的连续读：CSW 切成不自增、TAR 指向 address。
+ * 已经是这个状态就是空操作（每拍调一次也没关系，它自己会纠偏）。 */
+uint8_t swd_read_word_hold_prepare(uint32_t address)
 {
     const uint32_t csw = CSW_VALUE_HOLD | CSW_SIZE32;
-    uint8_t req, ack;
 
     if (dap_state.csw != csw)
     {
@@ -436,12 +442,31 @@ uint8_t swd_read_word_held(uint32_t address, uint8_t *data)
     {
         if (!swd_write_ap(AP_TAR, address)) { return 0; }
     }
+    return 1;
+}
 
-    /* prime：这一次 DRW 读回的是**上一次** DRW 读的结果（posted），丢掉；
-     * 紧接着的 RDBUFF 才是本次地址的值。 */
-    req = SWD_REG_AP | SWD_REG_R | AP_DRW;
-    if (swd_transfer_retry(req, NULL) != 0x01) { return 0; }
-    /* 这里**不动** tarp_ok：本轮 CSW 是不自增的，AP.TAR 还在原处 */
+/* 只发一次 DRW 读。**返回值是上一次 DRW 读的结果**，所以它单用没有意义：
+ * 必须当流水线用 —— 第一次的结果丢掉，之后每次拿到的都是上一次的。
+ * data 允许为 NULL（丢掉这次的结果）。 */
+uint8_t swd_read_word_pipe(uint32_t *data)
+{
+    const uint8_t req = SWD_REG_AP | SWD_REG_R | AP_DRW;
+
+    if (swd_transfer_retry(req, data) != 0x01) { return 0; }
+    /* CSW 是不自增的，AP.TAR 还在原处，tarp_ok 保持有效 */
+    return 1;
+}
+
+/* 一次性版本：DRW + RDBUFF = 2 次传输（给不想用流水线的调用方）。
+ * 返回 1 = 成功。地址固定时每拍 2 次，比 swd_read_block 的 3 次省一次。 */
+uint8_t swd_read_word_held(uint32_t address, uint8_t *data)
+{
+    uint8_t req, ack;
+
+    if (!swd_read_word_hold_prepare(address)) { return 0; }
+
+    /* prime：这一次读回的是上一次 DRW 读的结果，丢掉；RDBUFF 才是本次地址的值 */
+    if (!swd_read_word_pipe(NULL)) { return 0; }
 
     req = SWD_REG_DP | SWD_REG_R | SWD_REG_ADR(DP_RDBUFF);
     ack = swd_transfer_retry(req, (uint32_t *)data);
