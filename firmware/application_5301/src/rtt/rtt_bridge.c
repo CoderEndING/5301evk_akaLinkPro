@@ -671,6 +671,10 @@ void rtt_bridge_note_dap_activity(void)
     /* 主机用过 DAP（例如 OpenOCD 刚连过），DP 的时钟档/供电状态就不再由我们
      * 掌握：下次启动或基准测试必须重新初始化，不能复用旧状态。 */
     s_swd_ready = 0U;
+    /* 同理，swd_host 对 AP/DP 的影子寄存器缓存（SELECT / CSW / TAR）也会失真 ——
+     * 主机那条路走 SWD_Read/SWD_Write，完全绕过 swd_host。不清掉的话，
+     * scope 采样器可能拿着"CSW 还是自增"的旧认知去读**别的地址**。 */
+    swd_invalidate_ap_cache();
 }
 
 /* Bring-up debugging: keep the last host DAP request/response so the exact

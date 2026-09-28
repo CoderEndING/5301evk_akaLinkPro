@@ -62,6 +62,17 @@ uint8_t swd_read_memory(uint32_t address, uint8_t *data, uint32_t size);
  * 倍数、且整段不跨 1 KB 自增页 —— 于是可以跳过 swd_read_memory() 里的头尾字节处理与
  * 分页循环。实测每次采样的框架开销里有相当一部分就花在那两层包装上。 */
 uint8_t swd_read_block4(uint32_t address, uint8_t *data, uint32_t size);
+
+/* 同一个字反复读的快速路径：CSW 切成不自增 + 缓存 TAR，稳态每拍只剩
+ * **DRW + RDBUFF 两次传输**（swd_read_block4 是 3 次）。只在"整段会话都读同一个字"
+ * 时用 —— 夹进一次多字块读就会把 CSW 切回自增，来回切反而更慢。
+ * 返回 1 = 成功，0 = 失败（与 swd_read_block4 同约定）。 */
+uint8_t swd_read_word_held(uint32_t address, uint8_t *data);
+
+/* 清掉 swd_host 对 AP/DP 的影子寄存器缓存（select / CSW / TAR）。
+ * 主机自己碰过 DAP（走 DAP_SWD_Transfer 那条路，绕过 swd_host）之后必须调，
+ * 否则缓存会失真 —— 轻则多写几次寄存器，重则读到**别的地址**。 */
+void swd_invalidate_ap_cache(void);
 uint8_t swd_write_memory(uint32_t address, uint8_t *data, uint32_t size);
 uint8_t swd_read_core_register(uint32_t n, uint32_t *val);
 uint8_t swd_write_core_register(uint32_t n, uint32_t val);

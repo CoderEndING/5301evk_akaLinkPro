@@ -69,6 +69,14 @@ V_CROSS = [  # span A(0x20000000,14B) + span B(0x20001010,56B)：跨 span 的慢
     ("i_tick",     0x2000101c, 4, 5), ("g_pair_a",   0x2000102c, 2, 2),
     ("g_pair_b",   0x2000102e, 2, 2), ("g_tick",     0x20001044, 4, 4),
 ]
+V_MIXED = [  # 🚨 混合：一个 3 字 span（自增块读）+ 一个单字 span。
+             # 单字快路径（AddrInc=0 + 抱住 TAR）**必须不能启用** —— 一启用就会让 CSW
+             # 在自增/不自增之间来回切，切一次赔 2 次传输。这个用例就是守那条守卫的：
+             # 采样结果照旧要对（g_tick 斜率），M0 也应该跟"全是单字"明显不同。
+    ("g_lfsr",     0x20000000, 4, 4),   # + g_far_cnt @+8 → 并成 0x20000000..0x2000000b 的 3 字 span
+    ("g_far_cnt",  0x20000008, 4, 4),
+    ("g_tick",     0x20001044, 4, 4),   # 远处孤零零一个字
+]
 
 
 def watchdog(sec):
@@ -239,7 +247,7 @@ class PktStream:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cmd', choices=['status', 'bench', 'run'])
-    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one'])
+    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one', 'mixed'])
     ap.add_argument('--clock', type=int, default=0, help='SWD Hz，0=不动')
     ap.add_argument('--period', type=int, default=100, help='采样周期 us')
     ap.add_argument('--iters', type=int, default=2000)
@@ -253,7 +261,7 @@ def main():
                     help='HID 0x34：主循环 CDC/串口桥开关（off = 采样期间不用服务 COM 口，省几百周期/轮）')
     a = ap.parse_args()
 
-    vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE}[a.vset]
+    vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE, 'mixed': V_MIXED}[a.vset]
     dev = open_hid()
 
     if a.bridge != 'keep':
@@ -275,8 +283,8 @@ def main():
     do_config(dev, a.period, vars_, a.flags)
     st = status(dev)
     print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
-          % (len(vars_), a.period, st['spans'], {'pack': 1, 'one': 1, 'cross': 3}[a.vset]))
-    if st['spans'] != ({'pack': 1, 'one': 1, 'cross': 3}[a.vset]):
+          % (len(vars_), a.period, st['spans'], {'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2}[a.vset]))
+    if st['spans'] != ({'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2}[a.vset]):
         print("⚠️ span 数与本地计划不一致 —— 检查合并规则/地址")
 
     if a.cmd == 'bench':
