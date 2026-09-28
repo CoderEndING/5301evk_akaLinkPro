@@ -195,7 +195,14 @@ openocd.exe -s <sdk>\tools\openocd\tcl -f script_test\openocd_stm32f1_swd.cfg `
 > sdk_env 的 OpenOCD + 最小 cfg 下 H7 flash 算法跑不起来）—— 这正是当初做"全 RAM 版"
 > 的原因，所以"代码在 flash、缓冲在 AXI SRAM"那种布局目前无法在本机验证。
 
-### J-Link 交叉验证：700 KB/s 是**目标侧**天花板（决定性，2026-09-28）
+### J-Link 交叉验证（含 ⚠️ 一次被推翻的结论，2026-09-28）
+
+> **修正记录**：本节初版结论是"J-Link 也 ~700 KB/s ⇒ 目标侧天花板"。**该推论已作废。**
+> 随后用 J-Link 自己的 **CLI**（`JLink.exe` 的 `loadbin`/`savebin`，同样 CPU halt 条件）
+> 实测：读 4×512 KB @50 MHz = **691.7 KB/s**、@4 MHz = **293.8 KB/s**，写也是 ~697 KB/s
+> —— 读写同值、随链路速率变化且明显饱和 ⇒ **~700 KB/s 是 J-Link 工具侧（CLI 每块一次
+> USB 往返）的天花板，不是目标的**。所以 J-Link 的 RTT 数字（692.9）同样被它自己的
+> ~700 卡住，**不能当作"目标侧天花板"的证据**。
 
 换上 **SEGGER J-Link**（自家参考实现）+ `JLinkRTTLogger.exe`，同一块 H743、同一个
 狂发固件（此时已用 J-Link 把 **flash 版**烧好，代码在 flash、CB+栈在 AXI SRAM）：
@@ -207,20 +214,20 @@ openocd.exe -s <sdk>\tools\openocd\tcl -f script_test\openocd_stm32f1_swd.cfg `
 | **本探针的 RTT→CDC 桥** | 45 MHz | 676.9 ~ 724.4 KB/s |
 | （对照）本探针桥测 **F103ZET6** | 45 MHz | **2486 KB/s** |
 
-**结论：H743 上那 ~700 KB/s 是目标侧的天花板，不是探针的锅。**
+**修正后的结论：**
 
-1. 两个完全独立的工具（一个是 SEGGER 官方实现，SWD 还更快：50 vs 45 MHz）落在**同一个
-   数字**上；本探针在 45 MHz 就已经打到 SEGGER 50 MHz 的水平。
-2. 这条天花板只是**弱时钟相关**：J-Link 从 4 → 50 MHz（12.5 倍）只把 290 抬到 693 KB/s，
-   明显饱和；而同一块探针在 F103 上从 20 → 60 MHz 是 1379 → 2932 KB/s，**跟着链路走**。
-3. 与"CPU 停住时同一块 AXI SRAM 能读 2686 KB/s"合并看 ⇒ 瓶颈是
-   **"目标 CPU 在跑的时候，调试口读 AXI SRAM"这件事本身**（H7 的总线仲裁/延迟），
-   与取数工具无关。
-
-⇒ 因此 §6 开头那个"未解之谜"已经解开：**探针在这块目标上没有可优化的空间**，
-想在这类目标上把 RTT 拉起来，要动的是目标侧（例如把 CB/环形缓冲挪到
-**D2 SRAM 0x30000000**——它同样能被 AHB-AP 访问，但不在 AXI 那条被 M7 抢的通道上；
-或按 SEGGER 建议用 MPU 把 RTT 缓冲设成 non-cacheable 后开 D-cache）。
+1. **同一块 H743、同样 CPU halt，本探针读 AXI SRAM 是 2685.9 KB/s，J-Link CLI 只有
+   691.7 KB/s —— 探针快 3.9 倍。** ⇒ 目标侧没有 700 KB/s 的墙；J-Link 的 ~700 是它
+   自己的工具侧上限（4 MHz→293.8、50 MHz→691.7，往返受限且饱和）。
+2. 因此 J-Link 的 RTT 数字（692.9 KB/s）**不能**用来证明目标侧天花板，上一版推论作废。
+3. 仍然成立的：**本探针在等效路径上不输 J-Link** —— OpenOCD 路径 2685.9 vs 691.7；
+   RTT 路径 45 MHz 下 676.9~724.4 vs J-Link 50 MHz 下 692.9。
+4. **仍未解**：本探针的 **RTT 桥**在 H743 上只有 ~700 KB/s，而同一探针的 OpenOCD dump
+   有 2685.9 ⇒ 差距出在 RTT 这条路上（"CPU 正在跑" vs "CPU halt" 是首要嫌疑），
+   但 J-Link 已无法当参照。待做的判别实验（**需要把探针插回来**）：
+   - halt 住 CPU，让桥去 drain 那个已经灌满的 12 KB 缓冲 ⇒ 看能否跑出 2 MB/s 量级；
+   - 或用桥的 **discard 模式**（`CMD_RTT` action 7 的 `discard=1`，只轮询+搬运、不推 CDC）
+     看纯 SWD 侧的速率 ⇒ 分开"SWD 轮询慢"与"CDC 段慢"。
 
 > 顺带修好了板子：sdk_env 的 OpenOCD 烧不进去的 H743 flash，**用 J-Link 一次成功**
 > （`loadbin fw.bin, 0x08000000` + `verifybin` ⇒ `O.K.` / `Verify successful`），
