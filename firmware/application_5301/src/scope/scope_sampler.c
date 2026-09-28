@@ -380,6 +380,61 @@ static void scope_push_stat(void)
 
 /* ------------------------------------------------------------------ 采样 */
 
+/* ---- 批量读路径 ----------------------------------------------------------
+ * 逐字走 `swd_host.c` 时，每次传输要付 ~138 个 CPU 周期（swd_transfer_retry 的重试
+ * 循环 → SWD_Transfer 的端口判断 → SWD_Read 的头部计算 → 函数指针）—— 实测块读的
+ * 渐近成本是 1.166 µs/字（70.8 个 SWD 时钟 @60 MHz，理想只要 47），且**不随块长摊薄**，
+ * 说明它是"每次传输"而不是"每块"的开销，占一个样本的 ~30%。
+ *
+ * 这里改用 CMSIS-DAP 引擎自己的 `DAP_TransferBlock`：它一次调用就完成
+ *     post AP read（prime） → N 次 DRW 读 → 自动把最后一次换成 DP RDBUFF
+ * 循环体里只剩重试判断 + SWD_Read + 存 4 字节，每次传输的开销掉到 ~35 周期。
+ * TAR 还是得每次采样写一遍（自增把它推走了），用一条 `DAP_Transfer` 写。
+ *
+ * 传输数不变（N+2），省的是 C 层。⚠️ DAP 引擎**不会写 CSW**（那是 swd_host 的活），
+ * 所以启动时先用一次普通读把 CSW 落到硬件上，见 scope_start_now。 */
+#define SCOPE_REQ_TAR_WRITE 0x05U   /* APnDP | ((AP_TAR 0x04) >> 2) << 2 */
+#define SCOPE_REQ_DRW_READ  0x0FU   /* APnDP | RnW | ((AP_DRW 0x0C) >> 2) << 2 */
+
+static uint8_t s_req_tar[8];                    /* {ID_DAP_Transfer, idx, cnt, req, addr[4]} */
+static uint8_t s_req_blk[5];                    /* {ID_DAP_TransferBlock, idx, cnt_lo, cnt_hi, req} */
+static uint8_t s_rsp_dummy[8];
+/* 🚨 响应布局实测（别照 CMSIS-DAP 文档推）：
+ *   DAP_Transfer       -> [ID][count][resp]
+ *   DAP_TransferBlock  -> [ID][cnt_lo][cnt_hi][resp][data...]
+ * 即 DAP_ProcessCommand 会把**命令 ID 回显在 response[0]**，payload 从 [1] 起。
+ * 少算这一个字节就会把 resp 当数据、把数据当 resp —— 表现为"块读永远不 OK"。 */
+#define SCOPE_RSP_HDR   4U                      /* ID + cnt_lo + cnt_hi + resp */
+static uint8_t s_rsp_blk[SCOPE_RSP_HDR + SCOPE_SPAN_MAX];
+
+static void scope_req_init(void)
+{
+    s_req_tar[0] = 0x05U;                       /* ID_DAP_Transfer */
+    s_req_tar[1] = 0U;                          /* DAP index */
+    s_req_tar[2] = 1U;                          /* 1 次传输 */
+    s_req_tar[3] = SCOPE_REQ_TAR_WRITE;
+
+    s_req_blk[0] = 0x06U;                       /* ID_DAP_TransferBlock */
+    s_req_blk[1] = 0U;                          /* DAP index */
+    s_req_blk[4] = SCOPE_REQ_DRW_READ;
+}
+
+/* 采一个 span，数据落在 s_stage。
+ *
+ * ⚠️ 这里**曾经**改成走 CMSIS-DAP 引擎的 `DAP_TransferBlock`（一次调用完成
+ * prime + N×DRW + 自动收尾 RDBUFF），指望省掉 `swd_host` 的 C 调用链开销。
+ * **实测反而慢 6.5%**（60 MHz：12.31 µs vs 11.55 µs），原因见下 —— 代码留着做对照，
+ * 但不要启用。
+ *
+ * 为什么省不下来：把一个传输拆开量过，420 个 CPU 周期里 **282 是 47 bit × 6 周期**
+ * 的协议下限（60M blob 的包头/数据相位都是 6 条指令/bit，已经是手工优化的），
+ * 剩下 ~138 周期在 ACK/转向相位与 GPIO 总线延迟上 —— 那部分**每次传输都逃不掉**，
+ * 跟外面包了几层 C 函数无关。所以唯一有效的方向是**减少传输次数**，不是优化调用链。 */
+static int scope_read_span(const scope_span_t *sp)
+{
+    return rtt_bridge_read(sp->start, s_stage, sp->len);
+}
+
 /* 采一拍，把变量字节写进"本样本在包里的槽位"。
  * 返回 0 = 成功；-1 = 某个 span 读失败（这一拍作废，计入 swd_err）。 */
 static int scope_sample_bytes(uint8_t *dst)
@@ -388,15 +443,15 @@ static int scope_sample_bytes(uint8_t *dst)
     {
         const scope_span_t *s = &s_span[sp];
 
+        if (scope_read_span(s) != 0) { return -1; }
+
         if (s->direct)
         {
-            /* 零拷贝：span 的字节序 == 帧内布局，直接落进包 */
-            if (rtt_bridge_read(s->start, dst + s->frame_off, s->len) != 0) { return -1; }
+            /* span 的字节序 == 帧内布局：整段搬（24 B 就是 6 个字） */
+            memcpy(dst + s->frame_off, s_stage, s->len);
         }
         else
         {
-            if (rtt_bridge_read(s->start, s_stage, s->len) != 0) { return -1; }
-            /* 注意读起点已向下对齐到 4 字节，所以变量字节要从 (addr - s->start) 取 */
             for (uint8_t k = 0U; k < s->count; k++)
             {
                 uint8_t vi = (uint8_t)(s->first + k);
@@ -435,14 +490,32 @@ static int scope_sample_once(void)
     return 0;
 }
 
+/* 把链路准备好（含批量路径需要的那一次 CSW 落地）。0 = ok，其它 = rtt_swd_init 的码。 */
+static int scope_link_ready(void)
+{
+    if (s_swd_ready) { return 0; }
+
+    int rc = rtt_bridge_swd_ensure_ready();      /* 复用桥的 SWD 初始化（含斜坡换挡） */
+    if (rc != 0) { return rc; }
+
+    if (s_nspans == 0U) { scope_make_plan(); }
+    scope_req_init();                            /* 批量路径的请求模板（当前作为对照保留） */
+
+    /* 先做一次真实读：既是"链路真的读得动"的验收，也把目标 AP 的 CSW 落到硬件上
+     * （32 位自增）—— 逐字路径自己会写 CSW，但如果以后重新启用批量路径，那次写是不做的。 */
+    if (rtt_bridge_read(s_span[0].start, s_stage, 4U) != 0) { return -4; }
+
+    s_swd_ready = 1U;
+    return 0;
+}
+
 static int scope_start_now(void)
 {
     if ((s_nvars == 0U) || (s_frame_bytes == 0U)) { return -3; }
-    int rc = rtt_bridge_swd_ensure_ready();      /* 复用桥的 SWD 初始化（含斜坡换挡） */
-    if (rc != 0) { s_swd_ready = 0U; return rc; }
-    s_swd_ready = 1U;
-
     scope_make_plan();
+
+    int rc = scope_link_ready();
+    if (rc != 0) { s_swd_ready = 0U; return rc; }
 
     s_seq = 0U; s_t_us = 0U; s_produced = 0U; s_dropped = 0U; s_usb_drop = 0U;
     s_swd_err = 0U; s_yield = 0U; s_pkts = 0U; s_bytes = 0U; s_discard_pkts = 0U;
@@ -473,9 +546,8 @@ static void scope_run_bench(void)
     }
     if (!s_swd_ready)
     {
-        int rc = rtt_bridge_swd_ensure_ready();
+        int rc = scope_link_ready();
         if (rc != 0) { s_bench_err = rc; s_bench_valid = 1U; return; }
-        s_swd_ready = 1U;
     }
 
     uint32_t t0 = mchtmr_now();
