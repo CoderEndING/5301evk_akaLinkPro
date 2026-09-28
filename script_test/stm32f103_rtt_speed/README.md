@@ -60,10 +60,22 @@ RTT 配成 **`SEGGER_RTT_MODE_BLOCK_IF_FIFO_FULL`**（缓冲满就阻塞）—�
 
 ## 编译 / 烧录
 
+**每块板子一个独立输出目录，互不覆盖**（`-Clean` 也只清当前这块）：
+
 ```powershell
-pwsh -File build.ps1          # arm-none-eabi-gcc，不需要 Keil
-pwsh -File flash.ps1          # OpenOCD + CMSIS-DAP（烧录前先把桥/OpenOCD 停掉）
+pwsh -File build.ps1             # CB  : 128KB flash / 20KB RAM, RTT 上行 12KB -> build-cb\
+pwsh -File build.ps1 -Board c8   # C8  :  64KB flash / 20KB RAM, RTT 上行 12KB -> build-c8\
+pwsh -File build.ps1 -Board ze   # ZET6: 512KB flash / 64KB RAM, RTT 上行 32KB -> build-ze\
+
+pwsh -File flash.ps1 -Board cb   # OpenOCD + CMSIS-DAP（烧录前先把桥/OpenOCD 停掉）
+pwsh -File flash.ps1 -Board ze -Erase
 ```
+
+产物：每个目录下 `fw.elf` / `fw.bin` / `fw.hex` / `fw.map`。ZE 的 32KB 上行缓冲通过
+`-DBUFFER_SIZE_UP=32768` 覆盖 `segger_rtt/SEGGER_RTT_Conf.h` 的默认值（那里有 `#ifndef` 守卫）。
+
+> ⚠️ 跑 64KB `load_image` 基准（`script_test/swd/benchmark_readback.tcl`）会把 ZE 的
+> **整片 SRAM**（含 RTT 控制块）覆盖掉，跑完要重新烧固件。
 
 ## 跑吞吐测试
 

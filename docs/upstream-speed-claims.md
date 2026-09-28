@@ -109,23 +109,31 @@ telnet 往返（实测 ~1 ms），在 20 KB 量级上吃掉 **~19%**。OpenOCD �
 
 ## 5. F103ZET6 狂发（RTT flood）例程
 
-`script_test/stm32f103_rtt_speed/` 现在一块源码支持两块板：
+`script_test/stm32f103_rtt_speed/` 现在一块源码支持三块板，**每块板一个独立输出
+目录，互不覆盖**（两套固件可以同时躺在目录里，随时烧任意一块）：
 
 ```powershell
 cd script_test\stm32f103_rtt_speed
-pwsh -File build.ps1 -Board ze -Clean   # ZET6: 512KB flash / 64KB RAM, RTT 上行 32KB
-pwsh -File build.ps1                    # 默认 c8: 64KB flash / 20KB RAM, RTT 上行 12KB
+pwsh -File build.ps1 -Board cb -Clean   # CB  : 128KB flash / 20KB RAM, RTT 上行 12KB -> build-cb\
+pwsh -File build.ps1 -Board c8          # C8  :  64KB flash / 20KB RAM, RTT 上行 12KB -> build-c8\
+pwsh -File build.ps1 -Board ze          # ZET6: 512KB flash / 64KB RAM, RTT 上行 32KB -> build-ze\
+
+pwsh -File flash.ps1 -Board cb          # 烧录（OpenOCD + CMSIS-DAP 探针）
+pwsh -File flash.ps1 -Board ze -Erase
 ```
 
-* 新增 `ld/stm32f103ze.ld`；`SEGGER_RTT_Conf.h` 的 `BUFFER_SIZE_UP` 加了
-  `#ifndef` 守卫，ZE 用 `-DBUFFER_SIZE_UP=32768`。
+* 新增 `ld/stm32f103cb.ld`（128KB flash）与 `ld/stm32f103ze.ld`（512KB flash / 64KB RAM）；
+  `SEGGER_RTT_Conf.h` 的 `BUFFER_SIZE_UP` 加了 `#ifndef` 守卫，ZE 用
+  `-DBUFFER_SIZE_UP=32768`（实测 `bss` 12652 → 33132）。
+* 实测两套 `.bin` 均为 1052 B，内容不同（RTT 控制块里的缓冲长度常量不同），
+  MD5 分别是 `17c92b3a…`（cb）与 `9f1bb36b…`（ze）。
 * 烧录用本仓库的配置（`flash.ps1` 里写死的 ESP-IDF OpenOCD 已随 ESP-IDF 卸载，
-  改用 sdk_env 的）：
+  现在默认走 sdk_env 那份 + `script_test/openocd_stm32f1_swd.cfg`）：
 
 ```powershell
 openocd.exe -s <sdk>\tools\openocd\tcl -f script_test\openocd_stm32f1_swd.cfg `
   -c "init" -c "adapter speed 2000" -c "reset halt" `
-  -c "program {…/build/fw.elf} verify reset" -c "exit"
+  -c "program {…/build-ze/fw.elf} verify reset" -c "exit"
 ```
 
 * 实测（96 MHz HCLK，HSE 8 MHz ×12）：`RCC_CFGR=0x0029A50A` 确认 PLL×12；

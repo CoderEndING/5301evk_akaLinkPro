@@ -38,9 +38,12 @@ EVKLite 上 CDC 是复合设备的 `MI_01`，可用
 | `swd/run_benchmark.py` | 生成指定 `adapter speed`/`iterations` 的 OpenOCD SWD 读写校验并运行 |
 
 > `stm32f103_rtt_speed/` 是 RTT 测速用的 STM32F103 测试固件（SEGGER RTT + 计数
-> 全局变量），`rtt_*.py` 需要它编译出的 `build/fw.bin`：先跑
-> `powershell -File stm32f103_rtt_speed\build.ps1`（需要 arm-none-eabi 工具链），
-> 或自带一份已编译的 `fw.bin`（`build/` 不入库）。
+> 全局变量），`rtt_*.py` 需要它编译出的 `fw.bin`：先跑
+> `powershell -File stm32f103_rtt_speed\build.ps1 -Board cb|ze`（需要 arm-none-eabi
+> 工具链），或自带一份已编译的 `fw.bin`（`build-*/` 不入库）。
+> **每块板子一个独立输出目录，互不覆盖**：`build-cb/`（128KB flash / 20KB RAM）、
+> `build-c8/`（64KB flash / 20KB RAM）、`build-ze/`（512KB flash / 64KB RAM，
+> RTT 上行缓冲 32KB）；烧录用 `flash.ps1 -Board <名字>`。
 > `sram_speed_test.py` / `rtt_*.py` 走 OpenOCD，路径由环境变量
 > `OPENOCD_EXE` / `OPENOCD_SCRIPTS` / `HPM_SDK_ENV_DIR` 覆盖。
 
