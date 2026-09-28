@@ -93,8 +93,14 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if args:
         COM = args[0]
-    for o in [a for a in sys.argv[1:] if a.startswith("--")]:
-        k, _, v = o.partition("=")
+    # 同时支持 --sec=5 与 --sec 5 两种写法
+    argv = sys.argv[1:]
+    for i, o in enumerate(argv):
+        if not o.startswith("--"):
+            continue
+        k, eq, v = o.partition("=")
+        if not eq and (i + 1) < len(argv) and not argv[i + 1].startswith("--"):
+            v = argv[i + 1]
         if k == "--sec":
             SEC = float(v)
         elif k == "--clocks":
