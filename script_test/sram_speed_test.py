@@ -113,7 +113,15 @@ def boost_target_clock(tn):
 
     Must be re-applied after every 'reset halt' - the reset restores the RCC
     defaults and the throughput would silently fall back to the 8 MHz HSI rate.
+
+    但测试固件（script_test/stm32f103_rtt_speed）现在**自己**就超频到 96 MHz
+    （HSE 8 MHz x12，见其 main.c 的 clock_init），所以只要看到已经跑在 PLL 上就
+    直接返回 —— 再去写 RCC_CFGR 会把固件设好的 APB 分频覆盖掉（实测交付率因此
+    从 2503 掉到 1389 KB/s，见 docs §5.9）。
     """
+    cfgr = _rd(tn, RCC_CFGR) or 0
+    if ((cfgr >> 2) & 3) == 2:      # SWS = PLL：固件已经顶上去了，别动
+        return
     tn.cmd("mww 0x%08X 0x00000012" % FLASH_ACR)        # 2 wait states + prefetch
     tn.cmd("mww 0x%08X 0x00380400" % RCC_CFGR)         # PLLSRC=HSI/2, x16, HPRE=/1, PPRE1=/2
     cr = _rd(tn, RCC_CR) or 0

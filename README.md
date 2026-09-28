@@ -132,8 +132,23 @@ python script_test\rtt_rate_matrix.py COM52           :: 逐档对照：SWD 读�
 python script_test\rtt_bridge_sweep.py COM52 --clk=60 :: 调优扫描：时钟 x 块大小 x 丢弃模式
 ```
 
-`make sram-test` 实测（20 KB @ `0x20000000`，OpenOCD `load_image`/`dump_image`，
-目标已归一到 64 MHz）：
+### SRAM 吞吐：主机驱动 vs 纯 SWD 链路
+
+这两个数字**不是一回事**，放一起看才不会被误导：
+
+**① 纯 SWD 链路天花板**（探针内部基准：`CMD_RTT` action 8，读目标 SRAM，
+不经 USB、不经主机、不含 RTT 描述符开销）—— 这才是"链路本身能跑多快"：
+
+| SWD 档 | 20 MHz | 30 MHz | 36 MHz | 45 MHz | **60 MHz** |
+| --- | --- | --- | --- | --- | --- |
+| 纯 SWD 读 | 1476 | 2053 | 2359 | 2788 | **3312 KB/s（3.2 MB/s）** |
+
+复现：`python script_test\rtt_rate_matrix.py COM52`（同一张表里还给出 RTT 交付率与占比）。
+60/80/100 MHz 都落在同一个 60M blob 上，所以 60 MHz 起就 plateau 了。
+
+**② 主机驱动**（`make sram-test`：OpenOCD `load_image`/`dump_image` 走 CMSIS-DAP
+USB 往返）—— 每次传输都要 host↔探针 来回，所以**远低于**链路天花板，数字本身受
+主机栈与目标主频双重影响：
 
 | SWD 时钟 | 写 | 读 |
 | --- | --- | --- |
@@ -142,11 +157,15 @@ python script_test\rtt_bridge_sweep.py COM52 --clk=60 :: 调优扫描：时钟 x
 | 36 MHz | 1958.7 KB/s | 1944.6 KB/s |
 | 60 MHz | 2640.3 KB/s | 2375.7 KB/s |
 
-> ⚠️ 这个数字受**目标机主频**限制（每次 SWD AHB-AP 事务要花几个目标 HCLK）：
+> 上表是**目标 64 MHz 时代**的基线。现在 `script_test/stm32f103_rtt_speed` 固件
+> 自己就超频到 **96 MHz**（HSE 8 MHz ×12，`main.c` 的 `clock_init()`），复测会更高；
+> `sram_speed_test.py` 已改成「发现目标已跑在 PLL 上就不动 RCC」（否则它会把固件设好的
+> APB 分频写坏，实测交付率会从 2503 掉到 1389 KB/s）。
+>
+> ⚠️ 这个数字还受**目标机主频**限制（每次 SWD AHB-AP 事务要花几个目标 HCLK）：
 > STM32F103 上电默认 HSI 8 MHz 时，无论 SWD 时钟拉到多高都会卡在 ~1.4 MB/s，
 > 而 F1 的 `reset halt` 是核心级复位、不清 RCC，所以数字会随目标上电后的状态
-> 变化一倍。`sram_speed_test.py` 因此默认在每轮复位后把目标提到 64 MHz 并打印
-> 实测时钟（`--no-boost` 可关闭）。
+> 变化一倍（`sram_speed_test.py` 会打印实测时钟，`--no-boost` 可关闭它的补偿）。
 
 ### SEGGER RTT 吞吐：从 919 KB/s 到 2.9 MB/s
 
