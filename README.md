@@ -32,6 +32,12 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
   （J-Link 式），主机只读一个串口。**默认 45 MHz 档：2527 KB/s（2.47 MB/s）零丢包**；
   切 60 MHz 档：**2954 KB/s（2.89 MB/s）** —— 比主机轮询上限（1140 KB/s）快 **2.6 倍**。
   详见 [探针侧 RTT→CDC 桥](#探针侧-rttcdc-桥)。
+- **J-Scope 波形（探针侧 HSS 采样，HID `CMD_SCOPE` 0x32 + bulk IN `0x83`）**：类 SEGGER
+  J-Scope 的变量示波器 —— 探针自己按周期用 SWD 读目标 RAM 里 1~8 个变量，组 512 B
+  自描述包推给主机，**目标固件一行都不用改**（变量地址来自目标 `.elf` 的 DWARF）。
+  单变量 u32 实测**端到端 329 kHz**（3 µs 周期，探针侧零丢；探针本体 632 kHz），
+  8 通道 6 字 span 89.6 kHz。采样期间可一键让出 CDC/串口桥（`flags bit5` 或 HID `0x34`）。
+  详见 [J-Scope 波形（探针侧 HSS 采样）](#j-scope-波形探针侧-hss-采样)。
 - **支持 RISC-V 目标（JTAG-only，HID `CMD_RISCV` 0x33）**：新增探针侧 RISC-V
   Debug Module 引擎（DMI + SBA，`src/riscv/` + 专用 DMI 扫描汇编，TDI 预置 + 循环
   展开）。调 HPM6800EVK（HPM6880）实测 SRAM 读 **1504.5 KB/s**、写 **1511.8 KB/s**，
@@ -866,7 +872,8 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 | [`docs/hpm6800evk-jtag.md`](docs/hpm6800evk-jtag.md) | **HPM6800EVK（HPM6880，RISC-V）用本探针调 JTAG 的完整记录**：接线坑、启动头真相、DMI/SBA 引擎与专用汇编、三个 DTM 时序坑、RTT 交付率与跨后端极性 bug、TCK 频率上限 |
 | [`docs/HPM5301EVKLite_port.md`](docs/HPM5301EVKLite_port.md) | EVKLite 移植说明：引脚映射、构建、烧录、自调试、验证清单 |
 | [`docs/HANDOVER-evklite-20260927.md`](docs/HANDOVER-evklite-20260927.md) | 移植过程交接记录（含 CDC 回环故障的根因与修复） |
-| [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议 |
+| [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议（0x31 RTT / 0x32 SCOPE / 0x33 RISCV / 0x34 BRIDGE） |
+| [`script_test/stm32f103_scope/`](script_test/stm32f103_scope) | J-Scope 的靶子固件（F103C8/ZE，96 MHz，10 kHz 契约波形）+ `check.py` 客观验收 |
 | [`firmware/application_5301/Flash_Memory_Map.md`](firmware/application_5301/Flash_Memory_Map.md) | Flash 布局 |
 | [`firmware/application_5301/Firmware_Integrity_Plan.md`](firmware/application_5301/Firmware_Integrity_Plan.md) | 固件头/CRC 校验设计 |
 | [`.opencode/skills/akalinkpro-firmware/SKILL.md`](.opencode/skills/akalinkpro-firmware/SKILL.md) | 构建 / 烧录 / 调试技能说明 |
