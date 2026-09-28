@@ -225,7 +225,9 @@ Byte[0x03-0x3F] = Command data（可选）
     Byte[0x02] = 0x31 // Command type
     Byte[0x03] = action：0=停止，1=启动，2=查状态，3=自动启动（自己搜控制块），
                   4=原始 DAP 透传（调试用），5=读探针自身内存（调试用），6=取透传结果，
-                  7=运行时调参，8=纯 SWD 基准，9=取基准结果
+                  7=运行时调参，8=纯 SWD 基准，9=取基准结果，
+                  **10=切换目标类型**（Byte[0x04]：0=SWD/ARM，1=RISC-V/JTAG，
+                  见下方第 16 条）
     Byte[0x04-0x07] = 目标地址（action=1 时可选，0 = 用默认搜索区间；
                                 action=8 时为目标地址）
     Byte[0x08-0x0B] = 搜索长度（action=1 时可选，0 = 默认；
@@ -270,6 +272,14 @@ Byte[0x03-0x3F] = Command data（可选）
     `swd_host.c`（`src/swd_host/`）。它只在 DAP 空闲 ≥20 ms 时轮询，正常调试会话最多
     多约 1 ms 抖动。实测 2.14 MB/s 且零丢包，测速脚本 `script_test/rtt_probe_bridge.py`。
 
+    **目标可以是 RISC-V**（action 10 切换）：桥自身的逻辑（找控制块、搬环形缓冲、
+    回写 RdOff）两边完全一样，只有底下三个原语分派不同 —— 读/RdOff 写走
+    `src/riscv/` 的 DMI+SBA 引擎，初始化走 `riscv_jtag_open()`（TAP 复位 + 加载
+    `IR=0x11` + 唤醒 DM）。此时 action 7 的"SWD 时钟 Hz"对 RISC-V 无意义，只有
+    <256 的值会被当成 DMI 的 idle 周期数（默认 8，见第 16 条）。
+    实测 HPM6800EVK 交付 **1105~1165 KB/s 且字节级零丢包**，
+    测速脚本 `script_test/hpm6800_rtt_delivery.py` / `hpm6800_rtt_loss.py`。
+
 14. 设备复位指令 0xFE
    主机发送 request
    Byte[0x00] = 0x01 // Report ID
@@ -283,6 +293,73 @@ Byte[0x03-0x3F] = Command data（可选）
    Byte[0x01] = 0x01 // Data Length
    Byte[0x02] = 0xFF // Command type
    设备复位进入DFU模式，不会回复，此时连接断开
+
+16. 探针侧 RISC-V 引擎指令 0x32（JTAG-only 目标，如 HPM6800EVK / HPM6880）
+    探针自带一套 RISC-V Debug Module 引擎：加载一次 `IR=0x11` 之后，一次 DMI 访问
+    就是一次 41 位 DR 扫描（`{op[1:0], data[31:0], addr[6:0]}`），响应滞后一拍，
+    所以连续 posted 请求可以一个字一次扫描地流水；块搬运走 DM 的 SBA（硬件自增地址）。
+    JTAG 位翻转不能在 USB 中断里跑，所以动作都是**排队**的、由主循环的
+    `riscv_svc_poll()` 执行；回复里带的是**排队那一刻**的状态块，所以查询结果要
+    轮询 `action=6`（或看 bit8 的 pending 位变 0）。
+
+    主机发送 request
+    Byte[0x00] = 0x01 // Report ID
+    Byte[0x01] = 0x0E // Data Length（最多 1+1+4+4+4+2）
+    Byte[0x02] = 0x32 // Command type
+    Byte[0x03] = action
+    Byte[0x04-0x07] = 目标地址
+    Byte[0x08-0x0B] = 参数 1
+    Byte[0x0C-0x0D] = 参数 2（只有 16 位）
+
+    | action | 含义 | 参数 |
+    | --- | --- | --- |
+    | 0 | `stop`：释放端口（引脚回空闲） | — |
+    | 1 | `open`：TAP 复位 + 加载 `IR=DMI` + 置 `dmcontrol.dmactive`。**基准类动作都要求先 open** | — |
+    | 2 | `rbench`：SBA 块读基准 | addr / 参数1 = 字节数（钳到 ≤2048）/ 参数2 = 轮数（≤64） |
+    | 3 | `wbench`：SBA 块写基准 | 同上 |
+    | 4 | `sbench`：单字 SBA 读基准（每字 4 次 DMI 扫描） | addr / 参数1 = 轮数 |
+    | 5 | `rcheck`：写已知图案（`k*7+3`）再读回比对校验和 —— **完整性门禁** | addr = 基值 / 参数1 = 字数 |
+    | 6 | 查状态，**不排队**（也是所有动作的默认查询口） | — |
+    | 7 | `config`：设 DMI idle 周期数，**立即生效、不排队** | addr = 周期数 |
+    | 8 | `dmiprobe`：原始 DMI 扫描（TAP 复位 → `IR=DMI` → 4 次请求），把原始 41 位响应塞进状态块 | addr = 扫描条数（0 = 6） |
+
+    设备回应 response
+    Byte[0x00] = 0x02 // Report ID
+    Byte[0x01] = 0x32 // Data Length = 1(回显 action) + 1 + 48(12 个状态字)
+    Byte[0x02] = 0x32 // Command type
+    Byte[0x03] = **回显 action**（注意不是返回码，返回码在状态字 [0] 的 bit16-23）
+    Byte[0x04..0x33] = 12 个 32 位小端状态字
+
+    | 字 | 位域 | 含义 |
+    | --- | --- | --- |
+    | [0] | bit0 / bit8 / bit16-23 / bit24-31 | 端口已打开 / 有动作在排队或执行中 / 返回码（见下）/ 最近动作号 |
+    | [1] | 32 位 | TAP IDCODE（HPM6880 = `0x1000563D`） |
+    | [2] | 32 位 | DTMCS（HPM6880 = `0x00007071`，其 `idle` 字段为 7） |
+    | [3] | 32 位 | DMSTATUS（HPM6880 = `0x00400CA2`） |
+    | [4] | 32 位 | 本次动作搬运的字节数 |
+    | [5] | 32 位 | 耗时 MCHTMR tick（24 MHz） |
+    | [6] | 32 位 | 最近一次读到的 SBCS（出错时看 `sbbusyerror` / `sberror`） |
+    | [7] | 低 8 / 高 24 | 当前 DMI idle 周期数 / 完成的轮数 |
+    | [8] | 32 位 | 速率（字节/秒） |
+    | [9] | 32 位 | 校验和（action=5） |
+    | [10..11] | 32 位 ×2 | 校验和读回的前两个字（action=5） |
+
+    返回码（状态字 [0] 的 bit16-23）：`0` = 正常；`1` = 目标端口没打开
+    （基准/校验类动作在没 `open` 时会直接返回这个，**很容易误判成"引擎坏了"**）；
+    `0xFF`（即 -1 截断）= 读失败；action=1 时是失败原因 `1/2/3`。
+
+    **action=8 是个例外**：状态字 [4..11] 被替换成 4 次原始 41 位扫描，
+    每次占两个字（低 32 位 + 高 9 位），看 `op[1:0]` / `data` / `addr` 用来判断
+    "DMI 应答了吗、应答的是哪个寄存器"。
+
+    说明与约束：
+    - **探针必须先切到 `output_mode=1`（SWD+JTAG）**，`output_mode=0` 会拒绝 JTAG；
+      该设置只在 RAM 里，探针复位/重插即丢。见第 9 条 `CMD_SET_CONFIG`。
+    - `idle` 周期数**不能减**：HPM6880 的 DTM `dtmcs.idle` 读出来是 7，实测 8 稳、
+      6 只跑得动 6/50 轮就死、≤4 立刻不应答。HPM6800EVK 侧 JTAG TCK 规格上限
+      25 MHz，当前引擎跑在 ~16.4 MHz（一次 DMI 访问 54 TCK）。
+    - action 2/3/5 会**直接读写目标内存**，别指向目标正在用的区域。
+    - 完整背景、接线坑与失败实验见 `docs/hpm6800evk-jtag.md`。
 
 ## 配置说明
 

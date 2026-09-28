@@ -17,6 +17,12 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 `BOARD_HAS_SWDIO_DIR`、`BOARD_NRESET_ACTIVE_LOW`、`BOARD_LED_ACTIVE_LOW`、
 `BOARD_HAS_VREF_ADC`、`BOARD_SWD_BLOB_EVKLITE` 等），两块板共用同一套 `src/`。
 
+**目标侧**支持两类调试通路，同一份固件按需切换：
+
+- **ARM（SWD 为主，也支持 JTAG）** —— 主力通路，按速度预编译的 bit-bang blob。
+- **RISC-V（JTAG-only）** —— RISC-V Debug Module（DMI + SBA）+ 探针侧搬运引擎，
+  见 [HPM6800EVK（HPM6880，RISC-V）目标调试](#hpm6800evkhpm6880risc-v目标调试)。
+
 ## 主要特性
 
 - **CMSIS-DAP 调试器**：USB-HS 复合设备（DAP + CDC + 自定义 HID + WebUSB + DFU Runtime），
@@ -26,6 +32,11 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
   （J-Link 式），主机只读一个串口。**默认 45 MHz 档：2527 KB/s（2.47 MB/s）零丢包**；
   切 60 MHz 档：**2954 KB/s（2.89 MB/s）** —— 比主机轮询上限（1140 KB/s）快 **2.6 倍**。
   详见 [探针侧 RTT→CDC 桥](#探针侧-rttcdc-桥)。
+- **支持 RISC-V 目标（JTAG-only，HID `CMD_RISCV` 0x32）**：新增探针侧 RISC-V
+  Debug Module 引擎（DMI + SBA，`src/riscv/` + 专用 DMI 扫描汇编）。调 HPM6800EVK
+  （HPM6880）实测 SRAM 读 **1189.5 KB/s**、写 **1195.3 KB/s**，比主机驱动 OpenOCD
+  快 **9 倍**；RTT 交付 **1105~1165 KB/s 且字节级零丢包**。
+  详见 [HPM6800EVK（HPM6880，RISC-V）目标调试](#hpm6800evkhpm6880risc-v目标调试)。
 - **DFU/MSC Bootloader**：长按 USER 键进 DFU，虚拟 U 盘 `AKALINKPRO` 拖入 `.bin` 即升级；
   APP 带签名 + 长度 + CRC32 校验，校验失败停在 DFU。
 - **配置持久化 + WebHID 上位机**：配置存 QSPI NOR（EasyFlash），`docs/index.html` 可直接改。
@@ -246,30 +257,15 @@ USB 批量端点）—— 比链路天花板低一档，但**不是因为"每趟
 
 ### 2026-09-28 追加：RISC-V 走 JTAG —— 主机侧是**往返受限**，探针侧才有速度
 
-第一次用本探针调 **RISC-V**（HPM6800EVK / HPM6880，只有 JTAG、没有 SWD）。
-完整记录见 **`docs/hpm6800evk-jtag.md`**，结论摘要：
+第一次用本探针调 **RISC-V**（HPM6800EVK / HPM6880，只有 JTAG、没有 SWD）。这一块
+内容已经长成独立一章 —— 接线与前置条件、**必须烧 ELF 的启动头坑**、引擎与 RTT
+交付率、TCK 频率上限分析、复现清单，全部见下面的
+**[HPM6800EVK（HPM6880，RISC-V）目标调试](#hpm6800evkhpm6880risc-v目标调试)**，
+细节在 [`docs/hpm6800evk-jtag.md`](docs/hpm6800evk-jtag.md)。
 
-| 路径 | 写 | 读 |
-| --- | --- | --- |
-| OpenOCD 主机驱动（`progbuf`，三个后端里最好的） | 154.0 KB/s | **95.9 KB/s** |
-| **探针侧 DMI/SBA 引擎**（新增 `src/riscv/`） | **1195.3 KB/s** | **1181.6 KB/s** |
-
-- **为什么差 9 倍**：主机驱动下每个 abstract command（最多 4 个字）就要一个 USB
-  往返（实测 **97 µs**），40 µs/字的读速正好等于这个往返；换成 `sba`/`abstract`
-  后端都更差。**只有把搬运搬进探针固件才能真正提速**。
-- **JTAG 汇编并没有"没被使用"**：`JTAG_Sequence()` 一直在调
-  `JTAG_Sequence_GPIO_ASM_45M`，且与上游 `akkako/akaLinkPro` **逐指令相同**
-  （只差引脚参数化）。真正的差距是 SWD 那套是 **6 周期/bit**（60 MHz），
-  JTAG 这份是 **19 周期/bit**（≈19 MHz）；本次另写了专用 DMI 扫描汇编
-  （一次访问一个函数，41 位请求在寄存器里移位），把探针侧从 954 → **1181/1195 KB/s**。
-- **两个接线坑**（README 顶部 J5 说明的延伸）：① 20 针排线第 15 脚是
-  HPM5301EVKLite **自己的 RESET_N**，所以 `reset_config` 必须用 `none`
-  （走 DM 的 ndmreset），否则 OpenOCD 一复位就把探针自己打掉；
-  ② `adapter speed` 对 JTAG **完全无效**（汇编把 delay 写死传 0）。
-- **狂发例程已在 `script_test/hpm6800evk_rtt_flood/`**，探针也验证过能把它烧进
-  NOR flash（内容逐字节一致），但**板子目前不从 flash 启动**（复位后 PC 停在
-  boot ROM `0x2001d4c8` 不动），RTT 交付率这一项还差最后一步 —— 待确认 BOOT
-  跳线（EVK UG：`BOOT1=0` 才是 NOR flash 启动）。详见文档 §5。
+一句话结论：主机驱动下每个 abstract command 要一个 USB 往返（97 µs），读速
+95.9 KB/s；把搬运下沉进探针固件后 **1189.5 KB/s（9 倍）**，RTT 交付
+**1105~1165 KB/s 且字节级零丢包**。
 
 ### SEGGER RTT 吞吐：从 919 KB/s 到 2.9 MB/s
 
@@ -343,10 +339,179 @@ sticky 错误再判死」修好；但它**长跑偶尔抖动**（约每 5~10 次
 脚本说明见 [`script_test/README.md`](script_test/README.md)；`sram/rtt` 脚本的工具路径
 可用 `OPENOCD_EXE`、`OPENOCD_SCRIPTS`、`HPM_SDK_ENV_DIR` 覆盖。
 
+## HPM6800EVK（HPM6880，RISC-V）目标调试
+
+第一块用本探针调的 **RISC-V** 目标，也是第一次走 **JTAG-only** 通路（HPM6880 没有
+SWD）。它的调试模块是标准的 **RISC-V Debug Module**（DMI + SBA），跟 ARM 的
+DAP/AHB-AP 完全不是一回事，所以固件里新增了一整套 `src/riscv/`。
+
+> 完整记录（三个 DTM 时序坑、失败实验的原始读数、逐步复现清单）在
+> **[`docs/hpm6800evk-jtag.md`](docs/hpm6800evk-jtag.md)**，本节只放结论。
+
+### 接线与前置条件
+
+| 信号 | 探针（HPM5301EVKLite J5） | HPM6800EVK |
+| --- | --- | --- |
+| TCK | PA06 / J5.9 | JTAG TCK |
+| TMS | PA07 / J5.7 | JTAG TMS |
+| TDI | PA05 / J5.5 | JTAG TDI |
+| TDO | PA04 / J5.13 | JTAG TDO |
+| GND | J5.4·6·8… | GND |
+
+三条必须知道的前提：
+
+1. **探针要先切到 SWD+JTAG 模式**：`python script_test\hpm6800_probe.py set-mode 1`
+   （HID `CMD_SET_CONFIG` 的 `output_mode`；0 = SWD+VCOM 会**拒绝 JTAG**）。
+   这个设置**只存在 RAM 里，探针一复位/重插就丢**，每次上电都要重设。
+2. **排线第 15 脚是探针自己的 `RESET_N`**：`openocd_hpm6800evk_dap.cfg` 里必须
+   `reset_config none`，让复位走 DM 的 `ndmreset`。否则 OpenOCD 一复位**把探针自己
+   打掉**（实测掉过两次，靠给上游 USB Hub 断电才救回来）。
+3. **`adapter speed` 对 JTAG 扫描完全无效** —— JTAG 汇编把 delay 写死传 0，
+   改它没有任何效果（真正的旋钮见下面的 TCK 一节）。
+
+### 烧录：**必须烧 ELF，SDK 生成的 `.bin` 里没有启动头**
+
+这是最容易白掉半天的一条。SDK 输出的 `.bin` 里 **`.boot_header` 整段是全 0**，
+ROM 认不出来，复位后 PC 停在 boot ROM `0x2001d4c8` 一动不动 —— 看起来像"BOOT 跳线
+配错了"，其实跳线 `BOOT0=0 / BOOT1=0` 本来就是对的（NOR 启动）：
+
+| 文件 | `0x80001000`（启动头） |
+| --- | --- |
+| `demo.elf` 的 `.boot_header` | `bf109000…`（tag `0x009010BF`，正常） |
+| 它导出的 `demo.bin` | **全 0** ← 烧这个就不启动 |
+
+```bat
+python script_test\hpm6800_flash_target.py     :: 默认就是狂发固件 ELF，并打印复位后 PC 自检
+```
+
+烧完的自检三件套：`mdw 0x80001000` = `009010bf`、复位后 `pc` = `0x80003000`、
+`mdw 0x1240000` 读到 `"SEGGER RTT"`。
+
+### 速度：主机驱动 vs 探针侧引擎（**9 倍差距**）
+
+| 路径 | 写 | 读 |
+| --- | --- | --- |
+| OpenOCD `progbuf` 后端（三个后端里最好） | 154.0 KB/s | 95.9 KB/s |
+| OpenOCD `sba` 后端 | 87.0 | 85.3 |
+| OpenOCD `abstract` 后端 | 14.5 | 14.4 |
+| **探针侧 DMI/SBA 引擎**（新增 `src/riscv/`） | **1195.3 KB/s** | **1189.5 KB/s** |
+
+差 9 倍的原因是**往返**：主机驱动下每个 abstract command（最多 4 个字）就要一次
+USB 往返（实测 **97 µs**），而 40 µs/字的读速正好等于这个往返 —— 测出来就是
+"一个往返换一个字"；`sba`/`abstract` 后端更差。**只有把搬运下沉进探针固件才有速度。**
+
+探针侧的做法：加载一次 `IR = 0x11`（DMI）之后，**一次 DMI 访问 = 一次 41 位 DR 扫描**
+（`{op[1:0], data[31:0], addr[6:0]}`），而且响应**滞后一拍**，所以连续的 posted 请求可以
+一个字一次扫描地流水，没有任何往返。块搬运走 Debug Module 的 **SBA**（系统总线访问，
+硬件自增地址）。
+
+> 关于"上游是不是有个没用上的优化汇编"：**没有**。`JTAG_Sequence()` 一直在调
+> `JTAG_Sequence_GPIO_ASM_45M`，且与上游 `akkako/akaLinkPro` **逐指令相同**（只差
+> 引脚参数化）。真正的差距是 SWD 那套是 **6 周期/bit**，JTAG 这份是 **19 周期/bit**。
+> 本次另写了专用 DMI 扫描汇编 `JTAG_DP_GPIO_ASM_DMI.S`（一次访问收进一个函数、
+> 41 位请求在寄存器里移位），把探针侧从 954 → **1189/1195 KB/s**。
+
+### RTT 交付率：**1105 ~ 1165 KB/s，字节级零丢包**
+
+狂发固件在 `script_test/hpm6800evk_rtt_flood/`（`flash_xip`，RTT 上行 32 KB，
+`BLOCK_IF_FIFO_FULL`，死循环发 `hello world!\n`），控制块 `_SEGGER_RTT` 在
+**0x01240000**（AXI SRAM，探针可直接读写）。
+
+```bat
+python script_test\hpm6800_rtt_delivery.py COM5 5     :: 交付率
+python script_test\hpm6800_rtt_loss.py COM5 10        :: 字节流丢包校验
+```
+
+```
+host read 5963776 bytes in 5.00s -> 1164.7 KB/s
+bridge: drained=6017024 bytes, polls=2939, moves=2938, rderr=0, wderr=0
+
+host received   11341824 bytes in 10.000s -> 1107.6 KB/s
+stream check OK: 872447 complete records + 4 trailing bytes, pattern exact
+```
+
+狂发固件写的是**固定 13 字节记录**，丢一个字节模式必然错位 —— 所以
+"872447 条完整记录、模式精确复现"比计数器更能说明问题：**11.3 MB 不丢不重**。
+速率贴着探针侧 SBA 的 1.19 MB/s 天花板，CDC/USB 那一跳不是瓶颈。
+
+> 这里踩过一个**跨后端适配层**的坑，很有代表性：`rtt_write_word()` 的两个后端
+> 成功/失败方向相反（`swd_write_word()` 1 = 成功，`riscv_jtag_write_word()` 0 = 成功），
+> RISC-V 分支忘了取反 ⇒ **回写 RdOff 成功被判成失败**，桥搬完第一块 2048 B 就永久
+> 卡在"幂等补写"分支里打转，连控制块都不再读。它不报错、不崩，只表现为"速率是 0"。
+> 定位过程（靠 `s_write_err` 在涨、`s_rd_pend_v` 却是 0 这对矛盾读数）见文档 §5.3。
+
+### TCK 频率：现在 16.4 MHz，规格上限 25 MHz
+
+```
+一次 DMI 访问 = idle(8) + 导航(5) + 移位(41) = 54 TCK
+1189.5 KB/s = 304,512 字/秒  →  TCK = 16.4 MHz
+```
+
+**HPM6800EVK 侧 JTAG TCK 规格上限是 25 MHz**，所以 16.4 MHz 合规，还有 1.5 倍空间
+没吃满 —— 现在卡的是**探针 CPU 的每 bit 周期数**，不是目标、也不是协议。按 54 TCK/字
+算，25 MHz 下的理论上限是 **1.85 MB/s**，当前的 1.19 MB/s 是它的 64%。
+
+三个时序旋钮**都已经在最小值上**（每一点都用自检判死活：`hpm6800_selfcheck.py` 会
+写已知图案再读回比对校验和）：
+
+| 旋钮 | 默认 | 实测 |
+| --- | --- | --- |
+| `DMI_NAV_LOW/HIGH_NOP`（编译期） | 8 / 8 | **4/4 直接 FAIL**，读回全 0（TMS/TDI 建立时间不够） |
+| `idle`（运行时 `hpm6800_riscv.py delay <n>`） | 8 | **6 只跑得动 6/50 轮就死**；≤4 立刻不应答 |
+| `DMI_CAP_HIGH_NOP`（编译期，TDO 采样点） | 8 | ≤6 自检 FAIL |
+
+试过一次提速改造：把"整理上一拍 TDO"的 4 条指令从低相位搬进高相位死等，速率
+**1190 → 1386 KB/s（+16%）**，但自检**恒定失败**，且 cap=4 与 cap=6 拿到**逐字节
+相同的错误校验和** ⇒ 确定性的逻辑错而非余量不足：重排后 TCK 拉低到拉高之间只剩
+一条指令（约 5 ns），**TDI 建立时间不够**，目标每一位采到的都是上一位。已回退。
+
+⇒ **结论：低相位（TDI/TMS 建立）和高相位（TDO 往返）各需 ~8 拍，这个结构下 TCK
+周期下限就是 18 拍。** 剩下的唯一一条路：在上一位的高相位里用 `DO_SET`/`DO_CLR`
+预置下一位的 TDI，让低相位退化成"只拉低 TCK"，两相位各 ~8 拍（约 44 ns）
+≈ **22.7 MHz**，逼近 25 MHz 上限，**理论收益 ~+39%**。
+
+### 复现清单
+
+```bat
+:: 1) 探针：编译 + DFU 升级 + 切 JTAG 模式
+cd firmware\application_5301
+python ..\..\script_test\hpm6800_flash_probe.py
+python ..\..\script_test\hpm6800_probe.py set-mode 1
+
+:: 2) 目标：烧狂发固件（**必须 ELF**）
+python script_test\hpm6800_flash_target.py
+
+:: 3) 引擎自检与基准
+python script_test\hpm6800_riscv.py open
+python script_test\hpm6800_selfcheck.py                         :: PASS 才算数
+python script_test\hpm6800_riscv.py rbench 0x1200000 1024 50
+python script_test\hpm6800_riscv.py wbench 0x1200000 1024 50    :: 见下面 ⚠
+python script_test\sram_speed_hpm6800.py --size 65536 --regions axi   :: 主机侧口径
+
+:: 4) RTT 交付率
+python script_test\hpm6800_rtt_delivery.py COM5 5
+python script_test\hpm6800_rtt_loss.py COM5 10
+python script_test\hpm6800_rtt_diag.py COM5 3                   :: 出问题时读探针 RAM 定位
+python script_test\hpm6800_cdc_check.py COM5                    :: 拆 CDC 那一跳
+
+:: 5) 时序扫描（每点一次构建 + 烧写 + 自检，约 2 分钟）
+powershell -File script_test\hpm6800_timing_sweep.ps1
+```
+
+> ⚠️ **写基准的地址就是目标自己的 RAM**：`0x1200000` 是狂发固件 `.bss` 的起点，
+> `wbench` 会把目标正在用的变量整片覆盖，目标随后就不产数据了（现象是 RTT 桥
+> poll 几万次全是空环、交付塌到 3 KB/s，而**读回校验和仍然是对的**，只有速率会
+> 暴露它）。做完写基准确认要么换空闲 scratch 地址，要么重烧一次目标。
+
+HID 侧接口：`CMD_RISCV`（0x32，动作见
+[`Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md)）；
+RTT 桥切目标类型用 `CMD_RTT`（0x31）的 action 10。
+
 ## 文档
 
 | 文档 | 内容 |
 | --- | --- |
+| [`docs/hpm6800evk-jtag.md`](docs/hpm6800evk-jtag.md) | **HPM6800EVK（HPM6880，RISC-V）用本探针调 JTAG 的完整记录**：接线坑、启动头真相、DMI/SBA 引擎与专用汇编、三个 DTM 时序坑、RTT 交付率与跨后端极性 bug、TCK 频率上限 |
 | [`docs/HPM5301EVKLite_port.md`](docs/HPM5301EVKLite_port.md) | EVKLite 移植说明：引脚映射、构建、烧录、自调试、验证清单 |
 | [`docs/HANDOVER-evklite-20260927.md`](docs/HANDOVER-evklite-20260927.md) | 移植过程交接记录（含 CDC 回环故障的根因与修复） |
 | [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议 |

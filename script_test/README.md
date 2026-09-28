@@ -70,6 +70,40 @@ EVKLite 上 CDC 是复合设备的 `MI_01`，可用
 | `rtt_peek.py` | 读探针自身内存（HID `CMD_RTT` action 5），bring-up 期查 `DAP_Data`/trace 用 |
 | `rtt_rawdap.py` | 经探针主循环透传原始 CMSIS-DAP 请求（action 4/6），bring-up 期用 |
 
+### HPM6800EVK（HPM6880，RISC-V / JTAG-only）专用
+
+第一次调 RISC-V 目标，脚本统一带 `hpm6800_` 前缀。完整背景、接线与结论见
+[`../docs/hpm6800evk-jtag.md`](../docs/hpm6800evk-jtag.md) 与 README 的
+「HPM6800EVK（HPM6880，RISC-V）目标调试」一章。
+
+| 文件 | 用途 |
+| --- | --- |
+| `hpm6800_probe.py` | 探针控制：`set-mode 1` 切 SWD+JTAG（**只存 RAM，每次上电都要重设**）、读状态/电压 |
+| `hpm6800_flash_probe.py` | 探针固件 DFU 升级（编译 → 等虚拟盘 → 写入 → 等 APP 回来） |
+| `hpm6800_flash_target.py` | **用探针烧 HPM6800EVK**：默认就是狂发固件 ELF，并打印启动头 + 复位后 PC 自检 |
+| `hpm6800_selfcheck.py` | **完整性门禁**：探针写已知图案再读回比对校验和；**动任何时序都必须先跑它** |
+| `hpm6800_riscv.py` | 探针侧 RISC-V 引擎：`open` / `status` / `rbench` / `wbench` / `sbench` / `rcheck` / `delay` |
+| `hpm6800_rtt_delivery.py` | **RTT 交付率主尺子**：先开串口并起读线程、再启动桥，主机只读串口不计往返 |
+| `hpm6800_rtt_loss.py` | **字节级丢包校验**：狂发固件写固定 13 字节记录，模式错位即丢包（比计数硬） |
+| `hpm6800_rtt_diag.py` | 出事时用 HID PEEK 读**探针自身 RAM** 定位：`g_uartrx` in/out、rtt_bridge 计数器、`s_dbg` 原始 41 位 DMI 响应 |
+| `hpm6800_cdc_check.py` | 拆 CDC 那一跳：先做串口回环，再每 200 ms 采样「环 in/out vs 主机收到的字节数」 |
+| `hpm6800_jtag_raw.py` | 不经探针固件、主机直接 bit-bang JTAG 的原始扫描（bring-up 期验 TAP/IR/DR） |
+| `hpm6800_jtag_bench.tcl` | OpenOCD 侧三个后端（`progbuf` / `sba` / `abstract`）的对照基准 |
+| `hpm6800_timing_sweep.ps1` | DMI 时序旋钮扫描（`DMI_CAP_HIGH_NOP` / `DMI_NAV_*_NOP` × 自检 × 读写基准），每点约 2 分钟 |
+| `hpm6800evk_rtt_flood/` | 目标侧狂发固件（`flash_xip`，RTT 上行 32 KB，`BLOCK_IF_FIFO_FULL`，死循环发 `hello world!\n`） |
+| `sram_speed_hpm6800.py` | HPM6800 的 SRAM **主机侧**口径（OpenOCD load/dump，与探针侧引擎对照） |
+| `probe_usb_recover.ps1` | 探针从 USB 上消失时，给它上游的 USB Hub 断电重枚举（实测救回两次） |
+| `openocd_hpm6800evk_dap.cfg` | OpenOCD 配置：`transport select jtag` + **`reset_config none`**（排线第 15 脚是探针自己的 RESET_N，必须） |
+
+> ⚠️ **`hpm6800_riscv.py wbench 0x1200000` 会覆盖目标正在用的 RAM** —— `0x1200000`
+> 就是狂发固件 `.bss` 的起点，目标随后不再产数据（RTT 交付塌到 3 KB/s，但**读回
+> 校验和仍然是对的**，只有速率会暴露）。做完写基准确认要重烧一次目标，或换空闲
+> scratch 地址。
+>
+> ⚠️ `hpm6800_rtt_diag.py` 里的符号地址是从**当前构建**的
+> `build_dfu_evklite/output/akaLinkPro_App.asm` 的 `# <sym>` 注释里取的；改固件后
+> 要重新取（`s_drained` 之类是 `static`，`.map` 里不一定有）。
+
 ### RTT 测速为什么慢（实测结论，2026-09-27）
 
 `make rtt-test` 早期只有 ~0.4 MB/s，比 SRAM 读写的 2.5 MB/s 差 6 倍。逐项量下来是
