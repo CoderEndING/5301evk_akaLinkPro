@@ -40,7 +40,8 @@ EVKLite 上 CDC 是复合设备的 `MI_01`，可用
 > `stm32f103_rtt_speed/` 是 RTT 测速用的 STM32F103 测试固件（SEGGER RTT + 计数
 > 全局变量），`rtt_*.py` 需要它编译出的 `fw.bin`：先跑
 > `powershell -File stm32f103_rtt_speed\build.ps1 -Board cb|ze`（需要 arm-none-eabi
-> 工具链），或自带一份已编译的 `fw.bin`（`build-*/` 不入库）。
+> 工具链）；**可直接烧录的 `fw.bin` / `fw.hex` 已入库**（每块板一套，共 ~8KB），
+> `fw.elf` / `fw.map` 不入库。
 > **每块板子一个独立输出目录，互不覆盖**：`build-cb/`（128KB flash / 20KB RAM）、
 > `build-c8/`（64KB flash / 20KB RAM）、`build-ze/`（512KB flash / 64KB RAM，
 > RTT 上行缓冲 32KB）；烧录用 `flash.ps1 -Board <名字>`。
