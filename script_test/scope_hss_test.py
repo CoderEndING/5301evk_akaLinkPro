@@ -171,7 +171,16 @@ def do_bench(dev, iters=2000):
     ticks = int.from_bytes(bytes(r[3:7]), "little")
     it = int.from_bytes(bytes(r[7:11]), "little")
     err = int.from_bytes(bytes(r[11:15]), "little", signed=True)
-    return it, ticks, err
+    # 字 3/4：**实际装载**的 SWD blob 偏移（见 Custom HID Protocol.md 第 16 条）。
+    # 没这个数就分不出"时钟命令被忽略"和"生效了但没差别" —— 这个坑踩过：
+    # 1 MHz 与 60 MHz 的读数一模一样，状态字却报着新频率。
+    blob = int.from_bytes(bytes(r[15:19]), "little")
+    return it, ticks, err, blob
+
+
+# swd_ops 里的读函数偏移 → 档位（swd_blob_evklite.h 的 SWD_READ_OFFSET_*）
+BLOB_TIER = {0x53C: '60M(6 指令/bit)', 0x60C: '45M(8)', 0x6E0: '36M(10)',
+             0x7C4: '30M(12)', 0xA54: '20M(18)', 0x620: 'SLOW', 0xFFFFFFFF: '还没装载'}
 
 
 def find_ep83():
@@ -274,13 +283,14 @@ def main():
         r = do_bench(dev, a.iters)
         if not r:
             print("标定无响应"); return 1
-        it, ticks, err = r
+        it, ticks, err, blob = r
         if err != 0 or it == 0:
-            print("标定失败 err=%d iters=%d（-3 变量表空 / -4 读失败 / 其它=初始化码）" % (err, it))
+            print("标定失败 err=%d iters=%d blob=0x%05X（-3 变量表空 / -4 读失败 / 其它=初始化码）"
+                  % (err, it, blob))
             return 1
         us = (ticks / 24.0) / it
-        print("**M0 标定**: %d 次 × %.3f us/样本 = %.2f ms  → 上限 ≈ %.1f kHz"
-              % (it, us, ticks / 24.0 / 1000.0, 1000.0 / us))
+        print("**M0 标定**: %d 次 × %.3f us/样本 = %.2f ms  → 上限 ≈ %.1f kHz   [blob=0x%05X %s]"
+              % (it, us, ticks / 24.0 / 1000.0, 1000.0 / us, blob, BLOB_TIER.get(blob, '?')))
         return 0
 
     # ---- run：启动推流 + 读 0x83 ----

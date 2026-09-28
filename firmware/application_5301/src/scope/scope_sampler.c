@@ -524,7 +524,12 @@ static int scope_sample_once(void)
 /* 把链路准备好（含批量路径需要的那一次 CSW 落地）。0 = ok，其它 = rtt_swd_init 的码。 */
 static int scope_link_ready(void)
 {
-    if (s_swd_ready) { return 0; }
+    /* 🚨 必须问桥那一侧的链路状态，不能只看自己这份 s_swd_ready：主机碰过 DAP
+     * （rtt_bridge_note_dap_activity）、桥 stop 过、或换过 SWD 档位，都会把桥那份
+     * 清掉，而这份还是 1 —— 于是既不重新初始化、也拿不到新装的时钟 blob，
+     * 表现就是"改了频率没反应"甚至"换挡后第一次访问 -4"。 */
+    if (s_swd_ready && rtt_bridge_swd_is_ready()) { return 0; }
+    s_swd_ready = 0U;
 
     int rc = rtt_bridge_swd_ensure_ready();      /* 复用桥的 SWD 初始化（含斜坡换挡） */
     if (rc != 0) { return rc; }
@@ -534,7 +539,7 @@ static int scope_link_ready(void)
 
     /* 先做一次真实读：既是"链路真的读得动"的验收，也把目标 AP 的 CSW 落到硬件上
      * （32 位自增）—— 逐字路径自己会写 CSW，但如果以后重新启用批量路径，那次写是不做的。 */
-    if (rtt_bridge_read(s_span[0].start, s_stage, 4U) != 0) { return -4; }
+    if (rtt_bridge_read(s_span[0].start, s_stage, 4U) != 0) { s_swd_ready = 0U; return -4; }
 
     s_swd_ready = 1U;
     return 0;
@@ -674,9 +679,17 @@ void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, c
     scope_make_plan();
 
     /* clock_delay 覆盖：SWD 空闲拍那一截（每条 AP 读约 52 个时钟里有 6 拍是它）。
-     * 只在明确要求时改；否则把档位原生值装回去（档位换挡会重设它）。 */
-    if (flags & SCOPE_FLAG_DELAY0) { DAP_Data.clock_delay = 0U; }
-    else { rtt_bridge_set_swd_clock(s_clock_hz ? s_clock_hz : rtt_bridge_swd_clock_hz()); }
+     * 只在明确要求时改；否则走"请求档位"那条路（见 rtt_bridge_request_swd_clock）——
+     * 它保证下次用链路时会重新初始化并按新档装载 blob。 */
+    if (flags & SCOPE_FLAG_DELAY0)
+    {
+        DAP_Data.clock_delay = 0U;
+    }
+    else
+    {
+        rtt_bridge_request_swd_clock(s_clock_hz ? s_clock_hz : rtt_bridge_swd_clock_hz());
+        s_swd_ready = 0U;
+    }
 
     if (s_running)
     {
@@ -696,7 +709,10 @@ void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, c
 void scope_sampler_set_clock(uint32_t hz)
 {
     if (hz == 0U) { return; }
-    rtt_bridge_set_swd_clock(hz);
+    /* 走"请求 + 下次重新初始化"，不要直接在旧档上调 set_swd_clock()：
+     * 链路没起来时那只是把值记下来，硬件里还是旧 blob，而状态字会报新频率。 */
+    rtt_bridge_request_swd_clock(hz);
+    s_swd_ready = 0U;
     s_clock_hz = rtt_bridge_swd_clock_hz();
     s_last_cmd = 3U;
 }

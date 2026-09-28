@@ -620,6 +620,22 @@ int rtt_bridge_swd_ensure_ready(void)
     return rtt_swd_init();       /* 成功时它自己会把 s_swd_ready 置 1 */
 }
 
+int rtt_bridge_swd_is_ready(void)
+{
+    return (s_swd_ready != 0U) ? 1 : 0;
+}
+
+void rtt_bridge_request_swd_clock(uint32_t hz)
+{
+    if (hz == 0U) { return; }
+    s_swd_clock_req = hz;
+    s_swd_clock_hz = hz;
+    /* 关键：把链路标成"下次要重新初始化"，让 rtt_swd_init() 去走 20 MHz 斜坡
+     * 并按 s_swd_clock_hz 装载 blob。直接在旧档上调 rtt_swd_set_clock() 会在
+     * 链路没起来时静默变成"只记录不装载"。 */
+    s_swd_ready = 0U;
+}
+
 int rtt_bridge_read(uint32_t addr, uint8_t *dst, uint32_t len)
 {
     return rtt_read_bytes(addr, dst, len);

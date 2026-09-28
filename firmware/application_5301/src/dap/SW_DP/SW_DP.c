@@ -1404,6 +1404,22 @@ swd_sequence_ptr seq_func = NULL;
 swd_write_ptr write_func = NULL;
 swd_read_ptr read_func = NULL;
 
+/* 诊断用（见 SW_DP.h）：把"实际装载了哪个 blob"变成可以远程读到的数 —— 
+ * 光看请求频率分辨不出"命令被忽略"和"命令生效但没差别"。 */
+uint32_t swd_blob_read_offset(void)
+{
+    if ((read_func == NULL) || ((uint32_t)(uintptr_t)read_func < (uint32_t)(uintptr_t)swd_ops))
+    {
+        return 0xFFFFFFFFU;
+    }
+    return (uint32_t)((uint32_t)(uintptr_t)read_func - (uint32_t)(uintptr_t)swd_ops);
+}
+
+uint32_t swd_blob_clock_delay(void)
+{
+    return DAP_Data.clock_delay;
+}
+
 void SWD_DynamicLoad_Slow(void)
 {
     memcpy(swd_ops, swd_func_slow, sizeof(swd_func_slow));

@@ -100,6 +100,11 @@ uint32_t rtt_bridge_status(uint32_t *out, uint32_t words);
 /* 确保链路可用（0 = ok；语义与 rtt_swd_init 一致：-1 SWJ_Clock、-2 SWD init、-4 该档不可用） */
 int      rtt_bridge_swd_ensure_ready(void);
 
+/* 桥这一侧的链路现在是不是就绪的。**采样器不能只看自己那份 s_swd_ready** ——
+ * 主机碰过 DAP（rtt_bridge_note_dap_activity）、桥 stop、链路恢复失败，都会把桥
+ * 这一侧清掉，而采样器那份还是 1，于是它既不重新初始化、也拿不到新装的时钟档。 */
+int      rtt_bridge_swd_is_ready(void);
+
 /* 块读目标内存（0 = 成功）。内部按 s_chunk 切块，带失败重试。 */
 int      rtt_bridge_read(uint32_t addr, uint8_t *dst, uint32_t len);
 
@@ -109,5 +114,15 @@ uint32_t rtt_bridge_last_dap_ticks(void);
 /* 运行时改 SWD 时钟档（运行中也能改；换挡走桥那套斜坡路径） */
 void     rtt_bridge_set_swd_clock(uint32_t hz);
 uint32_t rtt_bridge_swd_clock_hz(void);
+
+/* 采样器专用换挡：请求档位 **并把链路标成"下次要重新初始化"**。
+ *
+ * 与 rtt_bridge_set_swd_clock 的区别很关键：那个只在链路已经就绪时才真的装载
+ * blob，链路没就绪就只把值记下来（等将来的初始化去装）。采样器那边有一份独立的
+ * s_swd_ready，两边一旦不同步就会踩到"报的是新频率、跑的还是旧 blob"——
+ * 实测 SWJ_Clock 请求 1 MHz 与 60 MHz 的 M4 标定读数一模一样，而且从慢档直接
+ * 跳回快档时第一次访问就 -4，因为少了 rtt_swd_init() 里那段 20 MHz 斜坡。
+ * 所以换挡一律走"下次重新初始化"，斜坡也就跟着走了。 */
+void     rtt_bridge_request_swd_clock(uint32_t hz);
 
 #endif /* __RTT_BRIDGE_H__ */

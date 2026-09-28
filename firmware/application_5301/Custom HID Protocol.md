@@ -336,6 +336,16 @@ Byte[0x03-0x3F] = Command data（可选）
     Byte[0x08..0B] = iters、Byte[0x0C..0F] = err**（网页读 `res[3]` / `res[7]`）。
     每样本真实耗时 = ticks / 24 / iters（µs）。
 
+    标定响应里字 3/4 平时用不到，顺手拿来回报**实际装载了哪个 SWD blob** ——
+    `Byte[0x10..13] = Read_GPIO_ASM 在 swd_ops 里的偏移`、`Byte[0x14..17] = clock_delay`。
+    没有这个数就分不出"时钟命令被忽略"和"生效了但没差别"。踩过的坑：`SWJ_Clock` 在
+    桥那一侧链路没就绪时只把值记下来、不装载 blob，而采样器有自己一份链路状态，
+    于是 1 MHz 与 60 MHz 的标定读数一模一样、状态字 w1 却报着新频率；从慢档跳回快档
+    时还会因为少了那段 20 MHz 斜坡而在第一次访问就 -4。现在采样器改走
+    `rtt_bridge_request_swd_clock()`（换挡一律"下次重新初始化"）。偏移对照表：
+    `0x53C=60M(6 指令/bit) 0x60C=45M(8) 0x6E0=36M(10) 0x7C4=30M(12) 0xA54=20M(18)
+     0x620=SLOW  0xFFFFFFFF=还没装载过`。
+
     状态字：w0 = running | spans<<8 | swdReady<<16 | nvars<<24；w1 = 实际 SWD Hz；
     w2 = 采到的样本数；w3 = 丢样本数（跳拍 + 无缓冲）；w4 = 已推字节低 16 / 无缓冲丢样本高 16；
     w5 = SWD 读错低 16 / 让路次数高 16；w6 = 最近一包 seq；w7 = 跳拍低 16 / 丢弃模式包数高 16；
