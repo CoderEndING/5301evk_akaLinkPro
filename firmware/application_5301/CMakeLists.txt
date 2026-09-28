@@ -94,6 +94,7 @@ sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/dap)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/api)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/led)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/rtt)
+sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/riscv)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/swd_host)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/drv)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/easyflash/inc)
@@ -110,6 +111,8 @@ sdk_app_src(src/usb/msc_interface.c)
 sdk_app_src(src/api/api_param.c)
 sdk_app_src(src/led/led_state.c)
 sdk_app_src(src/rtt/rtt_bridge.c)
+sdk_app_src(src/riscv/riscv_jtag.c)
+sdk_app_src(src/riscv/riscv_svc.c)
 sdk_app_src(src/swd_host/swd_host.c)
 sdk_app_src(src/swd_host/swd_host_port.c)
 sdk_app_src(src/drv/drv_flash.c)
@@ -132,6 +135,24 @@ sdk_app_src(src/dap/SW_DP/SW_DP_GPIO_ASM_SLOW.S)
 sdk_app_src(src/dap/JTAG_DP/JTAG_DP.c)
 sdk_app_src(src/dap/JTAG_DP/JTAG_DP_GPIO_Slow.c)
 sdk_app_src(src/dap/JTAG_DP/JTAG_DP_GPIO_ASM_45M.S)
+sdk_app_src(src/dap/JTAG_DP/JTAG_DP_GPIO_ASM_DMI.S)
+
+# TDO sample point of the fast DMI scan (nop count in the TCK-high phase).
+# It has to cover the level-shifter round trip plus the target's TCK->TDO
+# delay; too small and every response comes back one bit late. Tune with
+#   cmake -DDMI_CAP_HIGH_NOP=<n> ...
+set(DMI_CAP_HIGH_NOP "8"  CACHE STRING "JTAG DMI scan high-phase nop count")
+set(DMI_NAV_LOW_NOP  "8"  CACHE STRING "JTAG DMI nav/idle low-phase nop count")
+set(DMI_NAV_HIGH_NOP "8"  CACHE STRING "JTAG DMI nav/idle high-phase nop count")
+# Allow sweeping without editing this file:  set DMI_CAP_HIGH_NOP=40 && build...
+foreach(_knob DMI_CAP_HIGH_NOP DMI_NAV_LOW_NOP DMI_NAV_HIGH_NOP)
+    if(DEFINED ENV{${_knob}})
+        set(${_knob} "$ENV{${_knob}}" CACHE STRING "overridden from the environment" FORCE)
+    endif()
+endforeach()
+sdk_compile_definitions(-DDMI_CAP_HIGH_NOP=${DMI_CAP_HIGH_NOP})
+sdk_compile_definitions(-DDMI_NAV_LOW_NOP=${DMI_NAV_LOW_NOP})
+sdk_compile_definitions(-DDMI_NAV_HIGH_NOP=${DMI_NAV_HIGH_NOP})
 
 # generate_ide_projects()
 

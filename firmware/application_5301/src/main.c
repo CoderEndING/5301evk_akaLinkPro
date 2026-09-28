@@ -16,6 +16,7 @@
 #include "hpm_dfu_trigger.h"
 #include "api_param.h"
 #include "usb_composite.h"
+#include "riscv_svc.h"
 #include "led_state.h"
 
 #if BOARD_HAS_USER_KEY_DFU
@@ -83,6 +84,8 @@ int main(void)
         /* Probe-side RTT bridge: polls the target itself (only while the DAP
          * is idle) and forwards the bytes over the CDC. */
         rtt_bridge_poll();
+        /* Probe-side RISC-V engine (JTAG): queued memory access / benchmarks. */
+        riscv_svc_poll();
     }
     return 0;
 }

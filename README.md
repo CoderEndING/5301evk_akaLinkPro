@@ -242,6 +242,34 @@ USB 批量端点）—— 比链路天花板低一档，但**不是因为"每趟
 > 而 F1 的 `reset halt` 是核心级复位、不清 RCC，所以数字会随目标上电后的状态
 > 变化一倍（`sram_speed_test.py` 会打印实测时钟，`--no-boost` 可关闭它的补偿；
 > 它现在还会识别"固件已跑在 PLL 上"从而不去动 RCC）。
+>
+
+### 2026-09-28 追加：RISC-V 走 JTAG —— 主机侧是**往返受限**，探针侧才有速度
+
+第一次用本探针调 **RISC-V**（HPM6800EVK / HPM6880，只有 JTAG、没有 SWD）。
+完整记录见 **`docs/hpm6800evk-jtag.md`**，结论摘要：
+
+| 路径 | 写 | 读 |
+| --- | --- | --- |
+| OpenOCD 主机驱动（`progbuf`，三个后端里最好的） | 154.0 KB/s | **95.9 KB/s** |
+| **探针侧 DMI/SBA 引擎**（新增 `src/riscv/`） | **1195.3 KB/s** | **1181.6 KB/s** |
+
+- **为什么差 9 倍**：主机驱动下每个 abstract command（最多 4 个字）就要一个 USB
+  往返（实测 **97 µs**），40 µs/字的读速正好等于这个往返；换成 `sba`/`abstract`
+  后端都更差。**只有把搬运搬进探针固件才能真正提速**。
+- **JTAG 汇编并没有"没被使用"**：`JTAG_Sequence()` 一直在调
+  `JTAG_Sequence_GPIO_ASM_45M`，且与上游 `akkako/akaLinkPro` **逐指令相同**
+  （只差引脚参数化）。真正的差距是 SWD 那套是 **6 周期/bit**（60 MHz），
+  JTAG 这份是 **19 周期/bit**（≈19 MHz）；本次另写了专用 DMI 扫描汇编
+  （一次访问一个函数，41 位请求在寄存器里移位），把探针侧从 954 → **1181/1195 KB/s**。
+- **两个接线坑**（README 顶部 J5 说明的延伸）：① 20 针排线第 15 脚是
+  HPM5301EVKLite **自己的 RESET_N**，所以 `reset_config` 必须用 `none`
+  （走 DM 的 ndmreset），否则 OpenOCD 一复位就把探针自己打掉；
+  ② `adapter speed` 对 JTAG **完全无效**（汇编把 delay 写死传 0）。
+- **狂发例程已在 `script_test/hpm6800evk_rtt_flood/`**，探针也验证过能把它烧进
+  NOR flash（内容逐字节一致），但**板子目前不从 flash 启动**（复位后 PC 停在
+  boot ROM `0x2001d4c8` 不动），RTT 交付率这一项还差最后一步 —— 待确认 BOOT
+  跳线（EVK UG：`BOOT1=0` 才是 NOR flash 启动）。详见文档 §5。
 
 ### SEGGER RTT 吞吐：从 919 KB/s 到 2.9 MB/s
 

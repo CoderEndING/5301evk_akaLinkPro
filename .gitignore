@@ -48,3 +48,10 @@ __pycache__/
 
 # H743 SRAM 基准临时目录
 script_test/_h743bench/
+# HPM6800EVK JTAG 临时/构建产物
+script_test/hpm6800evk_rtt_flood/build/
+script_test/_upstream/
+script_test/_*.txt
+script_test/_*.json
+script_test/_*.py
+script_test/_*.log

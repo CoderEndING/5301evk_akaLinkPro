@@ -4,6 +4,7 @@
 #include "api_param.h"
 #include "usb_composite.h"
 #include "rtt_bridge.h"
+#include "riscv_svc.h"
 #include "led_state.h"
 #include "hpm_dfu_trigger.h"
 #include "board.h"
@@ -56,6 +57,9 @@
 #define RTT_ACT_CONFIG 7U
 #define RTT_ACT_BENCH 8U
 #define RTT_ACT_BENCH_RESULT 9U
+
+/* Probe-side RISC-V (JTAG) memory engine (see src/riscv/). */
+#define CMD_RISCV (0x32)
 
 #define PARAM_MAGIC_NUMBER (0x0D000721UL)
 /* EasyFlash ENV key that stores the whole api_param_t blob. */
@@ -392,6 +396,48 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
         res_hid[1] = 0x01;
         res_hid[2] = CMD_SAVE_CONFIG;
         break;
+    case CMD_RISCV:
+    {
+        /* Probe-side RISC-V engine (JTAG only). The JTAG bit-bang must not run
+         * in the USB interrupt context, so everything is queued here and run by
+         * riscv_svc_poll() from the main loop; the reply carries the status
+         * block of the *previous* operation (like CMD_RTT does).
+         *   req_hid[3] = action, [4..7] = addr, [8..11] = arg1, [12..13] = arg2 */
+        uint32_t out[12] = {0};
+        uint32_t addr = (uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                        ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24);
+        uint32_t arg1 = (uint32_t)req_hid[8] | ((uint32_t)req_hid[9] << 8) |
+                        ((uint32_t)req_hid[10] << 16) | ((uint32_t)req_hid[11] << 24);
+        uint32_t arg2 = (uint32_t)req_hid[12] | ((uint32_t)req_hid[13] << 8);
+
+        /* STATUS and CONFIG are read/modify-only: queueing them would clobber
+         * an outstanding operation (the slot is a single word). */
+        if (req_hid[3] == RISCV_ACT_STATUS)
+        {
+            /* nothing to queue: just report */
+        }
+        else if (req_hid[3] == RISCV_ACT_CONFIG)
+        {
+            riscv_svc_set_delay(addr);
+        }
+        else
+        {
+            riscv_svc_request(req_hid[3], addr, arg1, arg2);
+        }
+        (void)riscv_svc_status(out, 12U);
+
+        res_hid[1] = 1U + 1U + 4U * 12U;
+        res_hid[2] = CMD_RISCV;
+        res_hid[3] = (uint8_t)req_hid[3];
+        for (uint32_t i = 0U; i < 12U; i++)
+        {
+            res_hid[4U + i * 4U + 0U] = (uint8_t)(out[i] >> 0);
+            res_hid[4U + i * 4U + 1U] = (uint8_t)(out[i] >> 8);
+            res_hid[4U + i * 4U + 2U] = (uint8_t)(out[i] >> 16);
+            res_hid[4U + i * 4U + 3U] = (uint8_t)(out[i] >> 24);
+        }
+        break;
+    }
     case CMD_RESET_DEVICE:
         ppor_reset_mask_set_source_enable(HPM_PPOR, ppor_reset_software);
         ppor_sw_reset(HPM_PPOR, 24);
