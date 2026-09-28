@@ -283,3 +283,25 @@ RX flush 定时器周期**按波特率动态调整**（目标每次约 512 字�
 - 模式切换：空闲回环 OK → JTAG 下 COM 无回显（正常）→ SWD 恢复 OK → Disconnect 恢复 OK。
 - 引脚状态：PB13 `FUNC_CTL=0` 且输出高（5V_EN 开）；空闲/SWD 下 PA08/PA09 `FUNC_CTL=2`(UART2)。
 - RX 采用 **DMAV2 infinite-loop 圆形缓冲**（无 disable/restart），消除了重启边界上的重复字节。
+
+### HPM6800EVK（RISC-V / JTAG）回归基线
+
+探针固件或 DMI 时序有任何改动，这几条都要重新对上（前两条是**门禁**，不过就别往下走）：
+
+| 项 | 基线值 | 复现命令 |
+| --- | --- | --- |
+| **探针写图案读回校验和** | `got 0x08ECD0B4 want 0x08ECD0B4` → **PASS** | `hpm6800_selfcheck.py` |
+| **字节流模式精确** | `pattern exact`，0 丢 0 重 | `hpm6800_rtt_loss.py COM5 10` |
+| 探针侧 SBA 块读 | **1189.5 KB/s**（1024 B × 50） | `hpm6800_riscv.py rbench 0x1200000 1024 50` |
+| 探针侧 SBA 块写 | **1194.8 KB/s** | `hpm6800_riscv.py wbench 0x1200000 1024 50` |
+| 单字 SBA 读 | 25.6 µs（= 4 次 DMI 扫描/字） | `hpm6800_riscv.py sbench 0x1200000 200` |
+| RTT 交付率 | **1105 ~ 1165 KB/s**，`rderr=0 wderr=0` | `hpm6800_rtt_delivery.py COM5 5` |
+| 主机驱动 OpenOCD（`progbuf`） | 写 154.0 / 读 95.9 KB/s | `hpm6800_jtag_bench.tcl` |
+| TAP 身份 | IDCODE `0x1000563D`、DTMCS `0x00007071`、DMSTATUS `0x00400CA2` | `hpm6800_riscv.py status` |
+| 目标启动自检 | `0x80001000`=`009010BF`、复位后 PC=`0x80003000`、`0x1240000`=`"SEGGER RTT"` | `hpm6800_flash_target.py` |
+| 有效 TCK 频率 | **16.4 MHz**（54 TCK/字 × 304,512 字/秒），规格上限 25 MHz | 由 rbench 反推 |
+
+固件侧时序常量（**这三个都已验证是最小值，别再减**）：
+`DMI_CAP_HIGH_NOP=8`、`DMI_NAV_LOW_NOP=8`、`DMI_NAV_HIGH_NOP=8`，运行时 `idle=8`。
+判定依据：nav 4/4 → 自检 FAIL（读回全 0）；idle 6 → 只跑得动 6/50 轮就死；cap ≤6 → 自检 FAIL。
+
