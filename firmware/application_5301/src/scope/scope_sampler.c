@@ -1,0 +1,675 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright (c) 2026 akaInstruments */
+
+/* 探针侧 HSS 采样器（J-Scope 波形页的数据源）。
+ *
+ * 骨架/仲裁/时钟换挡照 src/rtt/rtt_bridge.c：SWD 只在主循环里碰，绝不在 USB 中断里碰；
+ * SWD 初始化复用桥那条路径（4 MHz 起手 → 20 MHz 斜坡 → 目标档 + 清 sticky + 失败降档）。
+ *
+ * ── 热路径（与参考草稿的差别）──────────────────────────────────────────────
+ * 一次采样 = 按 span 块读。一次 span 块读的传输数是 **N+2**（TAR + prime + (N-1)×DRW
+ * + RDBUFF），这已经是 AHB-AP 的理论最小 —— swd_host.c 里 CSW 与 DP_SELECT 都带缓存
+ * （dap_state.csw / dap_state.select），所以第二次起写 CSW 是零传输，不是浪费。
+ * 于是能省的就只剩**搬运**和**调用**：
+ *
+ *   1. **零拷贝**：span 内变量若首尾相接（无间隙）且起始 4 字节对齐，span 的字节序与
+ *      帧内布局**逐字节相同**，直接把 SWD 读进包里该样本的槽位 —— 省掉参考草稿里
+ *      "先读进 stage、再逐变量 memcpy 到 frame、再 memcpy 到包" 的两趟拷贝。
+ *   2. **对齐读**：有间隙的 span 把起点向下、终点向上各对到 4 字节再读，避开
+ *      swd_read_memory() 内部对未对齐头尾的逐字节慢路径。
+ *   3. **不整包 memset**：只清 16 B 包头；载荷尾部那不到一帧的字节在推包时清一次
+ *      （≤63 B），而不是每包无脑清 512 B。
+ *
+ * ⚠️ 包结构、类型编码、状态字位域必须与网页 app/scope/protocol.js 一一对应。
+ */
+
+#include <string.h>
+
+#include "board.h"
+#include "hpm_common.h"
+#include "usb_composite.h"   /* usbd_ep_start_write / SWO_IN_EP / ATTR_PLACE_AT_NONCACHEABLE_BSS_* */
+#include "rtt_bridge.h"      /* 复用的 SWD 原语（patch-notes §1 的 5 个 adapter） */
+#include "scope_sampler.h"
+
+/* ------------------------------------------------------------------ 常量 */
+
+#define SCOPE_MCHTMR_HZ   24000000UL          /* MCHTMR = osc24m（与 rtt_bridge.c 一致） */
+#define SCOPE_HDR         16U
+#define SCOPE_PAYLOAD     (SCOPE_PACKET - SCOPE_HDR)   /* 496 */
+#define SCOPE_MAGIC       0x4A53U             /* 'J','S'（小端下发：53 4A） */
+#define SCOPE_VER         1U
+#define SCOPE_KIND_DEF    1U
+#define SCOPE_KIND_DATA   2U
+#define SCOPE_KIND_STAT   3U
+#define SCOPE_KIND_EVT    4U
+
+#define SCOPE_MIN_PERIOD_US    5U             /* 比 5 µs 更快没有意义（一次读都做不完） */
+#define SCOPE_MAX_PERIOD_US    1000000UL
+/* 合并阈值：与网页 planReads() 的成本模型同源。
+ * 间隙 g 字节要多读 g×0.284 µs；拆成两个 span 则多付一次 TAR+prime+RDBUFF ≈
+ * 3×1.155 µs @45 MHz → g 到 ~12 B 都还是并起来便宜。取 12（网页侧是 19，
+ * 我们这边略保守；DEF 包里会回报 span 数，不一致时主机会立刻发现）。 */
+#define SCOPE_MERGE_GAP        12U
+#define SCOPE_STAT_EVERY       64U            /* 每多少个包插一个 STAT */
+#define SCOPE_YIELD_TICKS      (SCOPE_MCHTMR_HZ / 50U) /* 20 ms 内有 DAP 活动就让路一拍 */
+#define SCOPE_BENCH_MAX_ITERS  100000UL
+
+/* ------------------------------------------------------------------ 状态 */
+
+static volatile uint8_t s_running;
+static volatile uint8_t s_start_req;
+static volatile int8_t  s_start_rc = -100;    /* -100 = 还没启动过（与 RTT 桥同一哨兵） */
+static uint8_t  s_swd_ready;
+
+static scope_var_t s_var[SCOPE_MAX_VARS];     /* 按地址升序 */
+static uint8_t  s_nvars;
+static uint16_t s_frame_bytes;
+static uint8_t  s_per_packet;                 /* floor(496 / frame_bytes) */
+static uint16_t s_frame_off[SCOPE_MAX_VARS];  /* 每个变量在帧内的偏移 */
+static uint32_t s_period_us = 100U;
+static uint8_t  s_flags;
+
+typedef struct
+{
+    uint32_t start;      /* 读起点（已向下对齐到 4 字节） */
+    uint16_t len;        /* 读长度（已向上对齐到 4 字节） */
+    uint16_t frame_off;  /* 本 span 第一个变量在帧内的偏移 */
+    uint8_t  first;      /* 变量表下标 */
+    uint8_t  count;
+    uint8_t  direct;     /* 1 = span 字节序与帧布局逐字节相同 → 直接读进包里（零拷贝） */
+} scope_span_t;
+
+static scope_span_t s_span[SCOPE_MAX_VARS];
+static uint8_t  s_nspans;
+
+/* 只有非零拷贝的 span 才用得到它；8 个 f64 = 64 B，再留 4 B 给对齐补头 */
+static uint8_t  s_stage[SCOPE_SPAN_MAX + 4U];
+
+/* 🚨 给 USB DMA 用的缓冲必须在**非 cacheable** 段，否则 CPU 写进 D-cache 而 DMA
+ *    直接读内存 → 主机收到旧数据。uart_rx_buf 也是这么放的。 */
+ATTR_PLACE_AT_NONCACHEABLE_BSS_WITH_ALIGNMENT(4)
+static uint8_t s_pkt[SCOPE_TX_BUFS][SCOPE_PACKET];
+static volatile uint8_t s_tx_busy[SCOPE_TX_BUFS];
+static uint8_t  s_inflight[SCOPE_TX_BUFS];    /* 在飞顺序（FIFO）：回调不带下标，只能按序还 */
+static uint8_t  s_if_head, s_if_count;
+static uint8_t  s_fill_buf;                   /* 正在填的缓冲；0xFF = 还没分配 */
+static uint16_t s_fill_n;                     /* 已经填了几个样本 */
+static uint32_t s_fill_t0;                    /* 本包第一个样本的 t_us */
+
+static uint32_t s_seq;
+static uint32_t s_t_us;                       /* 名义时间轴（µs）：每拍 +period，跳拍照样推进 */
+static uint32_t s_next_tick;                  /* 下一次该采样的 MCHTMR 时刻 */
+
+static uint32_t s_produced;                   /* 采到的样本数（含没推出去的） */
+static uint32_t s_dropped;                    /* 追不上而跳掉的拍数（= 丢的样本数） */
+static uint32_t s_usb_drop;                   /* 因为没空闲包缓冲而丢掉的样本数 */
+static uint32_t s_swd_err;                    /* 读失败次数（那一拍作废） */
+static uint32_t s_yield;                      /* 给 DAP 让路的次数 */
+static uint32_t s_pkts;                       /* 推出去的包数 */
+static uint32_t s_bytes;                      /* 推出去的字节数 */
+static uint32_t s_discard_pkts;
+static uint32_t s_last_cmd, s_last_rsp;
+static uint32_t s_clock_hz;
+static uint32_t s_last_sample_ticks;          /* 最近一次采样的实际耗时（标称 vs 实际） */
+static uint32_t s_tx_done;                    /* USB 完成回调次数（诊断包缓冲为何耗尽） */
+
+static uint32_t s_bench_req, s_bench_valid, s_bench_iters, s_bench_ticks;
+static int32_t  s_bench_err;
+static uint32_t s_hdr_t;                      /* 正在组的那一包的时间戳（DATA 用首样本时刻） */
+
+static void scope_push_stat(void);
+
+/* MCHTMR 低 32 位（24 MHz → 约 179 s 绕回一次；这里只算"到点没有"，差值运算天然安全） */
+static uint32_t mchtmr_now(void)
+{
+    return *(volatile uint32_t *)(HPM_MCHTMR_BASE + 0x00);
+}
+
+static uint32_t us_to_ticks(uint32_t us)
+{
+    return (uint32_t)(((uint64_t)us * SCOPE_MCHTMR_HZ) / 1000000ULL);
+}
+
+/* ------------------------------------------------------------------ 计划 */
+
+static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* 这个 span 能不能**零拷贝**直读进帧里？条件是"span 的字节序与帧内布局逐字节相同"，
+ * 必须**逐个变量验**，不能只看起始地址对齐 —— 结构体里的填充字节会让两者错位：
+ *   g_pack: i_saw(u8)@0x11 → u_hi(u32)@0x14（中间 2 B 填充）
+ *   帧内紧凑排：i_saw@17 → u_hi@18          ← 差 2 字节
+ * 只验对齐的话这里就会把 u_hi 写到 2 字节之前的错误位置。
+ * 所以两条都要满足：内存里首尾相接，且帧内偏移同步递增。 */
+static int scope_span_is_direct(const scope_span_t *sp)
+{
+    uint32_t a = s_var[sp->first].addr;
+    uint16_t f = s_frame_off[sp->first];
+
+    if ((a & 3U) != 0U) { return 0; }          /* 起点不对齐会走逐字节慢路径 */
+
+    for (uint8_t k = 0U; k < sp->count; k++)
+    {
+        uint8_t vi = (uint8_t)(sp->first + k);
+        if (s_var[vi].addr != a) { return 0; }        /* 内存里不连续 */
+        if (s_frame_off[vi] != f) { return 0; }       /* 帧里不同步 */
+        a += s_var[vi].size;
+        f = (uint16_t)(f + s_var[vi].size);
+    }
+    return (((a - s_var[sp->first].addr) & 3U) == 0U) ? 1 : 0;
+}
+
+/* 排读计划：变量按地址排序 → 间隙 ≤ SCOPE_MERGE_GAP 的并进同一个 span。
+ * 与网页 planReads() 同源，两边的 span 数应当一致（DEF 包里回报，主机对账）。 */
+static void scope_make_plan(void)
+{
+    /* 插入排序：只有 ≤8 个元素，不值得引 qsort */
+    for (uint8_t i = 1U; i < s_nvars; i++)
+    {
+        scope_var_t v = s_var[i];
+        int8_t j = (int8_t)i - 1;
+        while ((j >= 0) && (s_var[j].addr > v.addr)) { s_var[j + 1] = s_var[j]; j--; }
+        s_var[j + 1] = v;
+    }
+
+    /* 帧内偏移按**排序后**的顺序累加（主机解码也按这个顺序） */
+    uint16_t off = 0U;
+    for (uint8_t i = 0U; i < s_nvars; i++)
+    {
+        s_frame_off[i] = off;
+        off = (uint16_t)(off + s_var[i].size);
+    }
+    s_frame_bytes = off;
+    s_per_packet = (uint8_t)((s_frame_bytes > 0U) ? (SCOPE_PAYLOAD / s_frame_bytes) : 0U);
+    if (s_per_packet == 0U) { s_per_packet = 1U; }
+
+    s_nspans = 0U;
+    for (uint8_t i = 0U; i < s_nvars; i++)
+    {
+        uint32_t end = s_var[i].addr + s_var[i].size;
+        if ((s_nspans > 0U) &&
+            ((s_var[i].addr - (s_span[s_nspans - 1U].start + s_span[s_nspans - 1U].len)) <= SCOPE_MERGE_GAP) &&
+            ((end - s_span[s_nspans - 1U].start) <= SCOPE_SPAN_MAX))
+        {
+            scope_span_t *sp = &s_span[s_nspans - 1U];
+            sp->len = (uint16_t)(end - sp->start);
+            sp->count++;
+        }
+        else
+        {
+            scope_span_t *sp = &s_span[s_nspans];
+            sp->start = s_var[i].addr;
+            sp->len = (uint16_t)s_var[i].size;
+            sp->frame_off = s_frame_off[i];
+            sp->first = i;
+            sp->count = 1U;
+            s_nspans++;
+        }
+    }
+
+    /* 每个 span 定下"怎么读"：先判零拷贝（用未扩边的原始范围），
+     * 再把起点向下、终点向上各扩到 4 字节 —— 只是多读几个字节，不改语义。
+     * 对零拷贝的 span 这一步是空操作（它们本来就两端对齐）。 */
+    for (uint8_t i = 0U; i < s_nspans; i++)
+    {
+        scope_span_t *sp = &s_span[i];
+
+        sp->direct = (uint8_t)scope_span_is_direct(sp);
+
+        uint32_t aligned = sp->start & ~3U;
+        uint32_t aend = (sp->start + sp->len + 3U) & ~3U;
+        sp->start = aligned;
+        sp->len = (uint16_t)(aend - aligned);
+    }
+}
+
+uint32_t scope_sampler_plan_hash(void)
+{
+    /* FNV-1a，与网页 app/scope/protocol.js 的 planHash() 逐字节一致 */
+    uint32_t h = 0x811C9DC5UL;
+    for (uint8_t i = 0U; i < s_nvars; i++)
+    {
+        const uint8_t bytes[6] = {
+            (uint8_t)(s_var[i].addr), (uint8_t)(s_var[i].addr >> 8),
+            (uint8_t)(s_var[i].addr >> 16), (uint8_t)(s_var[i].addr >> 24),
+            s_var[i].size, s_var[i].type,
+        };
+        for (uint8_t k = 0U; k < 6U; k++) { h ^= bytes[k]; h *= 0x01000193UL; }
+    }
+    return h;
+}
+
+/* ------------------------------------------------------------------ 组包 */
+
+/* 只清 16 B 包头。载荷里没被本样本覆盖的尾部字节由推包时统一清一次（见 scope_push_packet） */
+static uint8_t *scope_pkt_header(uint8_t kind, uint16_t n, uint16_t aux)
+{
+    uint8_t *p = s_pkt[s_fill_buf];
+    put16(p, SCOPE_MAGIC);
+    p[2] = SCOPE_VER;
+    p[3] = kind;
+    put32(p + 4U, s_seq);
+    put32(p + 8U, s_hdr_t);          /* DATA 包这里是**首个**样本的时刻（主机按它建时间轴） */
+    put16(p + 12U, n);
+    put16(p + 14U, aux);
+    return p;
+}
+
+/* 还回一个空闲缓冲；没有就返回 0xFF。
+ * 🚨 必须跳过**正在填的那个**：它在推出去之前不算 busy，否则会把自己交出去覆盖掉。 */
+static uint8_t scope_alloc_buf(void)
+{
+    for (uint8_t i = 0U; i < SCOPE_TX_BUFS; i++)
+    {
+        if (!s_tx_busy[i] && (i != s_fill_buf)) { return i; }
+    }
+    return 0xFFU;
+}
+
+/* 把当前填满的包交给 USB */
+static void scope_push_packet(void)
+{
+    s_hdr_t = s_fill_t0;                       /* DATA 包的时间戳 = 首样本时刻 */
+    (void)scope_pkt_header(SCOPE_KIND_DATA, s_fill_n, (uint16_t)(s_fill_n * s_frame_bytes));
+
+    /* 载荷尾部没用到的字节清一次（≤ 一帧，最多 63 B）——
+     * 比每包 memset 512 B 便宜一个数量级，同时保证坏包/越界解析看到的是 0。 */
+    uint16_t used = (uint16_t)(s_fill_n * s_frame_bytes);
+    if (used < SCOPE_PAYLOAD)
+    {
+        memset(&s_pkt[s_fill_buf][SCOPE_HDR + used], 0, (size_t)(SCOPE_PAYLOAD - used));
+    }
+
+    s_seq++;
+    s_pkts++;
+    s_bytes += SCOPE_PACKET;
+
+    if (s_flags & SCOPE_FLAG_DISCARD)
+    {
+        s_discard_pkts++;
+    }
+    else
+    {
+        uint8_t buf = s_fill_buf;
+        s_tx_busy[buf] = 1U;
+        s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
+        s_if_count++;
+        usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET);
+    }
+
+    /* 下一包。**拿不到就置 0xFF（"没有缓冲"），绝不退回某个固定下标** ——
+     * 早先这里是 `s_fill_buf = 0`，而 0 号很可能正在飞：往在飞的缓冲里写数据，
+     * 再对它调一次 usbd_ep_start_write 会因为端点忙而**静默不启动**（既不发也不回调），
+     * 于是 s_if_count 只增不减、缓冲永远还不回来 —— 实测 txDone=912/1136 而
+     * usbDrop 却等于"每包一次"（1133 次），打包率掉到 1/4，还丢了 5 个 seq。
+     * 现在没缓冲就丢拍并如实计数，等回调还回来（见 scope_sampler_tx_complete）。 */
+    s_fill_buf = scope_alloc_buf();
+    s_fill_n = 0U;
+
+    if ((s_pkts % SCOPE_STAT_EVERY) == 0U) { scope_push_stat(); }
+}
+
+/* DEF：变量表（主机先拿它建类型表，再按顺序解码 DATA） */
+static void scope_push_def(void)
+{
+    uint8_t save = s_fill_buf;
+    uint8_t buf = scope_alloc_buf();
+    if (buf == 0xFFU) { return; }
+    s_fill_buf = buf;
+    s_hdr_t = s_t_us;
+    uint8_t *p = scope_pkt_header(SCOPE_KIND_DEF, 0U, s_nvars);
+    uint8_t *q = p + SCOPE_HDR;
+    put32(q, s_clock_hz);
+    put32(q + 4U, s_period_us);
+    put16(q + 8U, s_flags);
+    q[10] = s_nvars;
+    q[11] = s_nspans;                     /* 主机拿它跟自己的计划对账 */
+    uint8_t *e = q + 12U;
+    for (uint8_t i = 0U; i < s_nvars; i++)
+    {
+        put32(e, s_var[i].addr);
+        e[4] = s_var[i].size;
+        e[5] = s_var[i].type;
+        e += 8U;
+    }
+    s_seq++;
+    s_pkts++;
+    s_bytes += SCOPE_PACKET;
+    if (!(s_flags & SCOPE_FLAG_DISCARD))
+    {
+        s_tx_busy[buf] = 1U;
+        s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
+        s_if_count++;
+        usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET);
+    }
+    s_fill_buf = save;
+}
+
+static void scope_push_stat(void)
+{
+    uint8_t save = s_fill_buf;
+    uint8_t buf = scope_alloc_buf();
+    if (buf == 0xFFU) { return; }
+    s_fill_buf = buf;
+    s_hdr_t = s_t_us;
+    uint8_t *p = scope_pkt_header(SCOPE_KIND_STAT, 0U, 0U);
+    uint8_t *q = p + SCOPE_HDR;
+    put32(q, s_produced);
+    put32(q + 4U, s_dropped + s_usb_drop);
+    put32(q + 8U, s_pkts);
+    put16(q + 12U, (uint16_t)(s_usb_drop & 0xFFFFU));
+    put16(q + 14U, (uint16_t)(s_swd_err & 0xFFFFU));
+    put32(q + 16U, s_period_us);
+    q[20] = (uint8_t)(s_clock_hz / 1000000UL);   /* 当前 SWD 档位（MHz） */
+    q[21] = (uint8_t)((s_flags & SCOPE_FLAG_DISCARD) ? 1U : 0U);
+    s_seq++;
+    s_pkts++;
+    s_bytes += SCOPE_PACKET;
+    if (!(s_flags & SCOPE_FLAG_DISCARD))
+    {
+        s_tx_busy[buf] = 1U;
+        s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
+        s_if_count++;
+        usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET);
+    }
+    s_fill_buf = save;
+}
+
+/* ------------------------------------------------------------------ 采样 */
+
+/* 采一拍，把变量字节写进"本样本在包里的槽位"。
+ * 返回 0 = 成功；-1 = 某个 span 读失败（这一拍作废，计入 swd_err）。 */
+static int scope_sample_bytes(uint8_t *dst)
+{
+    for (uint8_t sp = 0U; sp < s_nspans; sp++)
+    {
+        const scope_span_t *s = &s_span[sp];
+
+        if (s->direct)
+        {
+            /* 零拷贝：span 的字节序 == 帧内布局，直接落进包 */
+            if (rtt_bridge_read(s->start, dst + s->frame_off, s->len) != 0) { return -1; }
+        }
+        else
+        {
+            if (rtt_bridge_read(s->start, s_stage, s->len) != 0) { return -1; }
+            /* 注意读起点已向下对齐到 4 字节，所以变量字节要从 (addr - s->start) 取 */
+            for (uint8_t k = 0U; k < s->count; k++)
+            {
+                uint8_t vi = (uint8_t)(s->first + k);
+                uint32_t src = (s_var[vi].addr - s->start);
+                memcpy(dst + s_frame_off[vi], &s_stage[src], s_var[vi].size);
+            }
+        }
+    }
+    return 0;
+}
+
+static int scope_sample_once(void)
+{
+    /* 没有空闲包缓冲：丢这一拍并如实计数（**绝不写进在飞的缓冲**）。
+     * 缓冲由 USB 完成回调还给采样器，见 scope_sampler_tx_complete。 */
+    if (s_fill_buf >= SCOPE_TX_BUFS)
+    {
+        s_usb_drop++;
+        s_t_us += s_period_us;             /* 时间轴照常推进：主机看到的是"有洞"，不是"被压缩" */
+        return 0;
+    }
+
+    uint32_t t0 = mchtmr_now();
+    uint8_t *dst = &s_pkt[s_fill_buf][SCOPE_HDR + ((uint32_t)s_fill_n * s_frame_bytes)];
+
+    if (scope_sample_bytes(dst) != 0) { return -1; }
+
+    s_last_sample_ticks = mchtmr_now() - t0;
+
+    if (s_fill_n == 0U) { s_fill_t0 = s_t_us; }
+    s_fill_n++;
+    s_produced++;
+    s_t_us += s_period_us;                 /* 名义时间轴：跳拍也要推进，否则主机的轴会压缩 */
+
+    if (s_fill_n >= s_per_packet) { scope_push_packet(); }
+    return 0;
+}
+
+static int scope_start_now(void)
+{
+    if ((s_nvars == 0U) || (s_frame_bytes == 0U)) { return -3; }
+    int rc = rtt_bridge_swd_ensure_ready();      /* 复用桥的 SWD 初始化（含斜坡换挡） */
+    if (rc != 0) { s_swd_ready = 0U; return rc; }
+    s_swd_ready = 1U;
+
+    scope_make_plan();
+
+    s_seq = 0U; s_t_us = 0U; s_produced = 0U; s_dropped = 0U; s_usb_drop = 0U;
+    s_swd_err = 0U; s_yield = 0U; s_pkts = 0U; s_bytes = 0U; s_discard_pkts = 0U;
+    s_last_sample_ticks = 0U;
+    s_if_head = 0U; s_if_count = 0U;
+    memset((void *)s_tx_busy, 0, sizeof(s_tx_busy));
+    s_fill_buf = scope_alloc_buf();
+    s_fill_n = 0U;
+    s_fill_t0 = 0U;
+
+    scope_push_def();                            /* 先发变量表 */
+    s_next_tick = mchtmr_now() + us_to_ticks(s_period_us);
+    s_running = 1U;
+    return 0;
+}
+
+/* 标定：用当前计划空跑 iters 次，量真实的 µs/样本（M0 那一步的答案）。
+ * 🚨 要先自己把链路拉起来 —— 网页的「标定真实速率」是在**启动推流之前**点的。 */
+static void scope_run_bench(void)
+{
+    uint8_t *dst = &s_pkt[s_fill_buf][SCOPE_HDR];
+
+    if (s_nspans == 0U)
+    {
+        s_bench_err = -3;
+        s_bench_valid = 1U;
+        return;
+    }
+    if (!s_swd_ready)
+    {
+        int rc = rtt_bridge_swd_ensure_ready();
+        if (rc != 0) { s_bench_err = rc; s_bench_valid = 1U; return; }
+        s_swd_ready = 1U;
+    }
+
+    uint32_t t0 = mchtmr_now();
+    int32_t err = 0;
+
+    for (uint32_t i = 0U; (err == 0) && (i < s_bench_iters); i++)
+    {
+        if (scope_sample_bytes(dst) != 0) { err = -4; }
+    }
+    s_bench_ticks = mchtmr_now() - t0;
+    s_bench_err = err;
+    s_bench_valid = 1U;
+}
+
+void scope_sampler_poll(void)
+{
+    if (s_start_req)
+    {
+        s_start_req = 0U;
+        s_start_rc = (int8_t)scope_start_now();
+    }
+    if (s_bench_req)
+    {
+        s_bench_req = 0U;
+        scope_run_bench();
+    }
+
+    if (!s_running) { return; }
+
+    uint32_t now = mchtmr_now();
+    if ((int32_t)(now - s_next_tick) < 0) { return; }       /* 还没到点 */
+
+    /* 让路：最近 SCOPE_YIELD_TICKS 内有 DAP 命令 → 跳过这一拍（周期会豁一个口，
+     * 但不会把正在调试的会话打断）。要绝对稳的周期就设 SCOPE_FLAG_NO_YIELD。 */
+    if (!(s_flags & SCOPE_FLAG_NO_YIELD))
+    {
+        uint32_t last_dap = rtt_bridge_last_dap_ticks();
+        if ((last_dap != 0U) && ((uint32_t)(now - last_dap) < SCOPE_YIELD_TICKS))
+        {
+            s_yield++;
+            s_next_tick = now + us_to_ticks(s_period_us);
+            return;
+        }
+    }
+
+    if (scope_sample_once() != 0)
+    {
+        s_swd_err++;
+        s_next_tick = now + us_to_ticks(s_period_us);
+        return;
+    }
+
+    /* 追不上就跳拍：把 next_tick 推到将来，并把**真正跳过**的整拍数计入 dropped。
+     * 🚨 这里必须只算整拍：早先写成 `(now-next)/period + 1`，于是"晚 1 个 tick（42 ns）"
+     *    也被记成丢了 1 拍 —— 实测 10 kHz 采样下 produced=31222、dropped=31174，
+     *    界面上会显示成丢了一半，而 seq 缺口是 0、实际速率也正好 10 kHz。
+     *    现在用 while 逐拍推进，只有 now 真的越过了下一拍的时刻才算丢。 */
+    uint32_t period_ticks = us_to_ticks(s_period_us);
+    if (period_ticks == 0U) { period_ticks = 1U; }
+    s_next_tick += period_ticks;
+    while ((int32_t)(now - s_next_tick) > 0)
+    {
+        s_next_tick += period_ticks;
+        s_dropped++;
+        s_t_us += s_period_us;
+    }
+}
+
+/* ------------------------------------------------------------------ 控制面 */
+
+void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars)
+{
+    if (nvars > SCOPE_MAX_VARS) { nvars = SCOPE_MAX_VARS; }
+    if (period_us < SCOPE_MIN_PERIOD_US) { period_us = SCOPE_MIN_PERIOD_US; }
+    if (period_us > SCOPE_MAX_PERIOD_US) { period_us = SCOPE_MAX_PERIOD_US; }
+    s_period_us = period_us;
+    s_flags = flags;
+    s_nvars = nvars;
+    for (uint8_t i = 0U; i < nvars; i++) { s_var[i] = vars[i]; }
+
+    /* 计划要先排出来：标定（action 8）不启动也能跑，而且状态字里要报 span 数 */
+    scope_make_plan();
+
+    /* clock_delay 覆盖：SWD 空闲拍那一截（每条 AP 读约 52 个时钟里有 6 拍是它）。
+     * 只在明确要求时改；否则把档位原生值装回去（档位换挡会重设它）。 */
+    if (flags & SCOPE_FLAG_DELAY0) { DAP_Data.clock_delay = 0U; }
+    else { rtt_bridge_set_swd_clock(s_clock_hz ? s_clock_hz : rtt_bridge_swd_clock_hz()); }
+
+    if (s_running)
+    {
+        /* 运行中改配置：停掉再等主机启动 —— 免得半新半旧地跑（周期/变量表混用） */
+        s_running = 0U;
+        s_start_rc = -100;
+    }
+    s_last_cmd = 7U;
+}
+
+void scope_sampler_set_clock(uint32_t hz)
+{
+    if (hz == 0U) { return; }
+    rtt_bridge_set_swd_clock(hz);
+    s_clock_hz = rtt_bridge_swd_clock_hz();
+    s_last_cmd = 3U;
+}
+
+void scope_sampler_request_start(void)
+{
+    s_start_req = 1U;
+    s_start_rc = -100;                 /* 排队中：与 RTT 桥的约定一致 */
+}
+
+int scope_sampler_start_result(void)
+{
+    return (int)s_start_rc;
+}
+
+void scope_sampler_stop(void)
+{
+    s_running = 0U;
+    s_start_req = 0U;
+    s_start_rc = -100;
+    s_last_cmd = 0U;
+}
+
+int scope_sampler_is_running(void)
+{
+    return (int)s_running;
+}
+
+uint32_t scope_sampler_span_count(void)
+{
+    return (uint32_t)s_nspans;
+}
+
+uint32_t scope_sampler_last_sample_ticks(void)
+{
+    return s_last_sample_ticks;
+}
+
+void scope_sampler_request_bench(uint32_t iters)
+{
+    if (iters == 0U) { iters = 1000U; }
+    if (iters > SCOPE_BENCH_MAX_ITERS) { iters = SCOPE_BENCH_MAX_ITERS; }
+    s_bench_iters = iters;
+    s_bench_valid = 0U;
+    s_bench_req = 1U;
+}
+
+int scope_sampler_bench_result(uint32_t *iters, uint32_t *ticks, int32_t *err)
+{
+    if (!s_bench_valid) { return 0; }
+    if (iters) { *iters = s_bench_iters; }
+    if (ticks) { *ticks = s_bench_ticks; }
+    if (err)   { *err = s_bench_err; }
+    return 1;
+}
+
+void scope_sampler_tx_complete(void)
+{
+    s_tx_done++;
+    if (s_if_count == 0U) { return; }                  /* 丢弃模式下没有在飞的包 */
+    uint8_t idx = s_inflight[s_if_head];
+    s_if_head = (uint8_t)((s_if_head + 1U) % SCOPE_TX_BUFS);
+    s_if_count--;
+    if (idx < SCOPE_TX_BUFS) { s_tx_busy[idx] = 0U; }
+
+    /* 刚还回来的缓冲如果正是"缺的那个"，立刻接手继续填 —— 不然会一直丢拍到下一次推包 */
+    if ((s_fill_buf >= SCOPE_TX_BUFS) && s_running)
+    {
+        s_fill_buf = scope_alloc_buf();
+        s_fill_n = 0U;
+    }
+}
+
+/* 12 个状态字，位域见 docs/scope-page.md §7.1（网页 parseScopeStatus 按同一张表解） */
+uint32_t scope_sampler_status(uint32_t *out, uint32_t words)
+{
+    if (words < 12U) { return 0U; }
+    out[0] = (uint32_t)(s_running ? 1U : 0U) |
+             ((uint32_t)s_nspans << 8) |
+             ((uint32_t)(s_swd_ready ? 1U : 0U) << 16) |
+             ((uint32_t)s_nvars << 24);
+    out[1] = s_clock_hz;
+    out[2] = s_produced;
+    out[3] = s_dropped + s_usb_drop;
+    out[4] = (s_bytes & 0xFFFFU) | ((s_usb_drop & 0xFFFFU) << 16);
+    out[5] = (s_swd_err & 0xFFFFU) | ((s_yield & 0xFFFFU) << 16);
+    out[6] = s_seq;
+    out[7] = (s_dropped & 0xFFFFU) | ((s_discard_pkts & 0xFFFFU) << 16);
+    out[8] = scope_sampler_plan_hash();
+    out[9] = (s_last_cmd & 0xFFU) | ((s_last_rsp & 0xFFU) << 8) | ((s_tx_done & 0xFFFFU) << 16);
+    out[10] = (uint32_t)(int32_t)s_start_rc;
+    out[11] = (s_period_us & 0xFFFFU) |
+              ((uint32_t)((s_flags & SCOPE_FLAG_DISCARD) ? 1U : 0U) << 16) |
+              ((uint32_t)(s_clock_hz / 1000000UL) << 24);
+    return 12U;
+}

@@ -1,4 +1,4 @@
-"""Probe-side RISC-V engine control (HID CMD_RISCV = 0x32).
+"""Probe-side RISC-V engine control (HID CMD_RISCV = 0x33).
 
 The JTAG bit-bang only runs from the probe's main loop, so every action is
 queued and the status block is read back with follow-up polls (the reply to a
@@ -22,7 +22,7 @@ import time
 import hid
 
 VID, PID = 0x0D28, 0x0204
-CMD_RISCV = 0x32
+CMD_RISCV = 0x33   # 0x32 让给了网页「J-Scope 波形」页的 SCOPE
 
 ACT_STOP, ACT_OPEN, ACT_RBENCH, ACT_WBENCH = 0, 1, 2, 3
 ACT_SBENCH, ACT_RCHECK, ACT_STATUS, ACT_CONFIG = 4, 5, 6, 7

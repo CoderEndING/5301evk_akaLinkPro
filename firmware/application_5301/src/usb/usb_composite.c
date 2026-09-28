@@ -519,11 +519,17 @@ void dap_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes)
     }
 }
 
+#include "scope_sampler.h"
+
 void swo_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     (void)busid;
     (void)ep;
     (void)nbytes;
+    /* 这条 bulk IN（0x83）原本挂给 SWO，但 SWO_STREAM=0 从来没写过它。
+     * 现在给 J-Scope 采样器当数据面：一次 512 B 写完成 → 还回一个包缓冲。
+     * 回调不带缓冲下标，采样器内部按提交顺序（FIFO）还。 */
+    scope_sampler_tx_complete();
 }
 
 void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)

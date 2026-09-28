@@ -32,7 +32,7 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
   （J-Link 式），主机只读一个串口。**默认 45 MHz 档：2527 KB/s（2.47 MB/s）零丢包**；
   切 60 MHz 档：**2954 KB/s（2.89 MB/s）** —— 比主机轮询上限（1140 KB/s）快 **2.6 倍**。
   详见 [探针侧 RTT→CDC 桥](#探针侧-rttcdc-桥)。
-- **支持 RISC-V 目标（JTAG-only，HID `CMD_RISCV` 0x32）**：新增探针侧 RISC-V
+- **支持 RISC-V 目标（JTAG-only，HID `CMD_RISCV` 0x33）**：新增探针侧 RISC-V
   Debug Module 引擎（DMI + SBA，`src/riscv/` + 专用 DMI 扫描汇编，TDI 预置 + 循环
   展开）。调 HPM6800EVK（HPM6880）实测 SRAM 读 **1504.5 KB/s**、写 **1511.8 KB/s**，
   比主机驱动 OpenOCD 快 **9 倍**；RTT 交付 **1385 KB/s 且字节级零丢包**（28.5 MB
@@ -519,9 +519,68 @@ powershell -File script_test\hpm6800_timing_sweep.ps1
 > poll 几万次全是空环、交付塌到 3 KB/s，而**读回校验和仍然是对的**，只有速率会
 > 暴露它）。做完写基准确认要么换空闲 scratch 地址，要么重烧一次目标。
 
-HID 侧接口：`CMD_RISCV`（0x32，动作见
+HID 侧接口：`CMD_RISCV`（**0x33** —— 原本是 0x32，因网页侧 SCOPE 占了 0x32 而让位；动作见
 [`Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md)）；
 RTT 桥切目标类型用 `CMD_RTT`（0x31）的 action 10。
+
+## J-Scope 波形（探针侧 HSS 采样）
+
+类 SEGGER J-Scope 的**变量示波器**：探针自己按固定周期用 SWD 读目标 RAM 里 1~8 个变量，
+组 512 B 自描述包，从 interface 0 上那个**原本闲置的 bulk IN `0x83`**（SWO 端点，
+`SWO_STREAM=0` 所以一直没人写过）推给主机。**目标固件一行都不用改** —— 变量地址来自
+目标 `.elf` 的 DWARF。上位机是另一仓库
+[web-serial-rtt-tools](https://github.com/minichao9901) 的「J-Scope 波形」页（WebUSB）。
+
+控制面 HID `CMD_SCOPE 0x32`（形状照抄 0x31），数据面 `0x83`。协议与状态字见
+[`Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) 第 16 条。
+
+### 实测（8 通道 f32/u32/u16/u8 混排，64 字节一帧 → 22 B/样本）
+
+| 口径 | 结果 |
+| --- | --- |
+| **M0 标定 @45 MHz**（一个 span、24 B） | 13.49 µs/样本 → **74.2 kHz** |
+| **M0 标定 @60 MHz** | 11.55 µs/样本 → **86.5 kHz** |
+| 端到端 25 kHz 采集 | **99.7% 交付**（丢 268/78258，全是启动瞬态） |
+| 端到端 50 kHz 采集 | 1.10 MB/s，96.8% 交付（**宿主读速限制**，见下） |
+
+### 三个必须知道的实测结论
+
+1. **靶子的主频决定一切，不是探针。** AHB-AP 每次读都要花目标侧几个 HCLK：同一份靶子固件
+   跑 HSI 8 MHz 时块读封顶 **1.47 MB/s（0.68 µs/字节）**，而且 45 MHz 与 30 MHz 的读数
+   **一模一样**（目标已饱和）；改成 HSE ×12 = **96 MHz** 后同一路径是 **3.37 MB/s
+   （0.297 µs/字节）**，SWD 时钟才重新变成线性有效的旋钮。拿 8 MHz 的靶子量采样率，
+   量到的是靶子的上限（≈46 kHz）。→ 项目里那份靶子固件已经改成 96 MHz：
+   [`script_test/stm32f103_scope/`](script_test/stm32f103_scope)。
+2. **热路径是"一次采样 = 按 span 块读"**：变量按地址排序，间隙 ≤ 阈值就并成一个 span。
+   一次 span 块读的传输数是 **N+2**（TAR + prime + (N-1)×DRW + RDBUFF），这已是 AHB-AP
+   的理论最小 —— `swd_host.c` 里 CSW 与 DP_SELECT 都带缓存，第二次起写 CSW 是**零传输**。
+   真正能省的只有搬运：span 内变量首尾相接时，**span 的字节序与帧内布局逐字节相同**，
+   于是零拷贝直读进包（有填充字节的结构体不能直读 —— 帧内紧凑排会把 `u_hi` 放到 18
+   而它在内存里是 20，硬直读会写错位置，这个坑已经踩过并写进代码注释）。
+3. **包缓冲的账不能"拿不到就退回 0 号"**。那样会往**在飞**的缓冲里写数据，再对它
+   `usbd_ep_start_write` 会因端点忙而**静默不启动**（既不发也不回调），于是
+   `s_if_count` 只增不减、缓冲永远还不回来 —— 实测 `txDone=912/1136` 而"无缓冲丢样本"
+   却等于每包一次，打包率掉到 1/4 还丢 seq。现在拿不到就丢拍并如实计数，等回调还回来。
+
+> ⚠️ **测交付率时主机侧读法同样决定结果**：`usb.read(N)` 会一直等到凑满 N 字节才返回，
+> 读 16 KB = 32 个包 = 14 ms，这期间探针的包缓冲早被填满并开始丢拍 —— 看起来像固件丢数据。
+> 另外**读线程必须在 START 之前起来**（启动后那段没人读的时间的账会全记在 dropped 上，
+> 实测 25 kHz 下 dropped=3192 ≈ 120 ms × 25 kHz − 8 个缓冲）。同一个坑在 RTT 交付率
+> 脚本里已经踩过一次，见 [`docs/hpm6800evk-jtag.md`](docs/hpm6800evk-jtag.md) §5.3。
+
+### 复现
+
+```bat
+:: 靶子（STM32F103C8，96 MHz 超频，10 kHz 契约波形：正弦/三角/方波/锯齿/撕裂自检/50 kHz 混叠源）
+cd script_test\stm32f103_scope
+pwsh -File build.ps1
+pwsh -File flash.ps1
+python check.py                      :: 客观验收：halt → dump RAM → 逐项核对契约 + 反测时基
+
+:: 探针侧（命令行验收，不等网页）
+python script_test\scope_hss_test.py bench --clock 60000000     :: M0 标定（µs/样本 → 上限 kHz）
+python script_test\scope_hss_test.py run --clock 60000000 --period 40 --secs 3
+```
 
 ## 文档
 

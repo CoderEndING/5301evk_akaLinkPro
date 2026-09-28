@@ -1,0 +1,360 @@
+"""J-Scope 探针侧 HSS 采样 —— 端到端验收脚本（不等网页，先在命令行跑通）。
+
+控制面走 HID 0x32（与网页 app/scope/protocol.js 逐字节一致），数据面用 pyusb 直接
+读 interface 0 上的 bulk IN **0x83**（网页走 WebUSB，同一根管子）。
+
+用法:
+  python scope_hss_test.py status
+  python scope_hss_test.py bench  [--set pack|cross] [--clock 45000000] [--iters 2000]
+  python scope_hss_test.py run    [--set pack|cross] [--period 100] [--secs 3]
+
+靶子固件: web-serial-rtt-tools/tools/target-firmware/stm32f103_scope（10 kHz 契约波形）
+"""
+import argparse
+import os
+import struct
+import sys
+import threading
+import time
+
+import hid
+import usb.core
+import usb.util
+
+VID, PID = 0x0D28, 0x0204
+EP_IN = 0x83
+HID_CMD = 0x32
+
+ACT = {'STOP': 0, 'START': 1, 'STATUS': 2, 'CLOCK': 3, 'TRIGGER': 4,
+       'CONFIG': 7, 'BENCH': 8, 'BENCH_RESULT': 9}
+
+KIND = {1: 'DEF', 2: 'DATA', 3: 'STAT', 4: 'EVT'}
+MAGIC = 0x4A53
+PACKET, HEADER, PAYLOAD = 512, 16, 496
+
+TYPES = {0: ('B', 1), 1: ('b', 1), 2: ('H', 2), 3: ('h', 2),
+         4: ('I', 4), 5: ('i', 4), 6: ('f', 4), 7: ('d', 8)}
+
+# 靶子固件 stm32f103_scope 的变量契约（tools/target-firmware/stm32f103_scope/README.md）
+V_PACK = [  # g_pack 那 8 个字段 → 一个 span（24 B，中间有 2 B 填充）
+    ("f_sin",  0x20001014, 4, 6), ("f_tri",  0x20001018, 4, 6),
+    ("i_tick", 0x2000101c, 4, 5), ("u_ramp", 0x20001020, 2, 2),
+    ("i_sq1k", 0x20001022, 2, 3), ("u_cnt",  0x20001024, 1, 0),
+    ("i_saw",  0x20001025, 1, 1), ("u_hi",   0x20001028, 4, 4),
+]
+V_CROSS = [  # span A(0x20000000,14B) + span B(0x20001010,56B)：跨 span 的慢路径
+    ("g_lfsr",     0x20000000, 4, 4), ("g_far_cnt",  0x20000008, 4, 4),
+    ("g_far_sq100", 0x2000000c, 2, 3), ("g_isr_count", 0x20001010, 4, 4),
+    ("i_tick",     0x2000101c, 4, 5), ("g_pair_a",   0x2000102c, 2, 2),
+    ("g_pair_b",   0x2000102e, 2, 2), ("g_tick",     0x20001044, 4, 4),
+]
+
+
+def watchdog(sec):
+    def _f():
+        time.sleep(sec)
+        print("!! WATCHDOG TIMEOUT (%ss)" % sec)
+        os._exit(9)
+    threading.Thread(target=_f, daemon=True).start()
+
+
+def open_hid():
+    for _ in range(30):
+        cand = [i for i in hid.enumerate(VID, PID) if i.get("usage_page") == 0xFF00]
+        if cand:
+            d = hid.device()
+            d.open_path(cand[0]["path"])
+            d.set_nonblocking(1)
+            time.sleep(0.2)
+            return d
+        time.sleep(0.3)
+    raise RuntimeError("no HID")
+
+
+def hid_xfer(dev, data, tmo=3.0):
+    """data = [action, ...]；返回**已剥掉 Report ID** 的响应（与网页 xfer() 同语义：
+    res[1] === cmd，res[2] 是 payload 第 0 字节）。"""
+    req = [0x01, 2 + len(data), HID_CMD] + list(data)
+    req += [0] * (64 - len(req))
+    dev.write(req)
+    t0 = time.time()
+    while time.time() - t0 < tmo:
+        r = dev.read(64, timeout_ms=200)
+        if r and r[0] == 0x02 and r[2] == HID_CMD:
+            return list(r)[1:]
+    return None
+
+
+def s8(v):
+    v &= 0xFF
+    return v - 256 if v > 127 else v
+
+
+def status(dev):
+    r = hid_xfer(dev, [ACT['STATUS']])
+    if not r:
+        return None
+    w = [int.from_bytes(bytes(r[3 + i * 4:7 + i * 4]), "little") for i in range(12)]
+    return {
+        'startRc': s8(r[2]), 'running': w[0] & 1, 'spans': (w[0] >> 8) & 0xFF,
+        'swdReady': (w[0] >> 16) & 1, 'nvars': (w[0] >> 24) & 0xFF,
+        'swdHz': w[1], 'produced': w[2], 'dropped': w[3],
+        'swdErr': w[5] & 0xFFFF, 'yield': w[5] >> 16, 'seq': w[6],
+        'planHash': w[8], 'periodUs': w[11] & 0xFFFF, 'discard': bool(w[11] & (1 << 16)),
+        'swdMhz': (w[11] >> 24) & 0xFF, 'raw': w,
+    }
+
+
+def do_config(dev, period_us, vars_, flags=0):
+    d = [ACT['CONFIG']]
+    d += list(struct.pack('<I', period_us)) + [flags & 0xFF, len(vars_)]
+    for _, addr, size, typ in vars_:
+        d += list(struct.pack('<I', addr)) + [size, typ]
+    assert len(d) <= 61, "配置报文 %d B 超上限" % len(d)
+    r = hid_xfer(dev, d)
+    return bool(r)
+
+
+def do_bench(dev, iters=2000):
+    hid_xfer(dev, [ACT['BENCH']] + list(struct.pack('<I', iters)))
+    time.sleep(0.35 + iters / 40000.0)
+    r = hid_xfer(dev, [ACT['BENCH_RESULT']])
+    if not r:
+        return None
+    ticks = int.from_bytes(bytes(r[3:7]), "little")
+    it = int.from_bytes(bytes(r[7:11]), "little")
+    err = int.from_bytes(bytes(r[11:15]), "little", signed=True)
+    return it, ticks, err
+
+
+def find_ep83():
+    dev = usb.core.find(idVendor=VID, idProduct=PID)
+    if dev is None:
+        raise RuntimeError("探针没找到（pyusb）")
+    try:
+        dev.set_configuration()
+    except usb.core.USBError:
+        pass
+    for intf in dev.get_active_configuration():
+        for ep in intf:
+            if ep.bEndpointAddress == EP_IN:
+                return dev, intf.bInterfaceNumber, ep
+    raise RuntimeError("没找到 bulk IN 0x83")
+
+
+class PktStream:
+    """512 B 定长自描述包；按 magic 重同步，坏包只丢自己。"""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.pkts = 0
+        self.resync = 0
+
+    def push(self, chunk):
+        self.buf += chunk
+        out = []
+        while True:
+            if len(self.buf) < PACKET:
+                break
+            m = int.from_bytes(self.buf[0:2], "little")
+            if m != MAGIC:
+                i = self.buf.find(struct.pack('<H', MAGIC), 1)
+                if i < 0:
+                    self.buf = self.buf[-1:]
+                    self.resync += 1
+                    break
+                self.buf = self.buf[i:]
+                self.resync += 1
+                continue
+            p = bytes(self.buf[:PACKET])
+            del self.buf[:PACKET]
+            self.pkts += 1
+            out.append({
+                'kind': p[3],
+                'seq': int.from_bytes(p[4:8], "little"),
+                't_us': int.from_bytes(p[8:12], "little"),
+                'n': int.from_bytes(p[12:14], "little"),
+                'aux': int.from_bytes(p[14:16], "little"),
+                'payload': p[HEADER:],
+            })
+        return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('cmd', choices=['status', 'bench', 'run'])
+    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross'])
+    ap.add_argument('--clock', type=int, default=0, help='SWD Hz，0=不动')
+    ap.add_argument('--period', type=int, default=100, help='采样周期 us')
+    ap.add_argument('--iters', type=int, default=2000)
+    ap.add_argument('--secs', type=float, default=3.0)
+    a = ap.parse_args()
+
+    vars_ = V_PACK if a.vset == 'pack' else V_CROSS
+    dev = open_hid()
+
+    if a.clock:
+        hid_xfer(dev, [ACT['CLOCK']] + list(struct.pack('<I', a.clock)))
+        time.sleep(0.1)
+
+    if a.cmd == 'status':
+        st = status(dev)
+        print(st)
+        return 0
+
+    do_config(dev, a.period, vars_)
+    st = status(dev)
+    print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
+          % (len(vars_), a.period, st['spans'], 1 if a.vset == 'pack' else 2))
+    if st['spans'] != (1 if a.vset == 'pack' else 2):
+        print("⚠️ span 数与本地计划不一致 —— 检查合并规则/地址")
+
+    if a.cmd == 'bench':
+        r = do_bench(dev, a.iters)
+        if not r:
+            print("标定无响应"); return 1
+        it, ticks, err = r
+        if err != 0 or it == 0:
+            print("标定失败 err=%d iters=%d（-3 变量表空 / -4 读失败 / 其它=初始化码）" % (err, it))
+            return 1
+        us = (ticks / 24.0) / it
+        print("**M0 标定**: %d 次 × %.3f us/样本 = %.2f ms  → 上限 ≈ %.1f kHz"
+              % (it, us, ticks / 24.0 / 1000.0, 1000.0 / us))
+        return 0
+
+    # ---- run：启动推流 + 读 0x83 ----
+    ud, intf, ep = find_ep83()
+    try:
+        if ud.is_kernel_driver_active(intf):
+            ud.detach_kernel_driver(intf)
+    except Exception:
+        pass
+    usb.util.claim_interface(ud, intf)
+
+    st = status(dev)
+    dropped0, seq0 = st['dropped'], st['seq']
+    stream = PktStream()
+    chunks = []
+    stop = threading.Event()
+    nb = {'bytes': 0}
+
+    # 🚨 读线程必须在 START **之前**起来，否则启动后那段没人读的时间（下面等 rc 的
+    #    轮询至少 120 ms）里探针会把包缓冲填满并开始丢拍 —— 实测 period=40us 时
+    #    dropped=3192 ≈ 120 ms × 25 kHz − 8 个缓冲，全是这一段的账，看着却像固件丢数据。
+    #    同一个坑在 RTT 交付率脚本里已经踩过一次（见 docs/hpm6800evk-jtag.md §5.3）。
+    def reader():
+        while not stop.is_set():
+            try:
+                b = bytes(ep.read(2048, timeout=200))
+            except usb.core.USBTimeoutError:
+                continue
+            except Exception:
+                break
+            nb['bytes'] += len(b)
+            chunks.extend(stream.push(b))
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+
+    hid_xfer(dev, [ACT['START']])
+    rc = -100
+    for _ in range(20):
+        time.sleep(0.12)
+        st = status(dev)
+        rc = st['startRc']
+        if rc != -100:
+            break
+    print("启动 rc=%d (0=ok, -1 时钟, -2 初始化, -3 变量表空, -4 该档不可用)" % rc)
+    if rc != 0:
+        stop.set()
+        usb.util.dispose_resources(ud)
+        return 1
+
+    # 从这一刻起才计入速率与丢包统计（启动瞬态已经过去）
+    nb['bytes'] = 0
+    chunks.clear()
+    t0 = time.perf_counter()
+    time.sleep(a.secs)
+    dt = time.perf_counter() - t0
+    stop.set()
+    th.join(timeout=1.5)
+    total = nb['bytes']
+    st = status(dev)
+
+    hid_xfer(dev, [ACT['STOP']])
+    time.sleep(0.15)
+    # 停流后把在飞的读收干净
+    t1 = time.perf_counter()
+    while time.perf_counter() - t1 < 0.4:
+        try:
+            b = bytes(ep.read(16384, timeout=120))
+        except usb.core.USBTimeoutError:
+            break
+        total += len(b)
+        chunks += stream.push(b)
+    st = status(dev)
+    usb.util.dispose_resources(ud)
+
+    print("主机收到 %d B / %.2f s -> %.1f KB/s；包数 %d，重同步 %d"
+          % (total, dt, total / dt / 1024.0, stream.pkts, stream.resync))
+
+    kinds = {}
+    defs = [p for p in chunks if p['kind'] == 1]
+    datas = [p for p in chunks if p['kind'] == 2]
+    stats = [p for p in chunks if p['kind'] == 3]
+    for p in chunks:
+        kinds[KIND.get(p['kind'], p['kind'])] = kinds.get(KIND.get(p['kind'], p['kind']), 0) + 1
+    print("包类型: %s" % kinds)
+    if defs:
+        d = defs[0]['payload']
+        print("DEF: swd=%d Hz period=%d us flags=0x%X nvars=%d spans=%d"
+              % (int.from_bytes(d[0:4], 'little'), int.from_bytes(d[4:8], 'little'),
+                 int.from_bytes(d[8:10], 'little'), d[10], d[11]))
+    print("probe: produced=%d dropped=%d swdErr=%d yield=%d seq=%d"
+          % (st['produced'], st['dropped'], st['swdErr'], st['yield'], st['seq']))
+
+    # seq 缺口
+    gaps = 0
+    prev = None
+    for p in sorted(datas + stats, key=lambda x: x['seq']):
+        if prev is not None and p['seq'] != prev + 1:
+            gaps += p['seq'] - prev - 1
+        prev = p['seq']
+    print("seq 缺口合计 = %d 包" % gaps)
+
+    # 解码样本 + 按契约核对
+    order = sorted(vars_, key=lambda v: v[0] and v[1])   # 固件按地址排序
+    order = sorted(vars_, key=lambda v: v[1])
+    fb = sum(v[2] for v in order)
+    samples = []
+    for p in datas:
+        nb = min(p['aux'], p['n'] * fb)
+        for i in range(nb // fb):
+            off = i * fb
+            row = {}
+            fo = 0
+            for name, addr, size, typ in order:
+                fmt = '<' + TYPES[typ][0]
+                row[name] = struct.unpack_from(fmt, p['payload'], off + fo)[0]
+                fo += size
+            samples.append(row)
+    print("解出 %d 个样本（frame %d B，期望 %d 个/包）" % (len(samples), fb, PAYLOAD // fb))
+    if len(samples) >= 2:
+        # g_tick 斜率 = 采样率；跳变 > 1 就是丢样本
+        ts = [s['i_tick'] for s in samples]
+        d = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
+        ones = sum(1 for x in d if x == 1)
+        jumps = sum(x - 1 for x in d if x > 1)
+        print("i_tick 斜率: 连续+1 占 %d/%d，跳变丢样本合计 %d（probe dropped+usbDrop=%d）"
+              % (ones, len(d), jumps, st['dropped']))
+        expect_period = (d and sorted(d)[len(d) // 2]) or 0
+        print("目标 tick 步进中位数 = %d（=1 表示采样率与目标 10 kHz 同拍）" % expect_period)
+        # u_hi 精度
+        bad = [s for s in samples if (s['u_hi'] >> 28) != 1]
+        print("u_hi 高位校验: %d/%d 正确" % (len(samples) - len(bad), len(samples)))
+    return 0
+
+
+if __name__ == "__main__":
+    watchdog(180)
+    sys.exit(main())

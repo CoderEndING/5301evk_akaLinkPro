@@ -317,3 +317,15 @@ RX flush 定时器周期**按波特率动态调整**（目标每次约 512 字�
 > 于是整串请求被移成 0（`op=NOP`）—— **基准照跑、rderr/wderr 全 0、idcode/dtmcs 也对，
 > 只有自检能抓到读回全 0**。这就是自检必须当门禁的原因。
 
+
+### J-Scope 波形（探针侧 HSS 采样）脚本
+
+| 文件 | 用途 |
+| --- | --- |
+| `scope_hss_test.py` | **命令行端到端验收**：HID 0x32 配变量表 / 设 SWD 时钟 / 标定，再用 pyusb 读 bulk IN `0x83` 解包核对（`bench` = M0 标定，`run` = 实采）。网页走 WebUSB，同一根管子 |
+| `stm32f103_scope/` | **靶子固件**（STM32F103C8，**HSE ×12 = 96 MHz 超频**，10 kHz 契约波形）。`build.ps1` / `flash.ps1` / `check.py`（客观验收：halt → dump RAM → 逐变量核对 + 反测时基）。源本在 web-serial-rtt-tools，本仓库这份**已提频到 96 MHz** —— 原因见下 |
+
+> ⚠️ **靶子必须跑 96 MHz 才能量到探针的上限**：AHB-AP 每次读都要花目标侧几个 HCLK，
+> 8 MHz 时块读封顶 1.47 MB/s 且 45/30 MHz 读数一样（目标饱和），96 MHz 下同一路径
+> 3.37 MB/s。用 8 MHz 的靶子量出来的是靶子的上限（≈46 kHz），不是探针的。
+> 原目录 `tools/target-firmware/stm32f103_scope` 保持 8 MHz 不动，本仓库这份是提频版。

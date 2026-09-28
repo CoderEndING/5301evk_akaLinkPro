@@ -5,6 +5,7 @@
 #include "usb_composite.h"
 #include "rtt_bridge.h"
 #include "riscv_svc.h"
+#include "scope_sampler.h"
 #include "led_state.h"
 #include "hpm_dfu_trigger.h"
 #include "board.h"
@@ -59,8 +60,25 @@
 #define RTT_ACT_BENCH_RESULT 9U
 #define RTT_ACT_TARGET 10U
 
-/* Probe-side RISC-V (JTAG) memory engine (see src/riscv/). */
-#define CMD_RISCV (0x32)
+/* Probe-side RISC-V (JTAG) memory engine (see src/riscv/).
+ * 原本在 0x32，因网页侧「J-Scope 波形」页把 SCOPE 定在 0x32（另一仓库
+ * web-serial-rtt-tools 的 app/scope/protocol.js 里写死 HID_CMD = 0x32），
+ * 这里让位挪到 0x33。改这里要同步 script_test/hpm6800_*.py 与 Custom HID Protocol.md。 */
+#define CMD_RISCV (0x33)
+
+/* ---- CMD 0x32 SCOPE：探针侧 HSS 采样（J-Scope 波形页的数据源）----
+ * 形状照抄 0x31：res_hid[3] = 动作号回显，res_hid[4..] = 12 个状态字。
+ * ⚠️ 与 0x31 的差别：网页对 0x32 是把**启动码放在 payload[2]** 读的
+ * （app/scope/view.js 就是这么等 -100 变 0 的），所以 payload[2] = startRc。 */
+#define CMD_SCOPE (0x32)
+#define SCOPE_ACT_STOP 0U
+#define SCOPE_ACT_START 1U
+#define SCOPE_ACT_STATUS 2U
+#define SCOPE_ACT_CLOCK 3U
+#define SCOPE_ACT_TRIGGER 4U      /* v2：探针侧触发，当前主机侧触发已够用 */
+#define SCOPE_ACT_CONFIG 7U
+#define SCOPE_ACT_BENCH 8U
+#define SCOPE_ACT_BENCH_RESULT 9U
 
 #define PARAM_MAGIC_NUMBER (0x0D000721UL)
 /* EasyFlash ENV key that stores the whole api_param_t blob. */
@@ -225,10 +243,12 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
                             ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24);
             uint32_t size = (uint32_t)req_hid[8] | ((uint32_t)req_hid[9] << 8) |
                             ((uint32_t)req_hid[10] << 16) | ((uint32_t)req_hid[11] << 24);
+            scope_sampler_stop();      /* 采样器与桥都要独占 SWD，只能开一个 */
             rtt_bridge_request_start(addr, size, req_hid[12]);
             break;
         }
         case RTT_ACT_AUTOSTART:
+            scope_sampler_stop();
             rtt_bridge_request_start(0U, 0U, 0U);
             break;
         case RTT_ACT_RAW_DAP:
@@ -400,6 +420,97 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
         res_hid[1] = 0x01;
         res_hid[2] = CMD_SAVE_CONFIG;
         break;
+    case CMD_SCOPE:
+    {
+        /* 探针侧 HSS 采样（J-Scope 波形页）。SWD 只在主循环里碰，这里只登记请求。
+         *
+         * ⚠️ 字节位置的唯一依据是网页侧（web-serial-rtt-tools/app/scope/）：
+         *   · 它 `xfer()` 回来的 res **已经剥掉 Report ID**（`res[1] === cmd`），
+         *     所以网页的 res[i] == 本函数的 res_hid[i + 1]；
+         *   · 启动码读的是 `signed(res[2])`（view.js:356）→ 写 res_hid[3]；
+         *   · 标定结果读的是 `getUint32(3)` 与 `getUint32(7)`（view.js:396）
+         *     → 写 res_hid[4] 与 res_hid[8]。 */
+        uint32_t out[12] = {0};
+
+        switch (req_hid[3])
+        {
+        case SCOPE_ACT_STOP:
+            scope_sampler_stop();
+            break;
+        case SCOPE_ACT_START:
+            rtt_bridge_stop();                 /* 互斥：桥和采样器都要独占 SWD */
+            scope_sampler_request_start();
+            break;
+        case SCOPE_ACT_CLOCK:
+            scope_sampler_set_clock((uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                                    ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24));
+            break;
+        case SCOPE_ACT_CONFIG:
+        {
+            /* data 段：action(1) period_us(4) flags(1) nvars(1) n×(addr4,size1,type1)
+             * 8 个变量 = 55 B，一条 HID 报文（上限 61 B）正好装下。 */
+            uint32_t period = (uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                              ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24);
+            uint8_t flags = req_hid[8];
+            uint8_t n = req_hid[9];
+            scope_var_t vars[SCOPE_MAX_VARS];
+
+            if (n > SCOPE_MAX_VARS) { n = SCOPE_MAX_VARS; }
+            for (uint8_t i = 0U; i < n; i++)
+            {
+                const uint8_t *p = &req_hid[10U + (uint16_t)i * 6U];
+                vars[i].addr = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                               ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+                vars[i].size = p[4];
+                vars[i].type = p[5];
+                vars[i].rsv = 0U;
+            }
+            scope_sampler_configure(period, flags, n, vars);
+            break;
+        }
+        case SCOPE_ACT_BENCH:
+            scope_sampler_request_bench((uint32_t)req_hid[4] | ((uint32_t)req_hid[5] << 8) |
+                                        ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24));
+            break;
+        case SCOPE_ACT_BENCH_RESULT:
+        {
+            uint32_t iters = 0U, ticks = 0U;
+            int32_t err = 0;
+
+            if (scope_sampler_bench_result(&iters, &ticks, &err) == 0)
+            {
+                err = -1;                      /* 还没测过 */
+            }
+            res_hid[1] = 1U + 1U + 12U;
+            res_hid[2] = CMD_SCOPE;
+            res_hid[3] = 0U;
+            memcpy(&res_hid[4], &ticks, 4U);
+            memcpy(&res_hid[8], &iters, 4U);
+            memcpy(&res_hid[12], &err, 4U);
+            break;
+        }
+        case SCOPE_ACT_TRIGGER:                    /* v2：探针侧触发，当前只回 OK */
+        case SCOPE_ACT_STATUS:
+        default:
+            break;
+        }
+
+        if (req_hid[3] != SCOPE_ACT_BENCH_RESULT)
+        {
+            (void)scope_sampler_status(out, 12U);
+            res_hid[1] = 1U + 1U + 4U * 12U;
+            res_hid[2] = CMD_SCOPE;
+            res_hid[3] = (uint8_t)(int8_t)scope_sampler_start_result();   /* 网页在 res[2] 读它 */
+            for (uint32_t i = 0U; i < 12U; i++)
+            {
+                res_hid[4U + i * 4U + 0U] = (uint8_t)(out[i] >> 0);
+                res_hid[4U + i * 4U + 1U] = (uint8_t)(out[i] >> 8);
+                res_hid[4U + i * 4U + 2U] = (uint8_t)(out[i] >> 16);
+                res_hid[4U + i * 4U + 3U] = (uint8_t)(out[i] >> 24);
+            }
+        }
+        break;
+    }
     case CMD_RISCV:
     {
         /* Probe-side RISC-V engine (JTAG only). The JTAG bit-bang must not run

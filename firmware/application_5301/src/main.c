@@ -17,6 +17,7 @@
 #include "api_param.h"
 #include "usb_composite.h"
 #include "riscv_svc.h"
+#include "scope_sampler.h"
 #include "led_state.h"
 
 #if BOARD_HAS_USER_KEY_DFU
@@ -84,6 +85,9 @@ int main(void)
         /* Probe-side RTT bridge: polls the target itself (only while the DAP
          * is idle) and forwards the bytes over the CDC. */
         rtt_bridge_poll();
+        /* J-Scope HSS 采样器（探针自己按周期读目标 RAM，走 bulk IN 0x83）。
+         * 与 RTT 桥互斥 —— 两边的 start 分支会互相 stop()。 */
+        scope_sampler_poll();
         /* Probe-side RISC-V engine (JTAG): queued memory access / benchmarks. */
         riscv_svc_poll();
     }

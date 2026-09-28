@@ -294,7 +294,62 @@ Byte[0x03-0x3F] = Command data（可选）
    Byte[0x02] = 0xFF // Command type
    设备复位进入DFU模式，不会回复，此时连接断开
 
-16. 探针侧 RISC-V 引擎指令 0x32（JTAG-only 目标，如 HPM6800EVK / HPM6880）
+16. 探针侧 HSS 采样指令 0x32（J-Scope 波形页的数据源）
+    探针自己按你设的周期，用 SWD 读目标 RAM 里 1~8 个变量（地址来自目标 .elf 的 DWARF），
+    组 512 B 自描述包，从 **interface 0 上原本闲置的 bulk IN `0x83`** 推给主机。
+    目标固件一行都不用改。
+
+    控制面（本命令）与数据面（0x83）的字节布局**必须与网页逐字节一致** —— 权威实现是
+    另一仓库 web-serial-rtt-tools 的 `app/scope/protocol.js` / `view.js`。
+
+    ⚠️ 网页的 `xfer()` 回来时**已经剥掉 Report ID**（`res[1] === cmd`），所以
+       网页的 `res[i]` == 固件里的 `res_hid[i + 1]`。下面按**固件下标**写。
+
+    主机发送 request
+    Byte[0x00] = 0x01 // Report ID
+    Byte[0x01] = 长度
+    Byte[0x02] = 0x32 // Command type
+    Byte[0x03] = action
+    Byte[0x04-0x07] = 参数（周期 us / SWD Hz / 标定轮数）
+    Byte[0x08-0x09] = flags / nvars，变量表从 Byte[0x0A] 起，每个 6 B（addr u32 + size u8 + type u8）
+
+    | action | 含义 | 数据段 |
+    | --- | --- | --- |
+    | 0 | 停止 | — |
+    | 1 | 启动推流（会先 `rtt_bridge_stop()`，两者互斥） | — |
+    | 2 | 查状态 | — |
+    | 3 | 设 SWD 时钟 | `hz(4)`；0 = 不动。走 RTT 桥那套斜坡换挡 |
+    | 4 | 触发配置（v2，当前只回 OK） | — |
+    | 7 | 配置：周期 + 1~8 个变量 | `period_us(4) flags(1) nvars(1) n×(addr4,size1,type1)`，8 个变量 = 55 B |
+    | 8 | 标定：用当前计划空跑 N 次 | `iters(4)`，结果走 action 9 |
+    | 9 | 取标定结果 | → 见下 |
+
+    type：`0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=f32 7=f64`
+    flags：bit0 允许 60 MHz；bit1 丢弃模式；bit2 触发；bit3 不让路（独占链路）；
+           bit4 SWD 空闲拍压到 0（`DAP_Data.clock_delay=0`）
+
+    响应：Byte[0x01] = 长度，Byte[0x02] = 0x32，**Byte[0x03] = 启动码**（网页读 `res[2]`，
+    -100 = 排队中，0 = 正常，-1/-2/-3/-4 见 scopeRcText），Byte[0x04..0x33] = 12 个状态字。
+
+    action=9 时前 3 个字换成标定结果：**Byte[0x04..07] = ticks（24 MHz）、
+    Byte[0x08..0B] = iters、Byte[0x0C..0F] = err**（网页读 `res[3]` / `res[7]`）。
+    每样本真实耗时 = ticks / 24 / iters（µs）。
+
+    状态字：w0 = running | spans<<8 | swdReady<<16 | nvars<<24；w1 = 实际 SWD Hz；
+    w2 = 采到的样本数；w3 = 丢样本数（跳拍 + 无缓冲）；w4 = 已推字节低 16 / 无缓冲丢样本高 16；
+    w5 = SWD 读错低 16 / 让路次数高 16；w6 = 最近一包 seq；w7 = 跳拍低 16 / 丢弃模式包数高 16；
+    w8 = 计划哈希（与网页 planHash 同算法，防"配置没生效却在画图"）；
+    w9 = lastCmd | lastRsp<<8 | tx完成回调次数<<16；w10 = startRc；w11 = period | 丢弃位<<16 | MHz<<24。
+
+    数据面（0x83，512 B 定长自描述包）：
+    偏移 0 magic 'JS'(0x4A53) / 2 ver=1 / 3 kind / 4 seq(4) / 8 t_us(4) / 12 n(2) / 14 aux(2) / 16 载荷 496 B
+      kind 1=DEF：`swd_hz(4) period_us(4) flags(2) nvars(1) spans(1)` + n×(addr4,size1,type1)
+      kind 2=DATA：载荷 = n 帧，变量按**地址排序后**紧排、各按自己的 size 小端
+      kind 3=STAT：`produced(4) dropped(4) pkts(4) usb_err(2) swd_err(2) period_actual(4) swd_mhz(1) disc(1)`，每 64 包插一个
+    丢包判定：seq 跳号 / t_us 跳变 / STAT.dropped，三者都要显示，绝不静默。
+
+    收尾顺序（WebUSB 没有取消接口）：**先 HID STOP → 等 100~200 ms → 把在飞的读收干净 → 再 close**。
+17. 探针侧 RISC-V 引擎指令 0x33（原 0x32，让位给上面的 SCOPE）（JTAG-only 目标，如 HPM6800EVK / HPM6880）
     探针自带一套 RISC-V Debug Module 引擎：加载一次 `IR=0x11` 之后，一次 DMI 访问
     就是一次 41 位 DR 扫描（`{op[1:0], data[31:0], addr[6:0]}`），响应滞后一拍，
     所以连续 posted 请求可以一个字一次扫描地流水；块搬运走 DM 的 SBA（硬件自增地址）。
