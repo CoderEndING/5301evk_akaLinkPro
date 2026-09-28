@@ -241,8 +241,11 @@ static uint32_t sba_clear_errors(void)
 
     if ((sbcs & (SBCS_SBBUSYERROR | SBCS_SBERROR)) != 0U)
     {
-        /* write-1-to-clear: sbbusyerror bit 22, sberror field [14:12] */
-        (void)dmi_write(DM_SBCS, sbcs & ~(SBCS_SBBUSYERROR | SBCS_SBERROR));
+        /* sbbusyerror(bit22) / sberror([14:12]) 都是 **写 1 清零**。早先写成
+         * `sbcs & ~bits`（写 0）等于什么都没做，于是第一次出错之后 SBA 永久
+         * 卡在错误态：RTT 桥表现为"搬了一块就再也搬不动"（rderr 每轮必涨、
+         * moves 恒等于 1）。这里保持配置位不变、把错误位写 1。 */
+        (void)dmi_write(DM_SBCS, sbcs | SBCS_SBBUSYERROR | SBCS_SBERROR);
     }
     return sbcs;
 }
@@ -394,7 +397,7 @@ int riscv_jtag_write_word(uint32_t addr, uint32_t val)
  * sbreadondata makes every read of sbdata0 start the next system bus read, so
  * the loop below keeps exactly one read in flight and the DMI pipeline (one
  * deep) supplies the previous word in the same scan. */
-int riscv_jtag_read(uint32_t addr, uint8_t *dst, uint32_t len)
+int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
 {
     uint32_t first;
     uint32_t words;
@@ -432,8 +435,24 @@ int riscv_jtag_read(uint32_t addr, uint8_t *dst, uint32_t len)
 
             if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
             {
-                s_last_sbcs = sba_clear_errors();
-                return -4;
+                /* 目标在跑时 DM 偶发 BUSY：把这一拍重发几次再判死，否则一个
+                 * 1 KB 块会因为一个字整块失败（实测每块必中，搬运几乎停摆）。 */
+                uint32_t ok = 0U;
+
+                for (uint32_t r = 0U; r < 4U; r++)
+                {
+                    resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
+                    if (dmi_resp_op(resp) == DMI_OP_STATUS_SUCCESS)
+                    {
+                        ok = 1U;
+                        break;
+                    }
+                }
+                if (ok == 0U)
+                {
+                    s_last_sbcs = sba_clear_errors();
+                    return -4;
+                }
             }
             out[i] = dmi_resp_data(resp);
         }
@@ -614,4 +633,23 @@ void riscv_jtag_probe(uint32_t n, uint64_t *out)
     /* Leave the port idle again: on the evklite the JTAG pins are the chip's
      * own debug pins, so they must not stay armed when nothing is running. */
     PORT_OFF();
+}
+
+/* 目标 CPU 在跑的时候，SBA 偶发一次非 0 响应（sbbusy/sberror）就把整个 1 KB
+ * 块判死，实测 RTT 桥下每块几乎必中一次 -> 搬运几乎停摆。这里按块重试：
+ * 清掉 sticky 错误再重来，通常第二次就干净。 */
+int riscv_jtag_read(uint32_t addr, uint8_t *dst, uint32_t len)
+{
+    int rc = -4;
+
+    for (uint32_t attempt = 0U; attempt < 3U; attempt++)
+    {
+        rc = riscv_jtag_read_once(addr, dst, len);
+        if (rc == 0)
+        {
+            break;
+        }
+        s_last_sbcs = sba_clear_errors();
+    }
+    return rc;
 }

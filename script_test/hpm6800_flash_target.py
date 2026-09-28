@@ -20,7 +20,9 @@ SCRIPTS = os.path.join(SDK_ENV, "tools", "openocd", "tcl")
 SDK_BOARDS = os.path.join(SDK_ENV, "hpm_sdk", "boards", "openocd")
 CFG = os.path.join(HERE, "openocd_hpm6800evk_dap.cfg")
 
-DEFAULT_IMAGE = os.path.join(HERE, "hpm6800evk_rtt_flood", "build", "flash_xip", "output", "demo.bin")
+# 必须烧 **ELF**：这个 SDK 构建出的 .bin 里 0x1000 处的启动头是全 0（ELF 里有），
+# 烧 .bin 会让 ROM 认不出启动头、PC 停在 boot ROM 不动（实测踩过）。
+DEFAULT_IMAGE = os.path.join(HERE, "hpm6800evk_rtt_flood", "build", "flash_xip", "output", "demo.elf")
 
 
 def main():
@@ -38,12 +40,15 @@ def main():
     cmds = [
         "-c", "init",
         "-c", "halt",
-        "-c", 'flash write_image erase "%s" %s bin' % (img, addr),
-        "-c", 'verify_image "%s" %s bin' % (img, addr),
-        "-c", "mdw 0x1200000 1",
+        # 必须用 ELF：SDK 生成的 .bin 在 0x1000 处的启动头是全 0（ELF 里有），
+        # 烧 .bin 会让 ROM 认不出启动头、PC 停在 boot ROM 不动。ELF 里各段齐全。
+        "-c", 'flash write_image erase "%s"' % img,
+        "-c", "mdw 0x80001000 1",
     ]
     if "--no-reset" not in sys.argv:
-        cmds += ["-c", "reset"]
+        # 用 DM 的 ndmreset（cfg 里 reset_config none），绝不碰 SRST 引脚 ——
+        # 20 针排线第 15 脚是探针自己的 RESET_N。
+        cmds += ["-c", "reset halt", "-c", "reg pc", "-c", "resume"]
 
     args = [OPENOCD, "-s", SCRIPTS, "-s", SDK_BOARDS, "-f", CFG] + cmds
     print("flashing %s -> %s" % (os.path.basename(image), addr))

@@ -61,6 +61,9 @@ void rtt_bridge_trace_dap(const uint8_t *req, const uint8_t *resp);
 void rtt_bridge_request_raw(const uint8_t *req, uint32_t len);
 uint32_t rtt_bridge_raw_result(uint8_t *out, uint32_t max);
 
+/* 目标类型：0 = SWD/ARM，1 = RISC-V（JTAG）。HID CMD_RTT action 10 调用。 */
+void rtt_bridge_set_target(uint32_t kind);
+
 /* Stop bridging (the CDC keeps working as the UART bridge). */
 void rtt_bridge_stop(void);
 

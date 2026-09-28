@@ -142,36 +142,74 @@ bit 循环本身**（其中 10/23 是采样 nop）。要再往上就得压采样
 
 ---
 
-## 5. 阶段四：狂发例程与 RTT 交付率 —— **卡在板子不启动**
+## 5. 阶段四：狂发例程与 RTT 交付率
 
-固件已就绪：`script_test/hpm6800evk_rtt_flood/`（`flash_xip`，RTT 上行 32 KB，
+### 5.1 板子不启动 —— 真因：**`.bin` 里没有启动头**（已解决）
+
+第一次烧进去后 `reset halt` 读到 `PC = 0x2001d4c8`，跑 300 ms 不动 —— CPU 停在
+**boot ROM**，从未跳进应用（`_start = 0x80003000`）。
+
+`readelf`/`objcopy` 逐段对比后定位：
+
+| 文件 | 0x80001000（boot header） | 结果 |
+|---|---|---|
+| `demo.elf` 的 `.boot_header` 段 | `bf109000…`（tag `0x009010BF`，非零）| 正常 |
+| `objcopy -O binary` 出来的 `demo.bin` | **全 0** | **烧了就不启动** |
+
+也就是说**这个 SDK 构建产出的 `.bin` 不含启动头**（用户那份 `work/` 里的
+已知构建同样全 0，所以它大概也从没真正跑起来过）。改成烧 **ELF** 后：
+
+```
+flash write_image erase demo.elf      -> wrote 46712 bytes
+mdw 0x80001000  -> 009010bf ...       启动头进 flash 了
+reset halt ; reg pc -> 0x80003000     ROM 跳进 _start 了
+resume; 500ms; halt
+mdw 0x1240000 -> 47474553 52205245 00005454   "SEGGER RTT" —— 固件在跑
+```
+
+**结论：烧 HPM6800EVK 一律用 ELF，不要用 `.bin`。**
+`script_test/hpm6800_flash_target.py` 已默认走 ELF，并把"复位后 PC"打出来自检。
+
+### 5.2 狂发固件
+
+`script_test/hpm6800evk_rtt_flood/`（`flash_xip`，RTT 上行缓冲 32 KB，
 `BLOCK_IF_FIFO_FULL`，死循环发 `hello world!\n`），
-`_SEGGER_RTT` 落在 **0x01240000**（AXI SRAM，探针可直接读写）。
+`_SEGGER_RTT` 在 **0x01240000**（AXI SRAM，探针可直接读写）。
 
-已确认的：
+> 构建注意：**本地 SDK 的 `drivers/src/hpm_enet_drv.c` 被改过，无条件
+> `#include "trace_log.h"`**，而该头只存在于 `samples/lwip/lwip_tcpecho/src/TRACE_LOG/`，
+> 任何新工程都会因此编不过；本工程把该目录加进 include 路径绕过（没动 SDK）。
 
-- 构建通过（注意：**本地 SDK 的 `drivers/src/hpm_enet_drv.c` 被改过，无条件
-  `#include "trace_log.h"`**，而该头只存在于 `samples/lwip/lwip_tcpecho/src/TRACE_LOG/`，
-  任何新工程都会因此编不过；本工程把它加进 include 路径绕过）；
-- 用本探针烧写成功，**flash 内容与 `.bin` 逐字节一致**；
-- 镜像头 `0100f9fc070000000000000000000000` 与用户自己那份能跑的
-  `work/segger_rtt_printf_test_...` 构建**完全相同**。
+### 5.3 RTT 交付率 —— **未达标，卡在探针侧 SBA 的确定性失败**
 
-**没解决的**：`reset halt` 后 `reg pc = 0x2001d4c8`，跑 300 ms 后**还是同一个值**
-——CPU 停在**boot ROM**里（该地址不属于本工程任何段，`_start = 0x80003000`），
-从未跳进应用；因此 0x1240000 处的 RTT 控制块里没有 `SEGGER RTT` 签名。
+探针侧 RTT 桥已加上 RISC-V 后端（`rtt_bridge_set_target(1)`，HID CMD_RTT
+action 10；`rtt_read_bytes` / RdOff 回写分别走 `riscv_jtag_read` /
+`riscv_jtag_write_word`）。实测（`script_test/hpm6800_rtt_delivery.py COM5 5`）：
 
-下一步要人工确认的（我看不到板子）：
+```
+rc=0                          <- 桥启动成功
+up=0x01240018                 <- 找到了控制块（CB 在 0x01240000）
+host read 0 bytes             <- 主机侧一个字节都没收到
+bridge: drained=2048 polls=54 moves=1 rderr=75 wderr=15
+```
 
-1. **BOOT 跳线**：EVK UG 明确写了 "BOOT1=0，即调整到从 NOR FLASH 启动"，
-   若 BOOT 脚选择的是串口/USB 启动，ROM 就会停在那儿等（与现象一致）；
-2. 板上是否曾跑过有效镜像（`flash write_image erase` 只擦写了前 56 KB）；
-3. 串口（UART0 115200）有没有输出，能直接区分"没启动"和"启动了但崩了"。
+现象是**确定性**的：**第一次搬运成功（2048 B），之后每一次读控制块都失败**
+（`rderr` 每轮必涨、`moves` 恒等于 1）。已经试过三个健壮性修复都**完全没有变化**
+（计数逐字节相同），说明没打在失败点上：
 
-一旦能启动，探针侧 RTT 桥接 RISC-V 后端（把 `rtt_bridge.c` 里的
-`swd_read_memory`/`swd_write_word` 换成 `riscv_jtag_read`/`riscv_jtag_write_word`，
-按 1.19 MB/s 的实测值，交付率应当在 **1.1~1.2 MB/s** 量级，与 SWD 侧
-（2.9 MB/s）同源但受 DMI 41bit/32bit 的固有开销限制）即可收尾。
+1. 块读失败重试 3 次；
+2. 单字 BUSY 重发 4 次；
+3. `sbcs` 的 `sbbusyerror/sberror` 改成 **写 1 清零**（原先写成 `& ~bits` 是错的）。
+
+下一步应该做的（留给下一轮）：
+
+- 在失败点上直接 dump **41 位原始响应**与 `sbcs`/`dmstatus`（`CMD_RISCV` 已有
+  `action 8` 的 DMI 原始扫描入口），先确认失败到底是 DMI `op != 0`、
+  还是 SBA `sbbusyerror`；
+- 顺带查主机侧收不到字节的问题：`s_cdc_src_rtt` 是否真的切过来了、CDC IN
+  是否在 RTT 路径里被启动（SWD 侧同一套代码是通的，所以更可能是 RTT 桥在
+  第一次失败后就再没把数据推进环）；
+- 参考量级：探针侧 SBA 实测 1.18 MB/s（§4），所以交付率上限就在那附近。
 
 ---
 

@@ -27,6 +27,7 @@
 #include "DAP.h"
 #include "cdc_interface.h"
 #include "rtt_bridge.h"
+#include "riscv_jtag.h"
 #include "swd_host.h"   /* ARM DAPLink 官方 SWD 访问层（见 src/swd_host/） */
 #include "hpm_clock_drv.h" /* clock_cpu_delay_ms() */
 
@@ -158,10 +159,34 @@ static void dap_cmd(const uint8_t *req, uint8_t *resp)
 
 /* 单次块读的字节数：见文件头部的 RTT_SWD_CHUNK（默认值），此处用的是运行时值。 */
 
+/* 0 = SWD/ARM（官方 swd_host），1 = RISC-V（JTAG DMI + SBA，见 src/riscv/）。
+ * 目标类型由 HID CMD_RTT action 10 设定；桥本身的逻辑（找控制块、搬环形缓冲、
+ * 回写 RdOff）两边完全一样，只有底下三个原语不同。 */
+static uint8_t s_target;
+
+void rtt_bridge_set_target(uint32_t kind)
+{
+    s_target = (kind != 0U) ? 1U : 0U;
+}
+
+static int rtt_write_word(uint32_t addr, uint32_t val)
+{
+    if (s_target == 1U)
+    {
+        return (riscv_jtag_write_word(addr, val) == 0) ? 0 : -1;
+    }
+    return (swd_write_word(addr, val) == 0U) ? 0 : -1;
+}
+
 /* Load the fast bit-bang blob and set the SWD timing. Uses the DAP command
  * only to reach Set_Clock_Delay(); it performs no SWD traffic. */
 static int rtt_swd_set_clock(uint32_t hz)
 {
+    if (s_target == 1U)
+    {
+        if (hz < 256U) { riscv_jtag_set_delay(hz); }  /* RISC-V: hz 复用为 idle 周期数；SWD 换挡阶梯是百万级数字，不能落到 idle 计数上 */
+        return 0;
+    }
     s_req[0] = ID_DAP_SWJ_Clock;
     s_req[1] = (uint8_t)(hz >> 0);
     s_req[2] = (uint8_t)(hz >> 8);
@@ -180,6 +205,15 @@ static int rtt_swd_set_clock(uint32_t hz)
  * （含一次 nRESET 硬复位）。 */
 static int rtt_swd_init(void)
 {
+    if (s_target == 1U)
+    {
+        /* RISC-V: 没有 SWD 握手，直接开 TAP + 加载 IR=DMI + 唤醒 DM。 */
+        int rc = riscv_jtag_open();
+
+        s_swd_ready = (rc == 0) ? 1U : 0U;
+        return rc;
+    }
+
     uint32_t idcode = 0U;
 
     swd_init();     /* DAP_Setup + PORT_SWD_SETUP + DAP_Data.debug_port = SWD */
@@ -238,7 +272,14 @@ static int rtt_read_bytes(uint32_t addr, uint8_t *dst, uint32_t len)
         {
             n = s_chunk;
         }
-        if (swd_read_memory(addr + done, &dst[done], n) == 0U)
+        if (s_target == 1U)
+        {
+            if (riscv_jtag_read(addr + done, &dst[done], n) != 0)
+            {
+                return -1;
+            }
+        }
+        else if (swd_read_memory(addr + done, &dst[done], n) == 0U)
         {
             return -1;
         }
@@ -316,7 +357,7 @@ static int rtt_poll_once(uint32_t *moved)
      * 目标上了）就会被误判为"没写成功"，两边对不齐 —— 要么丢一段、要么重一段。 */
     if (s_rd_pending_valid)
     {
-        if (swd_write_word(s_up_addr + RTT_UP_RDOFF_OFF, s_rd_pending) == 0U)
+        if (rtt_write_word(s_up_addr + RTT_UP_RDOFF_OFF, s_rd_pending) == 0)
         {
             s_write_err++;
             return -1; /* 下轮再补 */
@@ -393,7 +434,7 @@ static int rtt_poll_once(uint32_t *moved)
     *moved = target;
 
     uint32_t new_rd = (up.rd + target) % up.size;
-    if (swd_write_word(s_up_addr + RTT_UP_RDOFF_OFF, new_rd) == 0U)
+    if (rtt_write_word(s_up_addr + RTT_UP_RDOFF_OFF, new_rd) == 0)
     {
         s_write_err++;
         s_rd_pending = new_rd;

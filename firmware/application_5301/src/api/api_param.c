@@ -57,6 +57,7 @@
 #define RTT_ACT_CONFIG 7U
 #define RTT_ACT_BENCH 8U
 #define RTT_ACT_BENCH_RESULT 9U
+#define RTT_ACT_TARGET 10U
 
 /* Probe-side RISC-V (JTAG) memory engine (see src/riscv/). */
 #define CMD_RISCV (0x32)
@@ -320,6 +321,9 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
             }
             break;
         }
+        case RTT_ACT_TARGET:
+            rtt_bridge_set_target(req_hid[4]);
+            break;
         case RTT_ACT_STATUS:
         default:
             break;
