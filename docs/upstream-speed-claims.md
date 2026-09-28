@@ -194,3 +194,48 @@ openocd.exe -s <sdk>\tools\openocd\tcl -f script_test\openocd_stm32f1_swd.cfg `
 > 另注：**H743 的 flash 版烧不进去**（`flash write algorithm aborted by target`，
 > sdk_env 的 OpenOCD + 最小 cfg 下 H7 flash 算法跑不起来）—— 这正是当初做"全 RAM 版"
 > 的原因，所以"代码在 flash、缓冲在 AXI SRAM"那种布局目前无法在本机验证。
+
+### J-Link 交叉验证：700 KB/s 是**目标侧**天花板（决定性，2026-09-28）
+
+换上 **SEGGER J-Link**（自家参考实现）+ `JLinkRTTLogger.exe`，同一块 H743、同一个
+狂发固件（此时已用 J-Link 把 **flash 版**烧好，代码在 flash、CB+栈在 AXI SRAM）：
+
+| 取数工具 | SWD 速率 | RTT 交付 |
+| --- | --- | --- |
+| J-Link + JLinkRTTLogger | 4 MHz | 290.5 KB/s |
+| J-Link + JLinkRTTLogger | **50 MHz** | **692.9 KB/s**（logger 自报 686~709） |
+| **本探针的 RTT→CDC 桥** | 45 MHz | 676.9 ~ 724.4 KB/s |
+| （对照）本探针桥测 **F103ZET6** | 45 MHz | **2486 KB/s** |
+
+**结论：H743 上那 ~700 KB/s 是目标侧的天花板，不是探针的锅。**
+
+1. 两个完全独立的工具（一个是 SEGGER 官方实现，SWD 还更快：50 vs 45 MHz）落在**同一个
+   数字**上；本探针在 45 MHz 就已经打到 SEGGER 50 MHz 的水平。
+2. 这条天花板只是**弱时钟相关**：J-Link 从 4 → 50 MHz（12.5 倍）只把 290 抬到 693 KB/s，
+   明显饱和；而同一块探针在 F103 上从 20 → 60 MHz 是 1379 → 2932 KB/s，**跟着链路走**。
+3. 与"CPU 停住时同一块 AXI SRAM 能读 2686 KB/s"合并看 ⇒ 瓶颈是
+   **"目标 CPU 在跑的时候，调试口读 AXI SRAM"这件事本身**（H7 的总线仲裁/延迟），
+   与取数工具无关。
+
+⇒ 因此 §6 开头那个"未解之谜"已经解开：**探针在这块目标上没有可优化的空间**，
+想在这类目标上把 RTT 拉起来，要动的是目标侧（例如把 CB/环形缓冲挪到
+**D2 SRAM 0x30000000**——它同样能被 AHB-AP 访问，但不在 AXI 那条被 M7 抢的通道上；
+或按 SEGGER 建议用 MPU 把 RTT 缓冲设成 non-cacheable 后开 D-cache）。
+
+> 顺带修好了板子：sdk_env 的 OpenOCD 烧不进去的 H743 flash，**用 J-Link 一次成功**
+> （`loadbin fw.bin, 0x08000000` + `verifybin` ⇒ `O.K.` / `Verify successful`），
+> 比全 RAM 版更适合反复测试（**复位-proof**：全 RAM 版被任何一次 `connect`/复位冲掉）。
+> J-Link 用法备忘：
+> ```
+> device STM32H743VI / si SWD / speed 4000 / connect
+> loadbin "<...>/fw.bin", 0x08000000
+> verifybin "<...>/fw.bin", 0x08000000
+> r / go / exit
+> ```
+> RTT 测速：
+> ```
+> JLinkRTTLogger.exe -Device STM32H743VI -If SWD -Speed 50000 \
+>   -RTTSearchRanges "0x24000000 0x80000" -RTTChannel 0 rtt.txt
+> ```
+> （它在控制台周期性打印 `Transfer rate: … KB/s Data written: … MB`，直接读那一行即可；
+> **别先用 `JLink.exe` 的 `connect` 探测** —— `connect` 默认"复位+halt"，会把全 RAM 版冲掉。）

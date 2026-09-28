@@ -28,6 +28,13 @@ script_test/stm32f103_rtt_speed/_out20k.bin
 # fw.elf / fw.map 是机器生成的大文件，不入库（重跑 build.ps1 即可）
 script_test/stm32f103_rtt_speed/build-*/fw.elf
 script_test/stm32f103_rtt_speed/build-*/fw.map
+# 手工/工具产生的临时文件（RTT 日志、基准落盘、临时测试数据）
+script_test/_rtt_jlink/
+script_test/swd/_h7out.bin
+script_test/swd/_in20k.bin
+script_test/swd/_out20k.bin
+script_test/swd/.bench_*.tcl
+script_test/swd/readback_*.bin
 
 # local reference material (kept out of the repo)
 /webusb_spec.html
