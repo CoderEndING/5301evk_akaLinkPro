@@ -42,6 +42,9 @@ V_PACK = [  # g_pack 那 8 个字段 → 一个 span（24 B，中间有 2 B 填�
     ("i_sq1k", 0x20001022, 2, 3), ("u_cnt",  0x20001024, 1, 0),
     ("i_saw",  0x20001025, 1, 1), ("u_hi",   0x20001028, 4, 4),
 ]
+V_ONE = [   # 单个 u32（g_tick，10 kHz 斜坡）→ 1 字 span，测"最少传输"下的上限
+    ("g_tick", 0x20001044, 4, 4),
+]
 V_CROSS = [  # span A(0x20000000,14B) + span B(0x20001010,56B)：跨 span 的慢路径
     ("g_lfsr",     0x20000000, 4, 4), ("g_far_cnt",  0x20000008, 4, 4),
     ("g_far_sq100", 0x2000000c, 2, 3), ("g_isr_count", 0x20001010, 4, 4),
@@ -183,7 +186,7 @@ class PktStream:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cmd', choices=['status', 'bench', 'run'])
-    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross'])
+    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one'])
     ap.add_argument('--clock', type=int, default=0, help='SWD Hz，0=不动')
     ap.add_argument('--period', type=int, default=100, help='采样周期 us')
     ap.add_argument('--iters', type=int, default=2000)
@@ -191,7 +194,7 @@ def main():
     ap.add_argument('--secs', type=float, default=3.0)
     a = ap.parse_args()
 
-    vars_ = V_PACK if a.vset == 'pack' else V_CROSS
+    vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE}[a.vset]
     dev = open_hid()
 
     if a.clock:
@@ -206,8 +209,8 @@ def main():
     do_config(dev, a.period, vars_, a.flags)
     st = status(dev)
     print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
-          % (len(vars_), a.period, st['spans'], 1 if a.vset == 'pack' else 2))
-    if st['spans'] != (1 if a.vset == 'pack' else 2):
+          % (len(vars_), a.period, st['spans'], (1 if a.vset in ('pack', 'one') else 2)))
+    if st['spans'] != ((1 if a.vset in ('pack', 'one') else 2)):
         print("⚠️ span 数与本地计划不一致 —— 检查合并规则/地址")
 
     if a.cmd == 'bench':
