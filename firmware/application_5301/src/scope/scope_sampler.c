@@ -459,14 +459,24 @@ static int scope_sample_bytes(uint8_t *dst)
     for (uint8_t sp = 0U; sp < s_nspans; sp++)
     {
         const scope_span_t *s = &s_span[sp];
+        uint8_t *fdst = dst + s->frame_off;
+
+        if ((s->direct != 0U) && (((uint32_t)(uintptr_t)fdst & 3U) == 0U))
+        {
+            /* **零拷贝**：span 的字节序 == 帧内布局，且落点 4 字节对齐 —— 直接把 SWD
+             * 读进包里的槽位，连 s_stage 那趟中转都省了。单变量时这是每样本省一次
+             * memcpy（小 memcpy 会真的走函数调用）。落点不对齐就退回下面。 */
+            if (swd_read_block4(s->start, fdst, s->len) == 0U) { return -1; }
+            continue;
+        }
 
         if (scope_read_span(s) != 0) { return -1; }
 
-        if (s->direct)
+        if (s->direct != 0U)
         {
             /* span 的字节序 == 帧内布局：整段搬（24 B 就是 6 个字），这条路仍用 memcpy
              * 划算 —— 一次 24 B 的调用比 6 次展开赋值还省 */
-            memcpy(dst + s->frame_off, s_stage, s->len);
+            memcpy(fdst, s_stage, s->len);
         }
         else
         {
@@ -474,7 +484,8 @@ static int scope_sample_bytes(uint8_t *dst)
             {
                 uint8_t vi = (uint8_t)(s->first + k);
                 uint32_t src = (s_var[vi].addr - s->start);
-                scope_copy_var(dst + s_frame_off[vi], &s_stage[src], s_var[vi].size);
+                scope_copy_var(fdst + (s_frame_off[vi] - s->frame_off), &s_stage[src],
+                               s_var[vi].size);
             }
         }
     }
@@ -492,12 +503,12 @@ static int scope_sample_once(void)
         return 0;
     }
 
-    uint32_t t0 = mchtmr_now();
+    /* 🚨 热路径上**故意不带诊断计时**：每次采样多一次 mchtmr_now()（volatile 读）+
+     * 减法，在 200 kHz 这个量级上是实打实的开销。s_last_sample_ticks 只在标定
+     * （scope_run_bench）里更新，那里不在乎这点开销。 */
     uint8_t *dst = &s_pkt[s_fill_buf][SCOPE_HDR + ((uint32_t)s_fill_n * s_frame_bytes)];
 
     if (scope_sample_bytes(dst) != 0) { return -1; }
-
-    s_last_sample_ticks = mchtmr_now() - t0;
 
     if (s_fill_n == 0U) { s_fill_t0 = s_t_us; }
     s_fill_n++;
@@ -578,6 +589,8 @@ static void scope_run_bench(void)
     s_bench_ticks = mchtmr_now() - t0;
     s_bench_err = err;
     s_bench_valid = 1U;
+    /* 热路径上不再逐拍测这个值（见 scope_sample_once 的说明），标定时补一次 */
+    s_last_sample_ticks = (s_bench_iters != 0U) ? (s_bench_ticks / s_bench_iters) : 0U;
 }
 
 void scope_sampler_poll(void)
