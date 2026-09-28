@@ -4,6 +4,13 @@ own RTT bridge over **JTAG** (RISC-V backend, src/riscv/).
 The probe polls the target's SEGGER RTT control block itself and pushes the
 bytes into the CDC ring, so the host only reads a COM port (no round trips).
 
+Host-side reading is part of the measurement: pyserial's read(n) allocates a
+fresh buffer per call and caps the host at ~2169 KB/s on this project (measured),
+so the loop below uses readinto() into one reused 1 MB buffer - the same pattern
+the SWD-side scripts use. Order matters too: open the port and start reading
+BEFORE ACT_START, otherwise reset_input_buffer() throws away the first chunk the
+bridge pushes.
+
 Usage:
   python hpm6800_rtt_delivery.py [COM5] [seconds] [--addr 0x1240000] [--size 0x2000]
 """
@@ -16,7 +23,7 @@ import hid
 
 VID, PID = 0x0D28, 0x0204
 CMD_RTT = 0x31
-ACT_START, ACT_STATUS, ACT_CONFIG, ACT_TARGET = 1, 2, 7, 10
+ACT_STOP, ACT_START, ACT_STATUS, ACT_CONFIG, ACT_TARGET = 0, 1, 2, 7, 10
 
 CB_ADDR = 0x1240000      # &_SEGGER_RTT (see nm on the flood firmware)
 CB_SIZE = 0x2000
@@ -84,44 +91,39 @@ def main():
     cmd(dev, ACT_TARGET, [1])
     print("2. chunk = 1024 B")
     cmd(dev, ACT_CONFIG, u32(0) + [0x00, 0x04, 0, 0xFF])   # hz=keep, chunk=1024
+    cmd(dev, ACT_STOP)
 
-    # 先把 COM 口打开并把读线程跑起来，**再**启动桥。
-    # 反过来（先 start、后 open+reset_input_buffer）会把桥搬出的第一块数据整个丢掉：
-    # 桥在 ACT_START 返回后一两毫秒内就开始推数据，而 pyserial 的 reset_input_buffer()
-    # 会把驱动里已经缓冲好的字节全部清掉。
+    # 先把 COM 口打开并开始读，**再**启动桥：反过来（先 start、后 open +
+    # reset_input_buffer）会把桥搬出的第一块数据整个丢掉。
     import serial
-    ser = serial.Serial(port, 115200, timeout=0.1)
+    ser = serial.Serial(port, 115200, timeout=0.2)
     ser.reset_input_buffer()
-
-    got = 0
-    stop = threading.Event()
-
-    def drain():
-        nonlocal got
-        while not stop.is_set():
-            got += len(ser.read(65536))
-
-    th = threading.Thread(target=drain, daemon=True)
-    th.start()
 
     print("3. start bridging [0x%08X, +0x%X) channel 0" % (addr, size))
     r = cmd(dev, ACT_START, u32(addr) + u32(size) + [0])
     w = words(r)
     rc = (w[0] >> 16) & 0xFF if w else -1
     print("   rc=%d  (0 = ok; 1 = SWD/JTAG init fail; 3 = control block not found)" % rc)
-    time.sleep(0.3)
-    w = words(cmd(dev, ACT_STATUS))
-    if w:
-        print("   flags=0x%08X cb=0x%08X up=0x%08X" % (w[0], w[1], w[2]))
 
     print("4. draining %s for %.1fs ..." % (port, secs))
-    t0 = time.time()
-    time.sleep(secs)
-    dt = time.time() - t0
-    first = got
-    stop.set()
-    th.join(timeout=1.0)
-    got = first
+    n = 0
+    got = 0
+    rbuf = bytearray(1 << 20)
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < secs:
+        n = ser.readinto(rbuf)
+        if n:
+            got += n
+    dt = time.perf_counter() - t0
+
+    # 先停桥再收尾：生产者停了以后还差的才是真丢包。
+    cmd(dev, ACT_STOP)
+    t1 = time.perf_counter()
+    while time.perf_counter() - t1 < 1.0:
+        n = ser.readinto(rbuf)
+        if n:
+            got += n
+            t1 = time.perf_counter()
     ser.close()
 
     w = words(cmd(dev, ACT_STATUS))

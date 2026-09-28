@@ -291,17 +291,29 @@ RX flush 定时器周期**按波特率动态调整**（目标每次约 512 字�
 | 项 | 基线值 | 复现命令 |
 | --- | --- | --- |
 | **探针写图案读回校验和** | `got 0x08ECD0B4 want 0x08ECD0B4` → **PASS** | `hpm6800_selfcheck.py` |
-| **字节流模式精确** | `pattern exact`，0 丢 0 重 | `hpm6800_rtt_loss.py COM5 10` |
-| 探针侧 SBA 块读 | **1189.5 KB/s**（1024 B × 50） | `hpm6800_riscv.py rbench 0x1200000 1024 50` |
-| 探针侧 SBA 块写 | **1194.8 KB/s** | `hpm6800_riscv.py wbench 0x1200000 1024 50` |
+| **字节流模式精确** | `pattern exact` + `lost=0 dup=0` + `probe-host delta: 0` | `hpm6800_rtt_loss.py COM5 20` |
+| 探针侧 SBA 块读 | **1504.5 KB/s**（1024 B × 50；长跑 2048×64 三次 1505.4/1505.6/1505.8） | `hpm6800_riscv.py rbench 0x1200000 1024 50` |
+| 探针侧 SBA 块写 | **1511.8 KB/s** | `hpm6800_riscv.py wbench 0x1200000 1024 50` |
 | 单字 SBA 读 | 25.6 µs（= 4 次 DMI 扫描/字） | `hpm6800_riscv.py sbench 0x1200000 200` |
-| RTT 交付率 | **1105 ~ 1165 KB/s**，`rderr=0 wderr=0` | `hpm6800_rtt_delivery.py COM5 5` |
+| RTT 交付率 | **1389 KB/s**（20 s / 28.5 MB），`rderr=0 wderr=0` | `hpm6800_rtt_delivery.py COM5 5` |
 | 主机驱动 OpenOCD（`progbuf`） | 写 154.0 / 读 95.9 KB/s | `hpm6800_jtag_bench.tcl` |
 | TAP 身份 | IDCODE `0x1000563D`、DTMCS `0x00007071`、DMSTATUS `0x00400CA2` | `hpm6800_riscv.py status` |
 | 目标启动自检 | `0x80001000`=`009010BF`、复位后 PC=`0x80003000`、`0x1240000`=`"SEGGER RTT"` | `hpm6800_flash_target.py` |
-| 有效 TCK 频率 | **16.4 MHz**（54 TCK/字 × 304,512 字/秒），规格上限 25 MHz | 由 rbench 反推 |
+| 有效 TCK 频率 | **~20.7 MHz**（54 TCK/字 × 1504.5 KB/s ÷ 4），规格上限 25 MHz | 由 rbench 反推 |
 
-固件侧时序常量（**这三个都已验证是最小值，别再减**）：
-`DMI_CAP_HIGH_NOP=8`、`DMI_NAV_LOW_NOP=8`、`DMI_NAV_HIGH_NOP=8`，运行时 `idle=8`。
-判定依据：nav 4/4 → 自检 FAIL（读回全 0）；idle 6 → 只跑得动 6/50 轮就死；cap ≤6 → 自检 FAIL。
+固件侧时序常量（**四个都已验证是最小值，别再减**）：
+
+| 常量 | 现值 | 减一档会怎样 |
+| --- | --- | --- |
+| `DMI_NAV_LOW_NOP` | 6 | **4 → 自检 FAIL，读回全 0**（TMS 建立不够） |
+| `DMI_NAV_HIGH_NOP` | 4 | 4 通过（配合 `NAV_LOW=8` 时的 4/4 曾 FAIL ⇒ 卡的是 LOW 不是 HIGH） |
+| `DMI_TCK_LOW_NOP` | 4 | **2 → 自检 FAIL，校验和 `0x11D9A168`**（TCK 低电平太窄） |
+| `DMI_CAP_HIGH_NOP` | 1 | **0 → 自检 FAIL**（采样点不够；TDI 预置后已垫了 8 条指令，补 1 拍正好） |
+| `idle`（运行时） | 8 | **6 → 只跑得动 6/50 轮就死**；≤4 → `moved=0`（DMI 完全不应答） |
+
+> ⚠️ 这套时序改起来最坑的一条：45M 汇编的 `andi t4, a4, JTDI_OFFSET` 看着能把
+> "取位 + 移位"合成一条，但那只在 **TDI 流已预先左移过 `JTDI_SHIFT`** 的代码里成立。
+> 套到 DMI 那边（`\in` 是原始请求寄存器、bit0 才是当前位）会去取 `bit[JTDI_SHIFT]`，
+> 于是整串请求被移成 0（`op=NOP`）—— **基准照跑、rderr/wderr 全 0、idcode/dtmcs 也对，
+> 只有自检能抓到读回全 0**。这就是自检必须当门禁的原因。
 

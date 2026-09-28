@@ -5,8 +5,13 @@ loop. Any dropped byte shifts the pattern, so a received stream that is an exact
 repetition of that record proves the delivery is byte-exact - a stronger claim
 than "the counters say so".
 
-Also cross-checks the probe's own drain counter against the host byte count, so
-the USB/CDC hop is covered too.
+Host-side reading matters as much as the probe side: pyserial's read(n) allocates
+a fresh buffer per call and caps the host at ~2169 KB/s (measured on this
+project), which at the rates this bridge reaches shows up as *host-side* byte
+loss while the probe still reports rderr=0/wderr=0. So: readinto() into one
+reused 1 MB buffer, and after the measuring window stop the bridge FIRST and only
+then drain the tail - with the producer stopped, whatever is still missing is
+real loss, not buffering.
 
 Usage: python hpm6800_rtt_loss.py [COM5] [seconds]
 """
@@ -70,6 +75,24 @@ def u32(v):
     return [v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]
 
 
+def stream_report(body):
+    """Walk the pattern record by record. A next occurrence that is not exactly
+    one record away is a gap (dropped bytes) or an overlap (duplicated bytes)."""
+    pos, n, lost, dup = 0, 0, 0, 0
+    while True:
+        j = body.find(PAT, pos)
+        if j < 0:
+            break
+        d = j - pos
+        if d > 0:
+            lost += d
+        elif d < 0:
+            dup += -d
+        pos = j + len(PAT)
+        n += 1
+    return n, lost, dup, len(body) - pos
+
+
 def main():
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     port = argv[0] if argv else "COM5"
@@ -80,63 +103,60 @@ def main():
     cmd(dev, ACT_CONFIG, u32(0) + [0x00, 0x04, 0, 0xFF])   # chunk 1024 B
     cmd(dev, ACT_STOP)
 
-    ser = serial.Serial(port, 115200, timeout=0.05)
+    ser = serial.Serial(port, 115200, timeout=0.2)
     ser.reset_input_buffer()
-
-    buf = bytearray()
-    stop = threading.Event()
-
-    def drain():
-        while not stop.is_set():
-            buf.extend(ser.read(65536))
-
-    th = threading.Thread(target=drain, daemon=True)
-    th.start()
 
     r = cmd(dev, ACT_START, u32(CB_ADDR) + u32(CB_SIZE) + [0])
     w = words(r)
-    rc = (w[0] >> 16) & 0xFF if w else -1
-    print("bridge rc=%d, draining %s for %.1fs ..." % (rc, port, secs))
+    print("bridge rc=%d, draining %s for %.1fs ..."
+          % (((w[0] >> 16) & 0xFF) if w else -1, port, secs))
 
-    t0 = time.time()
-    time.sleep(secs)
-    dt = time.time() - t0
-    stop.set()
-    th.join(timeout=2.0)
+    buf = bytearray()
+    rbuf = bytearray(1 << 20)
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < secs:
+        n = ser.readinto(rbuf)
+        if n:
+            buf += rbuf[:n]
+    dt = time.perf_counter() - t0
+
+    # Stop the producer first, then collect the tail: with the bridge stopped,
+    # whatever the host is still missing after this is real loss, not buffering.
+    cmd(dev, ACT_STOP)
+    t1 = time.perf_counter()
+    while time.perf_counter() - t1 < 1.0:
+        n = ser.readinto(rbuf)
+        if n:
+            buf += rbuf[:n]
+            t1 = time.perf_counter()
     ser.close()
 
     w = words(cmd(dev, ACT_STATUS))
-    cmd(dev, ACT_STOP)
-
     got = len(buf)
     print("host received   %d bytes in %.3fs -> %.1f KB/s" % (got, dt, got / dt / 1024.0))
     if w:
-        drained, polls, moves = w[3], w[4] & 0xFFFF, w[4] >> 16
-        rderr, wderr = w[5] & 0xFFFF, w[5] >> 16
         print("probe drained   %d bytes (polls=%d moves=%d rderr=%d wderr=%d zips=%d)"
-              % (drained, polls, moves, rderr, wderr, w[6] >> 16))
-        print("probe->host loss: %d bytes" % (drained - got))
+              % (w[3], w[4] & 0xFFFF, w[4] >> 16, w[5] & 0xFFFF, w[5] >> 16, w[6] >> 16))
+        print("probe-host delta: %d bytes (+ = probe drained more, tail in flight)"
+              % (w[3] - got))
 
-    # Stream check: locate the first record boundary, then it must repeat exactly.
     i = buf.find(PAT)
     if i < 0:
         print("FAIL: pattern never found in %d bytes: %r" % (got, bytes(buf[:64])))
         return 1
     body = bytes(buf[i:])
-    n = len(body) // len(PAT)
-    rem = len(body) % len(PAT)
-    exp = PAT * n
-    if body[:n * len(PAT)] != exp:
-        bad = next(k for k in range(len(exp)) if body[k] != exp[k])
-        print("FAIL: stream diverges at offset %d (record %d, byte %d): %r"
-              % (bad, bad // len(PAT), bad % len(PAT), bytes(body[bad:bad + 32])))
+    n, lost, dup, tail = stream_report(body)
+    print("records=%d lost=%d dup=%d tail=%d (banner skipped: %d)"
+          % (n, lost, dup, tail, i))
+    if lost or dup:
+        print("FAIL: stream is not a clean repetition (%d bytes lost, %d duplicated)"
+              % (lost, dup))
         return 1
-    print("stream check OK: %d complete records + %d trailing bytes, pattern exact"
-          % (n, rem))
-    print("banner bytes skipped before first record: %d" % i)
+    print("stream check OK: pattern exact - %d bytes, 0 lost, 0 duplicated"
+          % (n * len(PAT)))
     return 0
 
 
 if __name__ == "__main__":
-    watchdog(120)
+    watchdog(180)
     sys.exit(main())

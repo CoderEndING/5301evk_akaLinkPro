@@ -33,9 +33,10 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
   切 60 MHz 档：**2954 KB/s（2.89 MB/s）** —— 比主机轮询上限（1140 KB/s）快 **2.6 倍**。
   详见 [探针侧 RTT→CDC 桥](#探针侧-rttcdc-桥)。
 - **支持 RISC-V 目标（JTAG-only，HID `CMD_RISCV` 0x32）**：新增探针侧 RISC-V
-  Debug Module 引擎（DMI + SBA，`src/riscv/` + 专用 DMI 扫描汇编）。调 HPM6800EVK
-  （HPM6880）实测 SRAM 读 **1189.5 KB/s**、写 **1195.3 KB/s**，比主机驱动 OpenOCD
-  快 **9 倍**；RTT 交付 **1105~1165 KB/s 且字节级零丢包**。
+  Debug Module 引擎（DMI + SBA，`src/riscv/` + 专用 DMI 扫描汇编，TDI 预置 + 循环
+  展开）。调 HPM6800EVK（HPM6880）实测 SRAM 读 **1504.5 KB/s**、写 **1511.8 KB/s**，
+  比主机驱动 OpenOCD 快 **9 倍**；RTT 交付 **1385 KB/s 且字节级零丢包**（28.5 MB
+  不丢不重），有效 TCK 20.7 MHz（目标规格上限 25 MHz）。
   详见 [HPM6800EVK（HPM6880，RISC-V）目标调试](#hpm6800evkhpm6880risc-v目标调试)。
 - **DFU/MSC Bootloader**：长按 USER 键进 DFU，虚拟 U 盘 `AKALINKPRO` 拖入 `.bin` 即升级；
   APP 带签名 + 长度 + CRC32 校验，校验失败停在 DFU。
@@ -264,8 +265,8 @@ USB 批量端点）—— 比链路天花板低一档，但**不是因为"每趟
 细节在 [`docs/hpm6800evk-jtag.md`](docs/hpm6800evk-jtag.md)。
 
 一句话结论：主机驱动下每个 abstract command 要一个 USB 往返（97 µs），读速
-95.9 KB/s；把搬运下沉进探针固件后 **1189.5 KB/s（9 倍）**，RTT 交付
-**1105~1165 KB/s 且字节级零丢包**。
+95.9 KB/s；把搬运下沉进探针固件后 **1504.5 KB/s（9 倍）**，RTT 交付
+**1385 KB/s 且字节级零丢包**（28.5 MB，0 丢 0 重）。
 
 ### SEGGER RTT 吞吐：从 919 KB/s 到 2.9 MB/s
 
@@ -394,7 +395,7 @@ python script_test\hpm6800_flash_target.py     :: 默认就是狂发固件 ELF�
 | OpenOCD `progbuf` 后端（三个后端里最好） | 154.0 KB/s | 95.9 KB/s |
 | OpenOCD `sba` 后端 | 87.0 | 85.3 |
 | OpenOCD `abstract` 后端 | 14.5 | 14.4 |
-| **探针侧 DMI/SBA 引擎**（新增 `src/riscv/`） | **1195.3 KB/s** | **1189.5 KB/s** |
+| **探针侧 DMI/SBA 引擎**（新增 `src/riscv/`） | **1511.8 KB/s** | **1504.5 KB/s** |
 
 差 9 倍的原因是**往返**：主机驱动下每个 abstract command（最多 4 个字）就要一次
 USB 往返（实测 **97 µs**），而 40 µs/字的读速正好等于这个往返 —— 测出来就是
@@ -409,9 +410,9 @@ USB 往返（实测 **97 µs**），而 40 µs/字的读速正好等于这个往
 > `JTAG_Sequence_GPIO_ASM_45M`，且与上游 `akkako/akaLinkPro` **逐指令相同**（只差
 > 引脚参数化）。真正的差距是 SWD 那套是 **6 周期/bit**，JTAG 这份是 **19 周期/bit**。
 > 本次另写了专用 DMI 扫描汇编 `JTAG_DP_GPIO_ASM_DMI.S`（一次访问收进一个函数、
-> 41 位请求在寄存器里移位），把探针侧从 954 → **1189/1195 KB/s**。
+> 41 位请求在寄存器里移位），把探针侧从 954 一路做到 **1504/1512 KB/s**（见下一节）。
 
-### RTT 交付率：**1105 ~ 1165 KB/s，字节级零丢包**
+### RTT 交付率：**1385 KB/s，字节级零丢包**
 
 狂发固件在 `script_test/hpm6800evk_rtt_flood/`（`flash_xip`，RTT 上行 32 KB，
 `BLOCK_IF_FIFO_FULL`，死循环发 `hello world!\n`），控制块 `_SEGGER_RTT` 在
@@ -419,56 +420,71 @@ USB 往返（实测 **97 µs**），而 40 µs/字的读速正好等于这个往
 
 ```bat
 python script_test\hpm6800_rtt_delivery.py COM5 5     :: 交付率
-python script_test\hpm6800_rtt_loss.py COM5 10        :: 字节流丢包校验
+python script_test\hpm6800_rtt_loss.py COM5 20        :: 字节流丢包校验
 ```
 
 ```
-host read 5963776 bytes in 5.00s -> 1164.7 KB/s
-bridge: drained=6017024 bytes, polls=2939, moves=2938, rderr=0, wderr=0
+host read 7208960 bytes in 5.08s -> 1385.0 KB/s
+bridge: drained=7211008 bytes, polls=3521, moves=3521, rderr=0, wderr=0
 
-host received   11341824 bytes in 10.000s -> 1107.6 KB/s
-stream check OK: 872447 complete records + 4 trailing bytes, pattern exact
+host received   28516352 bytes in 20.046s -> 1389.2 KB/s
+probe drained   28516352 bytes (polls=13924 moves=13924 rderr=0 wderr=0 zips=0)
+probe-host delta: 0 bytes
+records=2193565 lost=0 dup=0
 ```
 
 狂发固件写的是**固定 13 字节记录**，丢一个字节模式必然错位 —— 所以
-"872447 条完整记录、模式精确复现"比计数器更能说明问题：**11.3 MB 不丢不重**。
-速率贴着探针侧 SBA 的 1.19 MB/s 天花板，CDC/USB 那一跳不是瓶颈。
+"2193565 条完整记录、0 丢 0 重、probe-host delta 恰好 0"比计数器更能说明问题：
+**28.5 MB 一个字节不差**。
 
-> 这里踩过一个**跨后端适配层**的坑，很有代表性：`rtt_write_word()` 的两个后端
+> ⚠️ **测交付率时主机侧读法同样决定结果**：pyserial 的 `ser.read(n)` 每次新分配
+> 缓冲，实测把主机侧压到 ~2169 KB/s；交付率一高就变成"主机侧丢字节"的假象
+> （探针 `rderr/wderr` 全是 0，流里却少几个字节）。本项目所有测速脚本一律用
+> `readinto()` + 复用同一个 1 MB 缓冲，并且**先停桥再收尾巴** —— 生产者停了以后
+> 还缺的才算真丢包。
+
+> 还踩过一个**跨后端适配层**的坑，很有代表性：`rtt_write_word()` 的两个后端
 > 成功/失败方向相反（`swd_write_word()` 1 = 成功，`riscv_jtag_write_word()` 0 = 成功），
 > RISC-V 分支忘了取反 ⇒ **回写 RdOff 成功被判成失败**，桥搬完第一块 2048 B 就永久
 > 卡在"幂等补写"分支里打转，连控制块都不再读。它不报错、不崩，只表现为"速率是 0"。
 > 定位过程（靠 `s_write_err` 在涨、`s_rd_pend_v` 却是 0 这对矛盾读数）见文档 §5.3。
 
-### TCK 频率：现在 16.4 MHz，规格上限 25 MHz
+### TCK 频率：从 16.4 MHz 提到 20.7 MHz，规格上限 25 MHz
 
-```
-一次 DMI 访问 = idle(8) + 导航(5) + 移位(41) = 54 TCK
-1189.5 KB/s = 304,512 字/秒  →  TCK = 16.4 MHz
-```
+一次 DMI 访问 = `idle(8) + 导航(5) + 移位(41)` = **54 TCK**，所以吞吐直接由"每 bit
+多少拍"决定：
 
-**HPM6800EVK 侧 JTAG TCK 规格上限是 25 MHz**，所以 16.4 MHz 合规，还有 1.5 倍空间
-没吃满 —— 现在卡的是**探针 CPU 的每 bit 周期数**，不是目标、也不是协议。按 54 TCK/字
-算，25 MHz 下的理论上限是 **1.85 MB/s**，当前的 1.19 MB/s 是它的 64%。
+| 版本 | 每 bit 结构 | 读 | 有效 TCK |
+| --- | --- | --- | --- |
+| 初版专用汇编 | 低相位 8 条指令专等 TDI 建立 + 高相位 8 拍 nop 等 TDO | 1189.5 KB/s | 16.4 MHz（上限的 66%） |
+| **TDI 预置 + 循环展开**（现行） | 低相位只剩 `sw DO_CLR`，TDI 提前到上一位的高相位摆好 | **1504.5 KB/s** | **20.7 MHz（83%）** |
 
-三个时序旋钮**都已经在最小值上**（每一点都用自检判死活：`hpm6800_selfcheck.py` 会
-写已知图案再读回比对校验和）：
+关键点是：**TCK 已经是高的时候，把 `DO_VAL` 写成 `TCK|TDI` 只是改 TDI 电平、
+不产生任何边沿**。所以"给下一位摆 TDI"可以提前到上一位的高相位去做，低相位就
+退化成一条 store，只受目标最小 TCK 低电平宽度约束（实测 4 拍），不再受 TDI 建立
+时间约束（那正是旧结构低相位那 8 拍的来源）。再把整个 32 位位移循环展开，每条位
+又省下 `addi`+`bnez` 两拍。
 
-| 旋钮 | 默认 | 实测 |
+按 54 TCK/字算，25 MHz 下的理论上限是 **1.85 MB/s**，当前 1.5 MB/s 是它的 81%。
+剩下的空间在**导航相位**（13 个导航/idle 时钟 × 每个约 10 拍）：用同一招把 TMS 也
+提前摆好，理论上还能再要百分之十几。
+
+四个时序旋钮**都已经在最小值上**（每一点都用自检判死活 —— `hpm6800_selfcheck.py`
+写已知图案再读回比对校验和，PASS 才算数）：
+
+| 旋钮 | 现值 | 上界判据 |
 | --- | --- | --- |
-| `DMI_NAV_LOW/HIGH_NOP`（编译期） | 8 / 8 | **4/4 直接 FAIL**，读回全 0（TMS/TDI 建立时间不够） |
+| `DMI_NAV_LOW_NOP` | 6 | **4 → FAIL，读回全 0**（TMS 建立不够） |
+| `DMI_NAV_HIGH_NOP` | 4 | 4 通过（配合 `NAV_LOW=8` 时的 4/4 曾 FAIL，说明卡的是 LOW） |
+| `DMI_TCK_LOW_NOP` | 4 | **2 → FAIL，校验和 `0x11D9A168`**（TCK 低电平太窄） |
+| `DMI_CAP_HIGH_NOP` | 1 | **0 → FAIL**（采样点不够；TDI 预置后已有 8 条指令垫底，补 1 拍正好） |
 | `idle`（运行时 `hpm6800_riscv.py delay <n>`） | 8 | **6 只跑得动 6/50 轮就死**；≤4 立刻不应答 |
-| `DMI_CAP_HIGH_NOP`（编译期，TDO 采样点） | 8 | ≤6 自检 FAIL |
 
-试过一次提速改造：把"整理上一拍 TDO"的 4 条指令从低相位搬进高相位死等，速率
-**1190 → 1386 KB/s（+16%）**，但自检**恒定失败**，且 cap=4 与 cap=6 拿到**逐字节
-相同的错误校验和** ⇒ 确定性的逻辑错而非余量不足：重排后 TCK 拉低到拉高之间只剩
-一条指令（约 5 ns），**TDI 建立时间不够**，目标每一位采到的都是上一位。已回退。
-
-⇒ **结论：低相位（TDI/TMS 建立）和高相位（TDO 往返）各需 ~8 拍，这个结构下 TCK
-周期下限就是 18 拍。** 剩下的唯一一条路：在上一位的高相位里用 `DO_SET`/`DO_CLR`
-预置下一位的 TDI，让低相位退化成"只拉低 TCK"，两相位各 ~8 拍（约 44 ns）
-≈ **22.7 MHz**，逼近 25 MHz 上限，**理论收益 ~+39%**。
+> ⚠️ 改这段汇编时最坑的一条：45M 汇编里 `andi t4, a4, JTDI_OFFSET` 看着能把
+> "取位 + 移位"合成一条，但那只在 **TDI 流已经预先左移过 `JTDI_SHIFT`** 的代码里
+> 成立。套到这里（`\in` 是原始请求寄存器、bit0 才是当前位）会去取
+> `bit[JTDI_SHIFT]`，于是请求被整串移成 0（`op=NOP`）—— **基准照跑、计数器全干净、
+> idcode/dtmcs 也还是对的，只有自检能抓到读回全 0**。这就是自检必须当门禁的原因。
 
 ### 复现清单
 

@@ -129,30 +129,21 @@ TDO 一拍流水采样。替代原来"6 次 `JTAG_Sequence` 调用 + C 侧打包
 | 实现 | 写 | 读 |
 |---|---|---|
 | 慢路径（C `jtag_seq` 拼 6 次调用） | 957.4 KB/s | 954.5 KB/s |
-| **专用 DMI 汇编（cap=8/nav=8）** | **1195.3 KB/s** | **1181.6 KB/s** |
+| 专用 DMI 汇编（cap=8/nav=8，初版） | 1195.3 KB/s | 1181.6 KB/s |
+| **专用 DMI 汇编 + TDI 预置 + 循环展开（现行）** | **1511.8 KB/s** | **1504.5 KB/s** |
 | 主机驱动 OpenOCD（最好后端） | 154.0 | 95.9 |
 
-单字 SBA 读 25.6 µs（4 次 DMI 扫描）。
+单字 SBA 读 25.6 µs（4 次 DMI 扫描）。现行配置相对初版 **+26.5%**，见下面
+「TDI 预置」一节。
 
 **教训**：一次 DMI 访问 54 个 TCK（41 移位 + 5 导航 + 8 idle），按 360 MHz 主频、
-每 bit 约 23 周期算 ≈ 3.4 µs，和实测 3.4 µs/字吻合——所以现在**瓶颈回到了
-bit 循环本身**（其中 10/23 是采样 nop）。要再往上就得压采样点或减少每 bit 指令数，
-而这受限于电平转换往返延迟，只能实测。有完整性自检脚本兜底：
-`script_test/hpm6800_selfcheck.py`（探针写已知图案再读回比对校验和，PASS 才算数）。
+每 bit 约 23 周期算 ≈ 3.4 µs，和实测 3.4 µs/字吻合——所以**瓶颈就是每 bit 多少拍**，
+不是协议也不是目标。有完整性自检脚本兜底：`script_test/hpm6800_selfcheck.py`
+（探针写已知图案再读回比对校验和，PASS 才算数）—— 后面所有提速都是在它卡着做的。
 
-#### 时序余量实测：**三个 nop 旋钮都已经在最小值上**（2026-09-28 扫过）
+### 提速：TDI 预置 + 循环展开（**1504.5 KB/s，+26.5%**）
 
-不是"保守值",是真的不能减 —— 每一点都用自检（写图案读回校验和）判死活：
-
-| 旋钮 | 默认 | 实测 |
-|---|---|---|
-| `DMI_NAV_LOW_NOP` / `DMI_NAV_HIGH_NOP`（编译期） | 8 / 8 | **4/4 直接 FAIL**：`write+readback checksum: got 0x00000000 want 0x08ECD0B4` —— 读回全 0。TMS/TDI 与 TCK 拉低写在同一拍，低电平相位不够就采到旧 TMS |
-| `idle`（运行时 `hpm6800_riscv.py delay <n>`） | 8 | **6 只跑得动 6/50 轮就死**（`moved=6144 iters=6`，短程速率 1216.9 KB/s 是假象）；4/2/1/0 立刻 `moved=0`（DMI 完全不应答）。只有 ≥7 稳 |
-
-也就是说 nav 的 8 拍和 idle 的 8 拍都是**真需求**，能再挖的只剩移位循环的每 bit
-指令数（当前 20 条/bit，理论上还有几个周期的空间），收益个位数百分比。
-
-#### 把每 bit 拍数换算成 TCK 频率：现在 16.3 MHz，目标上限 25 MHz
+#### 先把"每 bit 拍数"换算成 TCK 频率：16.4 MHz，而规格上限是 25 MHz
 
 HPM6800EVK 侧 **JTAG TCK 最快 25 MHz**（器件规格）。按引擎的 TCK 开销反推：
 
@@ -162,14 +153,13 @@ HPM6800EVK 侧 **JTAG TCK 最快 25 MHz**（器件规格）。按引擎的 TCK �
 TCK = 304512 × 54 = 16.4 MHz
 ```
 
-**16.4 MHz < 25 MHz，合规，而且还有 1.5 倍空间没吃满** —— 所以现在卡的不是目标、
-也不是协议，而是探针 CPU 的每 bit 周期数（360 MHz / 18 拍 ≈ 20 MHz 量级）。
-按 54 TCK/字算，25 MHz 下的理论上限是 **1.85 MB/s**，现在的 1.19 MB/s 是它的 64%。
+**16.4 MHz 只有上限的 66%** ⇒ 还有 1.5 倍空间没吃满，卡的完全是自己。
+按 54 TCK/字算，25 MHz 下的理论上限是 **1.85 MB/s**。
 
-#### 试过把簿记搬进死等：+16% 但**自检恒定失败**（已回退）
+#### 第一步（失败但有信息量）：只把簿记从低相位搬进高相位死等
 
-移位宏里"整理上一拍 TDO"的 4 条指令原本压在低相位，而高相位那 8 拍纯 nop 在等
-TDO 往返。把它们换个位置（低相位只剩"取 TDI + 拉低"），周期从 18 拍降到 14 拍：
+低相位原本有 8 条指令专等 TDI 建立，高相位有 8 拍纯 nop 等 TDO 往返。把"整理
+上一拍 TDO"的 4 条指令搬进死等，周期 18 → 14 拍：
 
 | 版本 | 读 | 自检 |
 |---|---|---|
@@ -177,16 +167,70 @@ TDO 往返。把它们换个位置（低相位只剩"取 TDI + 拉低"），周�
 | 重排 + cap=4 | **1384.6 KB/s** | FAIL，校验和 `0x11D9A168` |
 | 重排 + cap=6 | 1281.9 KB/s | FAIL，**同一个** `0x11D9A168` |
 
-两次不同 cap 拿到**逐字节相同的错误校验和**，说明是确定性的逻辑错、不是余量不足：
+两次不同 cap 拿到**逐字节相同的错误校验和** ⇒ 确定性的逻辑错、不是余量不足：
 重排后 TCK 拉低到拉高之间只剩一条 `srli`（约 2 拍 ≈ 5 ns），**TDI 建立时间不够**，
-目标每一位采到的都是上一位。
+目标每一位采到的都是上一位。**光搬簿记没用** —— 低相位那 8 拍是在等 TDI，不是在
+等指令。
 
-**结论：低相位（TDI/TMS 建立）和高相位（TDO 往返）各需 ~8 拍，这个结构下
-TCK 周期下限就是 18 拍。** 要再往上只剩一条路：**在上一位的高相位里就用
-`DO_SET`/`DO_CLR` 把下一位的 TDI 摆好**，低相位退化成"只拉低 TCK"一次写 ——
-这样两相位各 ~8 拍（约 44 ns）≈ 22.7 MHz，逼近 25 MHz 规格上限，理论收益 ~+39%。
-代价是每位要多一次条件性的 set/clr 写（`DO_SET`/`DO_CLR` 选地址），簿记更绕，
-必须靠 `hpm6800_selfcheck.py` 卡死才能动。
+#### 第二步（成功）：把 TDI 摆到**上一位的高相位**去
+
+关键是：TCK 已经是高的时候，把 `DO_VAL` 写成 `TCK|TDI` 只是改 TDI 电平、
+**不产生任何边沿**。所以"给下一位摆 TDI"可以提前到上一位的高相位里做，
+低相位就退化成一条 `sw DO_CLR`，只受目标**最小 TCK 低电平宽度**约束：
+
+```
+低相位:  sw t1, DO_CLR                       # 只拉低 TCK（TDI 早已稳定）  [+ DMI_TCK_LOW_NOP 拍]
+高相位:  sw t1, DO_SET                       # 上升沿
+         bexti/or/rori                       # 整理上一拍采样（在原死等里干活）
+         srli / andi / slli / or / sw        # 摆下一位 TDI（TCK 保持高，无沿）
+         lw                                  # 采样本拍 TDO
+```
+
+再加上**整个 32 位位移循环展开**（每条位省下 `addi`+`bnez` 两拍）。
+
+| 阶段 | 配置 | 读 KB/s | 自检 |
+|---|---|---|---|
+| 初版 | cap=8 / nav=8/8 | 1189.5 | PASS |
+| TDI 预置 + 展开 | cap=1 / tck_low=4 / nav=6 / 4 | **1504.5** | PASS（连测 3 次） |
+| 参照：长跑 2048×64 ×3 | 同上 | 1505.4 / 1505.6 / 1505.8 | 复现性极好 |
+
+**有效 TCK ≈ 20.7 MHz**（1504.5/1189.5 × 16.4），从上限的 66% 提到 **83%**。
+
+#### 翻车记录：`andi t4, \in, JTDI_OFFSET` 不能照抄
+
+45M 汇编里那句 `andi t4, a4, JTDI_OFFSET` 看着能把"取位 + 移位"合成一条，
+但那只在 **TDI 流已经预先左移过 `JTDI_SHIFT`** 的代码里成立（那份的 `a4` 就是
+那种约定）。这里的 `\in` 是原始 DMI 请求寄存器、bit0 才是当前位，套过去会去取
+`bit[JTDI_SHIFT]` —— 于是整个请求被移成全 0（`op=NOP`），**症状极隐蔽**：
+
+```
+自检: got 0x00000000 want 0x08ECD0B4   -> FAIL（读回全 0）
+基准: moved=51200 iters=50 rate=1324.7 KB/s -> "跑得通"、rderr/wderr 全 0
+idcode=0x1000563D dtmcs=0x00007071     -> 还是对的（那条路走 8/8 导航的 C 路径）
+```
+
+基准能跑完、计数器全干净，只有**自检**抓得到 —— 这就是它必须当门禁的原因。
+
+#### 四个时序旋钮的实测边界（**都已经在最小值**，别再减）
+
+| 旋钮 | 现值 | 上界判据 |
+|---|---|---|
+| `DMI_NAV_LOW_NOP` | 6 | **4 → FAIL，读回全 0**（TMS 建立不够；TMS/TDI 与 TCK 拉低同一次 `DO_VAL` 写） |
+| `DMI_NAV_HIGH_NOP` | 4 | 4 通过；配合 `NAV_LOW=8` 时的 4/4 曾 FAIL，说明卡的是 LOW 不是 HIGH |
+| `DMI_TCK_LOW_NOP` | 4 | **2 → FAIL，校验和 `0x11D9A168`**（TCK 低电平太窄）；0 更快但同样 FAIL |
+| `DMI_CAP_HIGH_NOP` | 1 | **0 → FAIL**（采样点不够，上升沿到 `lw` 需 ≥9 拍；TDI 预置后已有 8 条指令垫底，补 1 拍正好） |
+| `idle`（运行时） | 8 | **6 只跑得动 6/50 轮就死**；≤4 立刻 `moved=0`（DMI 完全不应答） |
+
+`DMI_BIT40_HIGH_NOP`（Exit1-DR 那一位）单独用 8：它跑在 `DMI_SHIFT_BIT` 之外，
+序列里没有"顺带干活"的指令，采样延迟只能靠 nop 补，不能跟着 `CAP_HIGH` 一起降。
+
+#### 还能再往上吗
+
+要摸到 25 MHz 得再砍 ~30% 的拍数，剩下的空间在**导航相位**：一次访问 13 个
+导航/idle 时钟 × 每个 ~10 拍 ≈ 130 拍，占总量约 15%。用同一招（把 TMS 也提前到
+上一位的高相位摆好）可以把导航低相位也压到"只拉低 TCK"，理论上还能再要百分之十几。
+但导航路径同时被 idle 循环复用、TMS 取值随状态变，改动比移位路径绕得多 ——
+要做的话同样先用 `hpm6800_selfcheck.py` 卡死。
 
 
 
@@ -230,7 +274,7 @@ mdw 0x1240000 -> 47474553 52205245 00005454   "SEGGER RTT" —— 固件在跑
 > `#include "trace_log.h"`**，而该头只存在于 `samples/lwip/lwip_tcpecho/src/TRACE_LOG/`，
 > 任何新工程都会因此编不过；本工程把该目录加进 include 路径绕过（没动 SDK）。
 
-### 5.3 RTT 交付率 —— **已打通：1109~1165 KB/s，字节级零丢包**
+### 5.3 RTT 交付率 —— **已打通：1389 KB/s，字节级零丢包**
 
 探针侧 RTT 桥的 RISC-V 后端（`rtt_bridge_set_target(1)`，HID CMD_RTT action 10；
 `rtt_read_bytes` / RdOff 回写分别走 `riscv_jtag_read` / `riscv_jtag_write_word`）
@@ -238,22 +282,31 @@ mdw 0x1240000 -> 47474553 52205245 00005454   "SEGGER RTT" —— 固件在跑
 
 ```
 rc=0, cb=0x01240000, up=0x01240018
-host read 5963776 bytes in 5.00s -> 1164.7 KB/s
-bridge: drained=6033408 bytes, polls=2947, moves=2946, rderr=0, wderr=0
+host read 7208960 bytes in 5.08s -> 1385.0 KB/s
+bridge: drained=7211008 bytes, polls=3521, moves=3521, rderr=0, wderr=0
 ```
 
-10 秒长跑 + 字节流校验（`script_test/hpm6800_rtt_loss.py COM5 10`）：
+20 秒长跑 + 字节流校验（`script_test/hpm6800_rtt_loss.py COM5 20`）：
 
 ```
-host received   11358208 bytes in 10.000s -> 1109.1 KB/s
-probe drained   11347968 bytes (polls=5542 moves=5541 rderr=0 wderr=0 zips=0)
-stream check OK: 873708 complete records + 0 trailing bytes, pattern exact
+host received   28516352 bytes in 20.046s -> 1389.2 KB/s
+probe drained   28516352 bytes (polls=13924 moves=13924 rderr=0 wderr=0 zips=0)
+probe-host delta: 0 bytes
+records=2193565 lost=0 dup=0 tail=7
+stream check OK: pattern exact - 28516345 bytes, 0 lost, 0 duplicated
 ```
 
 狂发固件写的是同一条 13 字节记录 `"hello world!\n"`，**丢一个字节模式必然错位**，
-所以"873708 条完整记录、模式精确复现"比计数更能说明问题：**11.36 MB 一个字节
-不丢、不重**。速率贴着探针侧 SBA 的 1.18 MB/s 天花板（§4），CDC/USB 那一跳不是
-瓶颈。
+所以"2193565 条完整记录、0 丢 0 重"比计数更能说明问题：**28.5 MB 一个字节
+不丢、不重**；`probe-host delta: 0` 说明连"探针搬了多少 vs 主机收了多少"都完全对上。
+速率贴着探针侧 SBA 的 1.50 MB/s 天花板（§4，TDI 预置提速后），CDC/USB 那一跳不是瓶颈。
+
+> ⚠️ **主机侧读法同样决定结果**（这一条一开始差点让我误判成"提速把链路搞不稳了"）。
+> 用 pyserial 的 `ser.read(n)` 读：10 秒能过、20 秒就报 `stream diverges`，而探针
+> `rderr/wderr` **全是 0** —— 因为 `read(n)` 每次新分配缓冲，实测把主机侧压到
+> ~2169 KB/s，速率一高就在主机侧丢字节。改成 `readinto()` + 复用同一个 1 MB 缓冲，
+> 并且**先停桥再收尾巴**（生产者停了以后还缺的才算真丢包），立刻干净：
+> `probe-host delta: 0`。项目里所有测速脚本都是这个写法。
 
 #### 真因：`rtt_write_word()` 对 RISC-V 的返回码极性反了
 
@@ -314,10 +367,11 @@ uartrx.in/out   = 0x800/0x800 <- 注意：数据其实已经过 USB 走了
 
 #### 速率上限在哪
 
-探针侧 SBA 块读 1.18 MB/s（§4）就是天花板，交付率已经到它的 98%。再往上只有
-抬 DMI 引擎本身：一次 DMI 访问 = `idle(8) + 导航(5) + 41 bit = 54 TCK`，移位
-循环约 19 cycle/bit（SWD 的 60 MHz blob 是 6 cycle/bit）。也就是说 RISC-V 侧
-现在**是 CPU 周期受限**，不是协议受限。
+探针侧 SBA 块读 **1.50 MB/s**（§4，TDI 预置提速后）就是天花板，交付率 1389 KB/s
+已经到它的 **92%**（剩下那 8% 是 CDC/USB 那一跳）。再往上只有继续抬 DMI 引擎：
+一次 DMI 访问 = `idle(8) + 导航(5) + 41 bit = 54 TCK`，按 360 MHz 主频反推，
+现在约 20.7 MHz TCK、目标规格上限 25 MHz。也就是说 RISC-V 侧现在**仍然是
+CPU 周期受限**，不是协议受限 —— 剩下的余量在导航相位（见 §4 末尾）。
 
 
 ---
@@ -325,9 +379,9 @@ uartrx.in/out   = 0x800/0x800 <- 注意：数据其实已经过 USB 走了
 ## 6. 复现清单
 
 ```bat
-:: 1) 探针固件（HPM5301EVKLite）
+:: 1) 探针固件（HPM5301EVKLite）—— 时序旋钮已写成源文件默认值，一般不用覆盖；
+::    要扫描才用 env 覆盖（见 script_test/hpm6800_timing_sweep.ps1）
 cd firmware\application_5301
-set DMI_CAP_HIGH_NOP=8 && set DMI_NAV_LOW_NOP=8 && set DMI_NAV_HIGH_NOP=8
 python ..\..\script_test\hpm6800_flash_probe.py          :: 构建 + DFU 升级
 python ..\..\script_test\hpm6800_probe.py set-mode 1
 
@@ -351,7 +405,7 @@ python script_test\sram_speed_hpm6800.py --size 65536 --regions axi
 
 :: 5) RTT 交付率（探针自己搬环，主机只读串口）
 python script_test\hpm6800_rtt_delivery.py COM5 5     :: 速率
-python script_test\hpm6800_rtt_loss.py COM5 10        :: 字节级丢包校验（模式必须精确复现）
+python script_test\hpm6800_rtt_loss.py COM5 20        :: 字节级丢包校验（模式必须精确复现）
 python script_test\hpm6800_rtt_diag.py COM5 3         :: 出问题时读探针 RAM 定位
 python script_test\hpm6800_cdc_check.py COM5          :: CDC 通路 / 环 vs 主机字节数对照
 

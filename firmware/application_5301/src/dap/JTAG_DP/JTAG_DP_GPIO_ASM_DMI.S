@@ -13,18 +13,33 @@
       这里把**一次完整的 DMI 访问**收进单个函数：
         Run-Test/Idle -> Select-DR -> Capture-DR -> Shift-DR(41 bit)
         -> Exit1-DR -> Update-DR -> Run-Test/Idle
-      41 bit 请求直接在寄存器里逐位右移，TDO 用 1 拍流水采样，C 侧只剩一次
-      函数调用。
+    41 bit 请求直接在寄存器里逐位右移，TDO 用 1 拍流水采样，C 侧只剩一次
+    函数调用。
 
-    时序：高电平相位的 nop 数（DMI_CAP_HIGH_NOP）决定 TDO 采样点，必须盖住
-    电平转换 + 目标 tCK->TDO 的往返延迟。实测该往返远小于 JTAG_Sequence 里
-    保守的 10 拍，这里默认给 4 拍，可再用 -D 调整后重测。
+    【2026-09-28 提速：TDI 预置 + 循环展开】
+      一次 DMI 访问 = idle(8) + 导航(5) + 移位(41) = 54 TCK，所以吞吐直接由
+      "每 bit 多少拍" 决定。旧结构每 bit 18 拍（低相位 8 条指令专等 TDI 建立 +
+      高相位 8 拍 nop 等 TDO），实测 1189.5 KB/s、有效 TCK 16.4 MHz —— 而目标
+      （HPM6800EVK）的 JTAG TCK 规格上限是 25 MHz，还差 1.5 倍没吃满。
+
+      两处改动（都靠 hpm6800_selfcheck.py 写图案读回卡死）：
+        1) TDI 预置：把"给出下一位 TDI"移到**上一位的高相位**，此时 TCK 已是高，
+           把 DO_VAL 写成 "TCK|TDI" 只是改电平、不产生边沿；低相位于是退化成
+           一条 `sw DO_CLR`，只受目标最小 TCK 低电平宽度约束（实测要 4 拍），
+           不再受 TDI 建立时间约束。累加也一并挪进高相位，正好填掉原来的死等。
+        2) 整个 32 位位移循环展开，每条位省下 addi+bnez 两拍。
+
+      实测：读 1189.5 -> **1504.5 KB/s**、写 1194.8 -> **1511.8 KB/s**（+26.5%），
+      有效 TCK ~20.7 MHz；RTT 交付 1164.7 -> 1385 KB/s，28.5 MB 字节级零丢包。
+      四个时序旋钮的实测边界见 CMakeLists.txt 的说明与
+      script_test/README.md 的回归基线表 —— 都已经在最小值上，别再往下减。
 */
 
 .equ FGPIO_BASE,                (0x000C0000)
 .equ FGPIO_DI_VAL_OFFSET,       (0x000)
 .equ FGPIO_DO_VAL_OFFSET,       (0x100)
 .equ FGPIO_DO_SET_OFFSET,       (0x104)
+.equ FGPIO_DO_CLR_OFFSET,       (0x108)
 
 #ifndef JTAG_PIN_JTCK_SHIFT
 #define JTAG_PIN_JTCK_SHIFT 27
@@ -39,7 +54,22 @@
 #define JTAG_PIN_JTDO_SHIFT 9
 #endif
 #ifndef DMI_CAP_HIGH_NOP
-#define DMI_CAP_HIGH_NOP 4
+#define DMI_CAP_HIGH_NOP 1
+#endif
+/* 移位相位 TCK **低电平**保持的 nop 数。
+ *
+ * 新方案里 TDI 已在上一拍的高相位摆好，所以这里**不需要**再等 TDI 建立时间
+ * （那是旧方案低相位 8 条指令的来源），只需要满足目标的最小 TCK 低电平宽度。
+ * 因此可以比 DMI_NAV_LOW_NOP 小得多 —— 具体能小到多少要用自检实测
+ * （script_test/hpm6800_selfcheck.py），别靠推理。 */
+#ifndef DMI_TCK_LOW_NOP
+#define DMI_TCK_LOW_NOP 4
+#endif
+/* bit40（Exit1-DR，TMS=1）那一位的采样延迟。它是**一次性**的收尾位，跑在
+ * DMI_SHIFT_BIT 之外，自己的 DO_VAL/DO_SET 序列里没有任何"顺带干活"的指令，
+ * 所以采样延迟得靠 nop 补齐 —— 不能跟着 DMI_CAP_HIGH_NOP 一起降到 1。 */
+#ifndef DMI_BIT40_HIGH_NOP
+#define DMI_BIT40_HIGH_NOP 8
 #endif
 
 .equ JTCK_OFFSET,               (1 << JTAG_PIN_JTCK_SHIFT)
@@ -50,14 +80,14 @@
 
 /* 非移位状态（导航 / idle）TCK 高电平保持的 nop 数 */
 #ifndef DMI_NAV_HIGH_NOP
-#define DMI_NAV_HIGH_NOP 8
+#define DMI_NAV_HIGH_NOP 4
 #endif
 /* 非移位状态 TCK 低电平保持的 nop 数。**不能省**：TMS/TDI 是在拉低的同一
  * 次 DO_VAL 写里给出的，如果紧跟着就拉高，TMS 只在上升沿前 1 个周期才变化，
  * 目标端采样到的还是旧 TMS（TAP 会走错分支，实测表现为响应 op/addr 对、
- * 但读数据恒为 0）。 */
+ * 但读数据恒为 0）。实测 6 稳、4 直接 FAIL（读回全 0）。 */
 #ifndef DMI_NAV_LOW_NOP
-#define DMI_NAV_LOW_NOP 8
+#define DMI_NAV_LOW_NOP 6
 #endif
 
 /* 一个非移位时钟：给出 TMS/TDI -> 低电平保持 -> 拉高 -> 高电平保持 */
@@ -72,42 +102,67 @@
 .endr
 .endm
 
-/* 移位位（TMS 固定为 0，所以不需要叠加 TMS）：拉低并给出 TDI -> 处理上一拍
- * 采样 -> 拉高 -> 采样。
+/* 移位位：**TDI 预置**方案（TMS 恒为 0，所以不用叠加 TMS）。
  *
- * 试过把"处理上一拍采样"的 4 条指令挪到高电平的死等里（低相位只剩 2 拍），
- * 速率确实从 1190 涨到 1386 KB/s（+16%），但**自检恒定失败**（cap=4 和 cap=6
- * 拿到的是同一个错误校验和 0x11D9A168，说明是确定性的逻辑错而不是余量不足）：
- * TCK 拉低到拉高之间只剩一条 srli（约 2 拍 ≈ 5 ns），**TDI 建立时间不够**，
- * 目标每位采到的都是上一位。结论：低相位（TDI/TMS 建立）和高相位（TDO 往返）
- * 各需 ~8 拍，这个结构下 TCK 周期下限就是 18 拍，实测 16.3 MHz。
- * 要再往上只能改成"上一位的高相位里就把下一位的 TDI 用 DO_SET/DO_CLR 摆好"，
- * 那样低相位只剩一次拉低 —— 理论上限 25 MHz（目标规格）。
+ * 旧方案每一位都在低相位里完成"取 TDI 位 + 拉低 TCK + 写 DO_VAL"，于是低相位
+ * 有 8 条指令 ≈ 8 拍，纯粹是在等目标侧的 TDI 建立时间；TCK 周期 = 8 + 1 + 8 + 1
+ * = 18 拍，实测 16.3 MHz（HPM6800EVK 规格上限 25 MHz，还有 1.5 倍没吃满）。
  *
- * \out : TDO 累加器（每拍右移，新位进 bit31）
+ * 新方案把 TDI 的建立**移到上一位的高相位**：此时 TCK 已经是高，把 DO_VAL 写成
+ * "TCK | TDI" 只是改 TDI 电平，不产生任何边沿。于是低相位退化成
+ *     sw t1, DO_CLR        # 只把 TCK 拉低
+ * 一个 store，只受 TCK 低电平宽度约束，不再受 TDI 建立时间约束。
+ *
+ * 顺带用上 45M 汇编里两个更省的写法：
+ *   andi t4, in, JTDI_OFFSET  —— JTDI_OFFSET 就是 1<<shift，一条 andi 同时完成
+ *                                "取位"和"移位"（旧写法要 andi + slli 两条）
+ *   or out,out,b ; rori out,out,1 —— 两拍完成累加（旧写法 srli+slli+or 三拍），
+ *                                32 拍后 b_k 正好落在 bit[k]，也不再需要收尾对奇
+ *
+ * 进入本迭代的前提：TCK 为高、且**当前这一位的 TDI 已经摆好**（由 prologue 或
+ * 上一拍结尾的 DMI_TDI_PRESET 完成）。
+ *
+ * \out : TDO 累加器（or 进 bit0 后循环右移 1，32 拍后 b_k 落在 bit[k]）
  * \in  : TDI 位来源（每拍右移，bit0 是下一位） */
 .macro DMI_SHIFT_BIT out, in
+    sw      t1, FGPIO_DO_CLR_OFFSET(t0)     # --- 低相位：只拉低 TCK（TDI 已稳定）
+.rept DMI_TCK_LOW_NOP
+    nop
+.endr
+    sw      t1, FGPIO_DO_SET_OFFSET(t0)     # --- TCK 拉高（本位的上升沿）
+    bexti   a6, a5, JTDO_SHIFT              # 整理上一拍采样（在高相位里干活，不占低相位）
+    or      \out, \out, a6
+    rori    \out, \out, 1
+    srli    \in, \in, 1                     # 下一位
+    /* 注意**不能**写成 `andi t4, \in, JTDI_OFFSET`：那条写法只在 TDI 流已经预先
+     * 左移过 JTDI_SHIFT 的代码里成立（45M 汇编的 a4 就是那种约定）。这里的 \in
+     * 是原始 DMI 请求寄存器、bit0 才是当前位，套过去会去取 bit[JTDI_SHIFT]，
+     * 结果是请求被整串写成 0（op=NOP）—— 症状极隐蔽：不报错、基准还"跑得通"，
+     * 只是读回来全是 0，只有自检能抓到。 */
     andi    t4, \in, 1
     slli    t4, t4, JTDI_SHIFT
-    sw      t4, FGPIO_DO_VAL_OFFSET(t0)     # --- TCK 拉低 + TDI（TMS=0）
-    srli    \in, \in, 1
-    bexti   a6, a5, JTDO_SHIFT              # 上一拍的 TDO
-    srli    \out, \out, 1
-    slli    a6, a6, 31
-    or      \out, \out, a6
-    sw      t1, FGPIO_DO_SET_OFFSET(t0)     # --- TCK 拉高
+    or      t4, t4, t1
+    sw      t4, FGPIO_DO_VAL_OFFSET(t0)
 .rept DMI_CAP_HIGH_NOP
     nop
 .endr
-    lw      a5, FGPIO_DI_VAL_OFFSET(t0)     # 采样 TDO
+    lw      a5, FGPIO_DI_VAL_OFFSET(t0)     # 采样本位 TDO
 .endm
 
-/* 冲刷 1 拍流水里剩下的最后一位采样 */
+/* 摆当前位的 TDI（TCK 保持高）。用于进入移位循环前把 bit0 预置好 —— 新方案里
+ * 低相位不再负责 TDI，所以循环入口必须先做这一下。 */
+.macro DMI_TDI_PRESET in
+    andi    t4, \in, 1
+    slli    t4, t4, JTDI_SHIFT
+    or      t4, t4, t1
+    sw      t4, FGPIO_DO_VAL_OFFSET(t0)
+.endm
+
+/* 冲刷 1 拍流水里剩下的最后一位采样（随后 a5 会被重新清零）。 */
 .macro DMI_FLUSH_BIT out
     bexti   a6, a5, JTDO_SHIFT
-    srli    \out, \out, 1
-    slli    a6, a6, 31
     or      \out, \out, a6
+    rori    \out, \out, 1
 .endm
 
 .section .fast, "ax"
@@ -149,26 +204,26 @@ JTAG_DMI_Scan:
     DMI_NAV_CLOCK t5                        # Shift-DR（TMS=0）
 
     # ---------------- 移位 32 bit（TMS=0，捕获 TDO） ----------------
+    /* 整个 32 位循环展开：每条位省下 addi+bnez 两拍（约占每拍 16 条指令的 12%）。
+     * 展开后 .fast 段多约 2 KB，但它在 ILM 里（单周期取指），不担心取指带宽。 */
     mv      a0, x0                          # TDO bit[31:0]
     mv      a5, x0                          # 上一拍 DI 整字（1 拍流水）
-    li      t3, 32
-.Ldmi_lo32:
+    DMI_TDI_PRESET a1                       # 新方案：循环入口前先把 bit0 的 TDI 摆好
+.rept 32
     DMI_SHIFT_BIT a0, a1
-    addi    t3, t3, -1
-    bnez    t3, .Ldmi_lo32
+.endr
     DMI_FLUSH_BIT a0
 
     # ---------------- 移位 8 bit（TMS=0，TDO bit[39:32]） ----------------
     mv      a4, x0
     mv      a5, x0
-    li      t3, 8
-.Ldmi_hi8:
+    DMI_TDI_PRESET a2
+.rept 8
     DMI_SHIFT_BIT a4, a2
-    addi    t3, t3, -1
-    bnez    t3, .Ldmi_hi8
+.endr
     DMI_FLUSH_BIT a4
-    /* 累加器是"每次右移、新位进 bit31"，只有正好 32 位时才自然对齐到
-     * bit[31:0]；8 位会停在 bit[31:24]，右移回来。 */
+    /* 累加器"插到 bit0 再循环右移"，要正好 32 拍才自然对齐到 bit[31:0]；
+     * 8 拍会停在 bit[31:24]，右移回来。 */
     srli    a4, a4, 24
 
     # ---------------- bit40（TMS=1，Exit1-DR） ----------------
@@ -183,7 +238,7 @@ JTAG_DMI_Scan:
     nop
 .endr
     sw      t1, FGPIO_DO_SET_OFFSET(t0)
-.rept DMI_CAP_HIGH_NOP
+.rept DMI_BIT40_HIGH_NOP
     nop
 .endr
     lw      a5, FGPIO_DI_VAL_OFFSET(t0)

@@ -137,20 +137,32 @@ sdk_app_src(src/dap/JTAG_DP/JTAG_DP_GPIO_Slow.c)
 sdk_app_src(src/dap/JTAG_DP/JTAG_DP_GPIO_ASM_45M.S)
 sdk_app_src(src/dap/JTAG_DP/JTAG_DP_GPIO_ASM_DMI.S)
 
-# TDO sample point of the fast DMI scan (nop count in the TCK-high phase).
-# It has to cover the level-shifter round trip plus the target's TCK->TDO
-# delay; too small and every response comes back one bit late. Tune with
-#   cmake -DDMI_CAP_HIGH_NOP=<n> ...
-set(DMI_CAP_HIGH_NOP "8"  CACHE STRING "JTAG DMI scan high-phase nop count")
-set(DMI_NAV_LOW_NOP  "8"  CACHE STRING "JTAG DMI nav/idle low-phase nop count")
-set(DMI_NAV_HIGH_NOP "8"  CACHE STRING "JTAG DMI nav/idle high-phase nop count")
-# Allow sweeping without editing this file:  set DMI_CAP_HIGH_NOP=40 && build...
-foreach(_knob DMI_CAP_HIGH_NOP DMI_NAV_LOW_NOP DMI_NAV_HIGH_NOP)
+# DMI 扫描的时序旋钮。三个都已经实测到最小值，**别再往下减**（判据见
+# docs/hpm6800evk-jtag.md §4 与 script_test/README.md 的回归基线表）：
+#
+#   DMI_CAP_HIGH_NOP   移位相位高电平里额外的 nop。TDI 预置方案下，上升沿到采样
+#                      之间本来就有 3(累加)+3(TDI 预置) 条指令垫着，所以这里只需
+#                      补 1 拍；它的作用仍是覆盖电平转换往返 + 目标 TCK->TDO 延迟，
+#                      太小会让每个响应晚一位。
+#   DMI_TCK_LOW_NOP    移位相位**低电平**保持拍数。TDI 已在高相位摆好，这里只受
+#                      目标最小 TCK 低电平宽度约束，所以远小于 DMI_NAV_LOW_NOP。
+#   DMI_NAV_*_NOP      导航/idle 时钟的低/高电平保持。低电平那 8 拍**不能省**：
+#                      TMS/TDI 与 TCK 拉低在同一次 DO_VAL 写里，少了会采到旧 TMS。
+#
+# 扫描用：set DMI_TCK_LOW_NOP=2 && build（见 script_test/hpm6800_timing_sweep.ps1）
+set(DMI_CAP_HIGH_NOP "1"  CACHE STRING "JTAG DMI shift-phase extra high-phase nops")
+set(DMI_TCK_LOW_NOP  "4"  CACHE STRING "JTAG DMI shift-phase TCK-low nop count")
+set(DMI_BIT40_HIGH_NOP "8" CACHE STRING "JTAG DMI bit40 sample delay nops")
+set(DMI_NAV_LOW_NOP  "6"  CACHE STRING "JTAG DMI nav/idle low-phase nop count")
+set(DMI_NAV_HIGH_NOP "4"  CACHE STRING "JTAG DMI nav/idle high-phase nop count")
+foreach(_knob DMI_CAP_HIGH_NOP DMI_TCK_LOW_NOP DMI_BIT40_HIGH_NOP DMI_NAV_LOW_NOP DMI_NAV_HIGH_NOP)
     if(DEFINED ENV{${_knob}})
         set(${_knob} "$ENV{${_knob}}" CACHE STRING "overridden from the environment" FORCE)
     endif()
 endforeach()
 sdk_compile_definitions(-DDMI_CAP_HIGH_NOP=${DMI_CAP_HIGH_NOP})
+sdk_compile_definitions(-DDMI_TCK_LOW_NOP=${DMI_TCK_LOW_NOP})
+sdk_compile_definitions(-DDMI_BIT40_HIGH_NOP=${DMI_BIT40_HIGH_NOP})
 sdk_compile_definitions(-DDMI_NAV_LOW_NOP=${DMI_NAV_LOW_NOP})
 sdk_compile_definitions(-DDMI_NAV_HIGH_NOP=${DMI_NAV_HIGH_NOP})
 
