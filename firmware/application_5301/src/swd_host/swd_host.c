@@ -55,6 +55,11 @@
 // AP CSW register, base value
 #define CSW_VALUE (CSW_RESERVED | CSW_MSTRDBG | CSW_HPROT | CSW_DBGSTAT | CSW_SADDRINC)
 
+/* 同上，但**地址不自增**。SWD 单字重复读的关键：AddrInc=1 时 DRW 读一次 AP.TAR
+ * 就自己走到 addr+4，于是每次采样都得重写 TAR；换成不自增后 TAR 能一直复用，
+ * 同一地址的连续读只剩 DRW + RDBUFF 两次传输（原来 3 次）。见 swd_read_word_held()。 */
+#define CSW_VALUE_HOLD (CSW_VALUE & ~CSW_SADDRINC)
+
 #define DCRDR 0xE000EDF8
 #define DCRSR 0xE000EDF4
 #define DHCSR 0xE000EDF0
@@ -72,6 +77,8 @@
 typedef struct {
     uint32_t select;
     uint32_t csw;
+    uint32_t tarp;      /* 我们上次写进 AP.TAR 的地址 */
+    uint8_t  tarp_ok;   /* 1 = AP.TAR 现在确实还等于 tarp（没被自增或别的路径动过） */
 } DAP_STATE;
 
 typedef struct {
@@ -83,6 +90,20 @@ static SWD_CONNECT_TYPE reset_connect = CONNECT_NORMAL;
 
 static DAP_STATE dap_state;
 static uint32_t  soft_reset = SYSRESETREQ;
+
+/* 三个 AP/DP 影子寄存器的缓存全部作废（0xffffffff 是"未知"的约定值）。
+ *
+ * 🚨 主机自己碰过 DAP 之后必须调这个：CMSIS-DAP 主机通路走的是
+ * DAP_SWD_Transfer → SWD_Read/SWD_Write，**完全绕过 swd_host**，所以我们这边
+ * 记的 select / csw / tar 全都会失真。踩过的正是这一类：换了 SWD 档位却没生效、
+ * 以及缓存说"CSW 还是自增"而硬件里已经被改成别的值。
+ * 保守作废的代价只是多写一两次影子寄存器，判反了就是读到**别的地址**。 */
+void swd_invalidate_ap_cache(void)
+{
+    dap_state.select  = 0xffffffff;
+    dap_state.csw     = 0xffffffff;
+    dap_state.tarp_ok = 0U;
+}
 
 static uint32_t swd_get_apsel(uint32_t adr)
 {
@@ -132,12 +153,15 @@ uint8_t swd_init(void)
     DAP_Setup();
     PORT_SWD_SETUP();
     DAP_Data.debug_port  = DAP_PORT_SWD;
+    /* 初始化意味着目标/AP 可能已经被重置过，影子寄存器一律作废 */
+    swd_invalidate_ap_cache();
     return 1;
 }
 
 uint8_t swd_off(void)
 {
     PORT_OFF();
+    swd_invalidate_ap_cache();
     return 1;
 }
 
@@ -241,6 +265,17 @@ uint8_t swd_write_ap(uint32_t adr, uint32_t val)
             dap_state.csw = val;
             break;
 
+        case AP_TAR:
+            /* 地址没变就把这一整趟省掉：AP 写是"写一次 + 一次 RDBUFF 收尾"，
+             * 所以省下来的是**两次传输**。地址没变时 AP 里的值本来就一样。 */
+            if (dap_state.tarp_ok && (dap_state.tarp == val)) {
+                return 1;
+            }
+
+            dap_state.tarp = val;
+            dap_state.tarp_ok = 1U;
+            break;
+
         default:
             break;
     }
@@ -288,6 +323,9 @@ static uint8_t swd_write_block(uint32_t address, uint8_t *data, uint32_t size)
     // DRW write
     req = SWD_REG_AP | SWD_REG_W | (3 << 2);
 
+    /* 同上：写过 DRW 之后 AP.TAR 已被自增带跑（本轮 CSW 带 SADDRINC） */
+    dap_state.tarp_ok = 0U;
+
     for (i = 0; i < size_in_words; i++) {
         if (swd_transfer_retry(req, (uint32_t *)data) != 0x01) {
             return 0;
@@ -331,6 +369,11 @@ static uint8_t swd_read_block(uint32_t address, uint8_t *data, uint32_t size)
     // read data
     req = SWD_REG_AP | SWD_REG_R | AP_DRW;
 
+    /* 发起 DRW 之前先把 TAR 缓存作废：本轮的 CSW 一定带 SADDRINC（上面刚写过），
+     * 所以这一趟之后 AP.TAR 已经自己往前走了，缓存里的值不再成立。
+     * 放在这里而不是循环里 —— 只要发起过 DRW，不管中途成败，TAR 都不可信。 */
+    dap_state.tarp_ok = 0U;
+
     // initiate first read, data comes back in next read
     if (swd_transfer_retry(req, NULL) != 0x01) {
         return 0;
@@ -350,6 +393,86 @@ static uint8_t swd_read_block(uint32_t address, uint8_t *data, uint32_t size)
     return (ack == 0x01);
 }
 
+/* 对齐块读的快速路径（见 swd_host.h）：调用方保证 4 字节对齐、size 是 4 的倍数、
+ * 不跨 1 KB 自增页 —— 于是直接进 swd_read_block，跳过 swd_read_memory() 的头尾字节
+ * 处理与分页循环。scope 采样器每个样本要调 1~3 次，那两层的开销是量的出来的。 */
+uint8_t swd_read_block4(uint32_t address, uint8_t *data, uint32_t size)
+{
+    if ((size == 0U) || ((address & 3U) != 0U) || ((size & 3U) != 0U))
+    {
+        return 0U;
+    }
+    if ((address & (TARGET_AUTO_INCREMENT_PAGE_SIZE - 1U)) + size > TARGET_AUTO_INCREMENT_PAGE_SIZE)
+    {
+        return 0U;      /* 跨页：让调用方退回 swd_read_memory() */
+    }
+    return swd_read_block(address, data, size);
+}
+
+/* ================= 单字"抱住地址"读：2 次传输 / 1 次传输 =================
+ *
+ * 背景：AHB-AP 的读是 **posted** 的 —— DRW 读回来的是"上一次 DRW 读"的结果，
+ * 同时发起一次新的 AHB 读。所以同一地址连续读时：
+ *
+ *   · TAR 根本不用重写（前提是 CSW 里 AddrInc=0，见 CSW_VALUE_HOLD）；
+ *   · 想要"当前值"，一次 DRW + 一次 RDBUFF 就够（swd_read_word_held 的老形态）；
+ *   · 更快的是**把它当流水线**：每拍只发一次 DRW 读，它返回的是上一拍的值，
+ *     调用方把那个值回填进上一拍自己的槽位 —— 每拍 **1 次传输**。
+ *
+ * 实测（F103ZE，60 MHz 档）：3 次 → 2 次把 4.503 µs 压到 2.681 µs；
+ * 再上流水线只剩 1 次读，约 1.57 µs。
+ *
+ * ⚠️ 只能在**同一个地址**上连续读时用。地址一变（哪怕只是两个单字 span 交替），
+ * 每次都要重写 TAR，而这里的 TAR 写走 swd_write_ap（写 + RDBUFF 收尾 = 2 次传输），
+ * 比 swd_read_block 的裸 TAR 写（1 次）还贵 —— 那种配置反而更慢，实测两个远离的
+ * 单字 span 从 8.6 µs 变成 11.2 µs。守卫必须是"**只有一个 span**"。
+ * ======================================================================== */
+
+/* 把 AP 准备成"抱住地址"的连续读：CSW 切成不自增、TAR 指向 address。
+ * 已经是这个状态就是空操作（每拍调一次也没关系，它自己会纠偏）。 */
+uint8_t swd_read_word_hold_prepare(uint32_t address)
+{
+    const uint32_t csw = CSW_VALUE_HOLD | CSW_SIZE32;
+
+    if (dap_state.csw != csw)
+    {
+        if (!swd_write_ap(AP_CSW, csw)) { return 0; }
+    }
+    if (!dap_state.tarp_ok || (dap_state.tarp != address))
+    {
+        if (!swd_write_ap(AP_TAR, address)) { return 0; }
+    }
+    return 1;
+}
+
+/* 只发一次 DRW 读。**返回值是上一次 DRW 读的结果**，所以它单用没有意义：
+ * 必须当流水线用 —— 第一次的结果丢掉，之后每次拿到的都是上一次的。
+ * data 允许为 NULL（丢掉这次的结果）。 */
+uint8_t swd_read_word_pipe(uint32_t *data)
+{
+    const uint8_t req = SWD_REG_AP | SWD_REG_R | AP_DRW;
+
+    if (swd_transfer_retry(req, data) != 0x01) { return 0; }
+    /* CSW 是不自增的，AP.TAR 还在原处，tarp_ok 保持有效 */
+    return 1;
+}
+
+/* 一次性版本：DRW + RDBUFF = 2 次传输（给不想用流水线的调用方）。
+ * 返回 1 = 成功。地址固定时每拍 2 次，比 swd_read_block 的 3 次省一次。 */
+uint8_t swd_read_word_held(uint32_t address, uint8_t *data)
+{
+    uint8_t req, ack;
+
+    if (!swd_read_word_hold_prepare(address)) { return 0; }
+
+    /* prime：这一次读回的是上一次 DRW 读的结果，丢掉；RDBUFF 才是本次地址的值 */
+    if (!swd_read_word_pipe(NULL)) { return 0; }
+
+    req = SWD_REG_DP | SWD_REG_R | SWD_REG_ADR(DP_RDBUFF);
+    ack = swd_transfer_retry(req, (uint32_t *)data);
+    return (ack == 0x01) ? 1 : 0;
+}
+
 // Read target memory.
 static uint8_t swd_read_data(uint32_t addr, uint32_t *val)
 {
@@ -367,6 +490,8 @@ static uint8_t swd_read_data(uint32_t addr, uint32_t *val)
 
     // read data
     req = SWD_REG_AP | SWD_REG_R | (3 << 2);
+
+    dap_state.tarp_ok = 0U;         /* 发过 DRW：AP.TAR 已被自增带跑 */
 
     if (swd_transfer_retry(req, (uint32_t *)tmp_out) != 0x01) {
         return 0;
@@ -403,6 +528,8 @@ static uint8_t swd_write_data(uint32_t address, uint32_t data)
     // write data
     int2array(tmp_in, data, 4);
     req = SWD_REG_AP | SWD_REG_W | (3 << 2);
+
+    dap_state.tarp_ok = 0U;         /* 同上：发过 DRW 之后 AP.TAR 就会自增 */
 
     if (swd_transfer_retry(req, (uint32_t *)tmp_in) != 0x01) {
         return 0;
@@ -757,6 +884,7 @@ uint8_t swd_init_debug(void)
     // init dap state with fake values
     dap_state.select = 0xffffffff;
     dap_state.csw = 0xffffffff;
+    dap_state.tarp_ok = 0U;
 
     int8_t retries = 4;
     int8_t do_abort = 0;

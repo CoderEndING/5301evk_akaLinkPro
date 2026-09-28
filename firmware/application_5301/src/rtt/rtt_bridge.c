@@ -610,12 +610,71 @@ int rtt_bridge_is_running(void)
     return s_running ? 1 : 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* 给 scope 采样器复用的 adapter（声明见 rtt_bridge.h 末尾）            */
+/* ------------------------------------------------------------------ */
+
+int rtt_bridge_swd_ensure_ready(void)
+{
+    if (s_swd_ready) { return 0; }
+    return rtt_swd_init();       /* 成功时它自己会把 s_swd_ready 置 1 */
+}
+
+int rtt_bridge_swd_is_ready(void)
+{
+    return (s_swd_ready != 0U) ? 1 : 0;
+}
+
+void rtt_bridge_request_swd_clock(uint32_t hz)
+{
+    if (hz == 0U) { return; }
+    s_swd_clock_req = hz;
+    s_swd_clock_hz = hz;
+    /* 关键：把链路标成"下次要重新初始化"，让 rtt_swd_init() 去走 20 MHz 斜坡
+     * 并按 s_swd_clock_hz 装载 blob。直接在旧档上调 rtt_swd_set_clock() 会在
+     * 链路没起来时静默变成"只记录不装载"。 */
+    s_swd_ready = 0U;
+}
+
+int rtt_bridge_read(uint32_t addr, uint8_t *dst, uint32_t len)
+{
+    return rtt_read_bytes(addr, dst, len);
+}
+
+uint32_t rtt_bridge_last_dap_ticks(void)
+{
+    return s_last_dap;
+}
+
+void rtt_bridge_set_swd_clock(uint32_t hz)
+{
+    if (hz == 0U) { return; }
+    s_swd_clock_req = hz;
+    if (s_swd_ready)
+    {
+        if (rtt_swd_set_clock(hz) == 0) { s_swd_clock_hz = hz; }
+    }
+    else
+    {
+        s_swd_clock_hz = hz;
+    }
+}
+
+uint32_t rtt_bridge_swd_clock_hz(void)
+{
+    return s_swd_clock_hz;
+}
+
 void rtt_bridge_note_dap_activity(void)
 {
     s_last_dap = mchtmr_now();
     /* 主机用过 DAP（例如 OpenOCD 刚连过），DP 的时钟档/供电状态就不再由我们
      * 掌握：下次启动或基准测试必须重新初始化，不能复用旧状态。 */
     s_swd_ready = 0U;
+    /* 同理，swd_host 对 AP/DP 的影子寄存器缓存（SELECT / CSW / TAR）也会失真 ——
+     * 主机那条路走 SWD_Read/SWD_Write，完全绕过 swd_host。不清掉的话，
+     * scope 采样器可能拿着"CSW 还是自增"的旧认知去读**别的地址**。 */
+    swd_invalidate_ap_cache();
 }
 
 /* Bring-up debugging: keep the last host DAP request/response so the exact

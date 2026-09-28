@@ -95,6 +95,14 @@ void chry_dap_handle(void);
 
 void chry_dap_usb2uart_handle(void);
 
+/* 主循环级 CDC/串口桥总开关（HID 0x34 CMD_BRIDGE 控制）。
+ * 0 = main() 不再调 chry_dap_usb2uart_handle()，每轮省下几百周期；
+ * 代价是暂停期间 COM 口与 RTT-over-USB 都不通。默认 1（开）。
+ * 高频 J-Scope 采样前把它关掉，是端到端从 167 kHz 往上走的必要条件。 */
+extern volatile uint8_t usb2uart_bridge_enabled;
+void    chry_dap_usb2uart_set_enabled(uint8_t enable);
+uint8_t chry_dap_usb2uart_is_enabled(void);
+
 /* implment by user */
 extern void chry_dap_usb2uart_uart_config_callback(struct cdc_line_coding *line_coding);
 

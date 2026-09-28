@@ -294,7 +294,87 @@ Byte[0x03-0x3F] = Command data（可选）
    Byte[0x02] = 0xFF // Command type
    设备复位进入DFU模式，不会回复，此时连接断开
 
-16. 探针侧 RISC-V 引擎指令 0x32（JTAG-only 目标，如 HPM6800EVK / HPM6880）
+16. 探针侧 HSS 采样指令 0x32（J-Scope 波形页的数据源）
+    探针自己按你设的周期，用 SWD 读目标 RAM 里 1~8 个变量（地址来自目标 .elf 的 DWARF），
+    组 512 B 自描述包，从 **interface 0 上原本闲置的 bulk IN `0x83`** 推给主机。
+    目标固件一行都不用改。
+
+    控制面（本命令）与数据面（0x83）的字节布局**必须与网页逐字节一致** —— 权威实现是
+    另一仓库 web-serial-rtt-tools 的 `app/scope/protocol.js` / `view.js`。
+
+    ⚠️ 网页的 `xfer()` 回来时**已经剥掉 Report ID**（`res[1] === cmd`），所以
+       网页的 `res[i]` == 固件里的 `res_hid[i + 1]`。下面按**固件下标**写。
+
+    主机发送 request
+    Byte[0x00] = 0x01 // Report ID
+    Byte[0x01] = 长度
+    Byte[0x02] = 0x32 // Command type
+    Byte[0x03] = action
+    Byte[0x04-0x07] = 参数（周期 us / SWD Hz / 标定轮数）
+    Byte[0x08-0x09] = flags / nvars，变量表从 Byte[0x0A] 起，每个 6 B（addr u32 + size u8 + type u8）
+
+    | action | 含义 | 数据段 |
+    | --- | --- | --- |
+    | 0 | 停止 | — |
+    | 1 | 启动推流（会先 `rtt_bridge_stop()`，两者互斥） | — |
+    | 2 | 查状态 | — |
+    | 3 | 设 SWD 时钟 | `hz(4)`；0 = 不动。走 RTT 桥那套斜坡换挡 |
+    | 4 | 触发配置（v2，当前只回 OK） | — |
+    | 7 | 配置：周期 + 1~8 个变量 | `period_us(4) flags(1) nvars(1) n×(addr4,size1,type1)`，8 个变量 = 55 B |
+    | 8 | 标定：用当前计划空跑 N 次 | `iters(4)`，结果走 action 9 |
+    | 9 | 取标定结果 | → 见下 |
+
+    `period_us` 范围 **2 ~ 1000000**（低于 2 会被钳到 2）。这个下限是一路放下来的：
+    5（"一次读 4.478 µs 做不完"）→ 3（单字快路径 2.681 µs）→ 2（单字流水读 1.589 µs，
+    每拍只 1 次传输）。**周期是整数微秒**，所以 2 就是下限；拐点落在 2 与 3 µs 之间
+    （3 µs 零丢、2 µs 丢 ~5%），想吃到中间值得改协议的时间轴单位。
+
+    单变量 u32 的快路径（**只有一个 span** 且它是 4 字节直读时自动启用，主机不用管）：
+    ① CSW 切成 `AddrInc=0` + 缓存 AP.TAR，地址不变就跳过 TAR 写 ⇒ 每拍 2 次传输
+    （DRW + RDBUFF）；② 再把它当流水线，每拍只发 1 次 DRW 读、返回值回填上一拍的槽位
+    ⇒ 每拍 1 次传输。实测 M0 4.503 → 2.681 → **1.589 µs**（222 → 373 → 629 kHz），
+    端到端 3 µs 周期 ~329 kHz（探针侧零丢，余下是主机排空）。
+    多 span 或含多字 span 的配置自动退回原路径 —— **不要**把守卫放宽成"所有 span 都是
+    单字"：两个远离的单字 span 交替读时每拍都要重写 TAR，那条路的 TAR 写比裸写还贵，
+    实测会 -31%。
+
+    type：`0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=f32 7=f64`
+    flags：bit0 允许 60 MHz；bit1 丢弃模式；bit2 触发；bit3 不让路（独占链路）；
+           bit4 SWD 空闲拍压到 0（`DAP_Data.clock_delay=0`）；
+           bit5 采样期间自动暂停 CDC/串口桥（停采样自动恢复，见第 18 条）
+
+    响应：Byte[0x01] = 长度，Byte[0x02] = 0x32，**Byte[0x03] = 启动码**（网页读 `res[2]`，
+    -100 = 排队中，0 = 正常，-1/-2/-3/-4 见 scopeRcText），Byte[0x04..0x33] = 12 个状态字。
+
+    action=9 时前 3 个字换成标定结果：**Byte[0x04..07] = ticks（24 MHz）、
+    Byte[0x08..0B] = iters、Byte[0x0C..0F] = err**（网页读 `res[3]` / `res[7]`）。
+    每样本真实耗时 = ticks / 24 / iters（µs）。
+
+    标定响应里字 3/4 平时用不到，顺手拿来回报**实际装载了哪个 SWD blob** ——
+    `Byte[0x10..13] = Read_GPIO_ASM 在 swd_ops 里的偏移`、`Byte[0x14..17] = clock_delay`。
+    没有这个数就分不出"时钟命令被忽略"和"生效了但没差别"。踩过的坑：`SWJ_Clock` 在
+    桥那一侧链路没就绪时只把值记下来、不装载 blob，而采样器有自己一份链路状态，
+    于是 1 MHz 与 60 MHz 的标定读数一模一样、状态字 w1 却报着新频率；从慢档跳回快档
+    时还会因为少了那段 20 MHz 斜坡而在第一次访问就 -4。现在采样器改走
+    `rtt_bridge_request_swd_clock()`（换挡一律"下次重新初始化"）。偏移对照表：
+    `0x53C=60M(6 指令/bit) 0x60C=45M(8) 0x6E0=36M(10) 0x7C4=30M(12) 0xA54=20M(18)
+     0x620=SLOW  0xFFFFFFFF=还没装载过`。
+
+    状态字：w0 = running | spans<<8 | swdReady<<16 | nvars<<24；w1 = 实际 SWD Hz；
+    w2 = 采到的样本数；w3 = 丢样本数（跳拍 + 无缓冲）；w4 = 已推字节低 16 / 无缓冲丢样本高 16；
+    w5 = SWD 读错低 16 / 让路次数高 16；w6 = 最近一包 seq；w7 = 跳拍低 16 / 丢弃模式包数高 16；
+    w8 = 计划哈希（与网页 planHash 同算法，防"配置没生效却在画图"）；
+    w9 = lastCmd | lastRsp<<8 | tx完成回调次数<<16；w10 = startRc；w11 = period | 丢弃位<<16 | MHz<<24。
+
+    数据面（0x83，512 B 定长自描述包）：
+    偏移 0 magic 'JS'(0x4A53) / 2 ver=1 / 3 kind / 4 seq(4) / 8 t_us(4) / 12 n(2) / 14 aux(2) / 16 载荷 496 B
+      kind 1=DEF：`swd_hz(4) period_us(4) flags(2) nvars(1) spans(1)` + n×(addr4,size1,type1)
+      kind 2=DATA：载荷 = n 帧，变量按**地址排序后**紧排、各按自己的 size 小端
+      kind 3=STAT：`produced(4) dropped(4) pkts(4) usb_err(2) swd_err(2) period_actual(4) swd_mhz(1) disc(1)`，每 64 包插一个
+    丢包判定：seq 跳号 / t_us 跳变 / STAT.dropped，三者都要显示，绝不静默。
+
+    收尾顺序（WebUSB 没有取消接口）：**先 HID STOP → 等 100~200 ms → 把在飞的读收干净 → 再 close**。
+17. 探针侧 RISC-V 引擎指令 0x33（原 0x32，让位给上面的 SCOPE）（JTAG-only 目标，如 HPM6800EVK / HPM6880）
     探针自带一套 RISC-V Debug Module 引擎：加载一次 `IR=0x11` 之后，一次 DMI 访问
     就是一次 41 位 DR 扫描（`{op[1:0], data[31:0], addr[6:0]}`），响应滞后一拍，
     所以连续 posted 请求可以一个字一次扫描地流水；块搬运走 DM 的 SBA（硬件自增地址）。
@@ -360,6 +440,36 @@ Byte[0x03-0x3F] = Command data（可选）
       25 MHz，当前引擎跑在 ~16.4 MHz（一次 DMI 访问 54 TCK）。
     - action 2/3/5 会**直接读写目标内存**，别指向目标正在用的区域。
     - 完整背景、接线坑与失败实验见 `docs/hpm6800evk-jtag.md`。
+18. 主循环 CDC/串口桥开关指令 0x34（网页面板用）
+    探针主循环每轮都要服务 CDC/串口桥（VCOM 转发 + RTT-over-USB 转发）：一次读 DMA
+    的 `DSTADDR`、两次关中断、三次环形缓冲查询。**这几百个 CPU 周期正是高频 J-Scope
+    采样时缺的那一块** —— 单变量 u32、5 µs 周期下关掉它，端到端从 ~180 kHz 提到
+    **~197 kHz**，丢包从 10.6% 降到 1.9%。采样数据走的是另一条 bulk IN `0x83`，与
+    本开关无关；代价只是**暂停期间 COM 口不通**（CDC 的 bulk OUT 被 NAK，主机自行重试）、
+    RTT-over-USB 也停 —— 但采样器与 RTT 桥本来就互斥（第 16 条的启动分支会互相 stop）。
+
+    主机发送 request
+    Byte[0x00] = 0x01 // Report ID
+    Byte[0x01] = 0x02 // Data Length = action(1) + 参数(1)
+    Byte[0x02] = 0x34 // Command type
+    Byte[0x03] = action（0 = 查状态，1 = 设置）
+    Byte[0x04] = 参数（action=1 时：0 = 关桥，1 = 开桥）
+
+    设备回应 response
+    Byte[0x00] = 0x02 // Report ID
+    Byte[0x01] = 0x06 // Data Length = 1(回显 action) + 1 + 4
+    Byte[0x02] = 0x34 // Command type
+    Byte[0x03] = **回显 action**
+    Byte[0x04..0x07] = 状态字（小端）：bit0 = 桥当前是开的；bit8 = 本命令被支持（探活用）
+
+    说明与约束：
+    - **默认是开的**（bit0 = 1）。开→关再开时，探针会把暂停期间积压的串口数据丢掉并把
+      DMA 定位追平（`uartx_rx_resync()`），不会在恢复瞬间灌一整圈陈旧字节给主机。
+    - 状态**不持久化**，探针复位/重插即恢复为开。
+    - 第 16 条的 `SCOPE` flags **bit5** 是"采样期间自动关、停采样自动恢复"，一般用那个
+      就够了（网页只要在已有的 CONFIG 报文里加一位，不必自己管状态）；本命令是给面板
+      做**显式勾选框**用的。自动暂停只恢复"自己关过的那一次"，不会覆盖手动关掉的状态。
+    - 关着的时候别去开 RTT —— 桥被关了，RTT 的数据没有出口。
 
 ## 配置说明
 

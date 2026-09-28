@@ -88,7 +88,7 @@ AXI_SRAM `0x01200000`）：
   （System Bus Access）块搬运**（`sbautoincrement` + `sbreadondata`，
   稳态 **一次 DMI 读 = 一个 32 位字**）；
 - `riscv_svc.c` —— 延迟执行层（JTAG 位操作**不能**在 USB 中断里跑，
-  与 RTT 桥同一规矩），HID `CMD_RISCV (0x32)`。
+  与 RTT 桥同一规矩），HID `CMD_RISCV (0x33)`。
 
 数据通路：`sba_read/sba_write` 用的是**系统总线地址**，所以 RTT 控制块要放在
 地址两侧一致的 RAM（本芯片 `flash_xip` 的 `.bss`/noncacheable 都落在
@@ -419,7 +419,7 @@ powershell -File script_test\hpm6800_timing_sweep.ps1
 
 ### HID 协议补充
 
-`CMD_RISCV = 0x32`：`req[3]=action`（0 停、1 开、2 读基准、3 写基准、4 单字读基准、
+`CMD_RISCV = 0x33`（原 0x32，让位给 SCOPE）：`req[3]=action`（0 停、1 开、2 读基准、3 写基准、4 单字读基准、
 5 读回校验、6 状态、7 时序、8 DMI 原始扫描），`req[4..7]=addr`、`req[8..11]=arg1`、
 `req[12..13]=arg2`；响应 12 个 32 位状态字：
 `[0] open|pending<<8|rc<<16|action<<24`、`[1] idcode`、`[2] dtmcs`、`[3] dmstatus`、

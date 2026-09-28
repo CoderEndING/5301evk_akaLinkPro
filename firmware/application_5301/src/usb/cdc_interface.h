@@ -33,6 +33,10 @@ extern "C"
 
     void usb2uart_handler(void);
 
+    /* Drop the UART RX backlog accumulated while the CDC bridge was suspended
+     * and resume position tracking from the current DMA write pointer. */
+    void uartx_rx_resync(void);
+
     /* Who feeds the CDC ringbuffer: 0 = the VCOM UART bridge (default),
      * 1 = the probe-side RTT bridge. Only one producer may write g_uartrx. */
     void uartx_set_cdc_source(uint8_t from_rtt);
