@@ -176,8 +176,10 @@ static uint8_t DAP_Info(uint8_t id, uint8_t *info)
 #endif
 		break;
 	case DAP_ID_PACKET_SIZE:
-		info[0] = (uint8_t)(DAP_PACKET_SIZE >> 0);
-		info[1] = (uint8_t)(DAP_PACKET_SIZE >> 8);
+		/* 报的是"单条命令/响应最大字节数"，可跨多个 USB 包 —— 见 DAP_config.h 里
+		 * DAP_XFER_SIZE 的说明。不能报端点 mps，否则主机每次只能带 ~508 B 数据。 */
+		info[0] = (uint8_t)(DAP_XFER_SIZE >> 0);
+		info[1] = (uint8_t)(DAP_XFER_SIZE >> 8);
 		length = 2U;
 		break;
 	case DAP_ID_PACKET_COUNT:

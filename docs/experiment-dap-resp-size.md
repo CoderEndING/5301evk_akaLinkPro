@@ -85,3 +85,62 @@ DAP_Info(0xFE) 报 max packet size = DAP_PACKET_SIZE = 512
      + `DAP_ExecuteCommands` 批处理 / 异步 URB）或方案 C（把批量读也下沉进 CDC 流）
 
 基线固件已重新烧回（CRC 0xDF382B3F，60 MHz 读 2523 / 写 2869 KB/s 复核正常），板子可用。
+
+---
+
+## 二轮复现（2026-09-28 13:0x，分支 feat/usb-fifo）：**真因是 OUT 方向没放大**
+
+上面"最可能的原因：USB 栈不支持一次写超过 mps"**是错的**。逐层查证结果：
+
+| 猜想 | 证据 | 结论 |
+| --- | --- | --- |
+| USB PHY FIFO 可配 | `usb_glue_hpm.c` 只有 IRQ/OTG 钩子，**没有任何 FIFO 配置**；该控制器是 dQH/dTD 架构（`hpm_usb_device.c`），没有 Synopsys 式 `DIEPTXF` | ✗ 不存在这个旋钮 |
+| QTD 太少 | `hpm_soc_feature.h:87 USB_SOC_DCD_QTD_COUNT_EACH_ENDPOINT = 8`（且 `#ifndef` 可覆盖），1 个 QTD 管 16 KB，**单次最多 128 KB** | ✗ 不是瓶颈 |
+| 驱动不支持 >mps 的单次写 | CDC IN 就是一次 `usbd_ep_start_write(…, size)` 写整个线性窗（RTT 桥按 2048 B 入环），实测 2.9 MB/s 无损跑了 12 s | ✗ 早就支持 |
+
+**真因**：方案 A 只放大了响应侧，**请求侧仍是 512**：
+
+```c
+usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[i], DAP_PACKET_SIZE);   // ← 应为 DAP_XFER_SIZE
+```
+
+`DAP_TransferBlock` 的**写**命令 = 3 + 4×N 字节。主机把 packet size 当 2048/1024 后，
+一次会发上千字节的 OUT 传输，而设备只武装了 512 ⇒ 只收下头 512 B 就完成一次 dTD，
+而 `DAP_SWD_TransferBlock`（`DAP.c:1929`，循环内**没有任何长度检查**）仍按请求头里的
+`count` 去读 `USB_Request[512..N]` 的越界内容当写数据 ⇒ 写进目标是垃圾 ⇒
+**数据校验必错，且与 SWD 时钟无关**（1 MHz 也错）—— 与一轮观测完全吻合。
+
+### 改法（`feat/usb-fifo`，3 个文件）
+
+`DAP_config.h` 新增 `DAP_XFER_SIZE`（默认 `2×DAP_PACKET_SIZE`=1024，带 64..32768 与
+mps 整数倍两条 `#error` 守卫），然后三处必须**同源**：
+
+1. `usb_composite.c`：`USB_Request`/`USB_Response` 第二维 → `DAP_XFER_SIZE`
+2. `usb_composite.c`：**三处** `usbd_ep_start_read(0, DAP_OUT_EP, …)` → `DAP_XFER_SIZE`
+3. `DAP.c`：`DAP_Info(DAP_ID_PACKET_SIZE)` 报 `DAP_XFER_SIZE`（端点描述符仍是 512 的 mps）
+
+### 复现结果：放大生效了，速度却不变
+
+OpenOCD 自报 `Packet Size = 1024 / Packet Count = 4`；用 `openocd -d4` 数每包事务数
+（`Executing N queued transactions`）：一次 20 KB dump 的 **20 个包各带 254/255 ops
+（≈1016 B/包）**，基线是 ~40 个 127-ops 包 ⇒ 块尺寸确实翻倍。1..60 MHz 八档**全部
+`verified`**（结构性问题消失）。
+
+| SWD 档 | 基线512 读/写 | 1024 读/写 |
+| --- | --- | --- |
+| 10 MHz | 760.7 / 799.3 | 766.4 / 810.9 |
+| 20 MHz | 1296.5 / 1347.3 | 1282.2 / 1375.3 |
+| 36 MHz | 1905.5 / 2070.3 | 1840.2 / 1900.5 |
+| 45 MHz | 2146.3 / 2333.9 | 2194.8 / 2431.0 |
+| **60 MHz** | 2428.2(2523.2) / 2906.8(2868.7) | **2503.9 / 2896.0** |
+
+⇒ **端到端速度与包大小无关**。所以"4770 趟/秒 × 210 µs"那条推理不成立：OpenOCD 的
+4 深 pending FIFO + 异步 URB **已经把每包固定开销隐藏掉了**，包变小并不会变慢——
+主机路径从一开始就不是往返次数受限，而是
+`max(探针 SWD 位翻转率, USB 传输率) ⊕ 少量固定开销`：同档 **in-probe 纯 SWD 读 3281 KB/s**，
+dump 只到 2504（79%），load 2896 ≈ 同档交付出力的上限。
+
+**结论：块大小不是杠杆。** 60 MHz 档真正还能挖的是那 21%：SWD 引擎本身
+（60 MHz 已经是抖动边缘，80 MHz 不可用）或每比特的指令数，不是 CMSIS-DAP 包大小。
+保留本分支的价值：`DAP_Info` 不再虚报"一次只能 508 B"，且高 SWD 档下少了 20 次往返/20 KB；
+代价是 DLM 从 89.6% 涨到 **92.8%**（130304 B 里用 120928 B）。

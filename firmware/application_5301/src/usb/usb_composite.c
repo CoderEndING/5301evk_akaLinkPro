@@ -421,8 +421,8 @@ static volatile uint16_t USB_ResponseCountI = 0; // Response Count In
 static volatile uint16_t USB_ResponseCountO = 0; // Response Count Out
 static volatile uint8_t USB_ResponseIdle = 1;    // Response Idle  Flag
 
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Request[DAP_PACKET_COUNT][DAP_PACKET_SIZE];  // Request  Buffer
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Response[DAP_PACKET_COUNT][DAP_PACKET_SIZE]; // Response Buffer
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Request[DAP_PACKET_COUNT][DAP_XFER_SIZE];  // Request  Buffer
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Response[DAP_PACKET_COUNT][DAP_XFER_SIZE]; // Response Buffer
 static uint16_t USB_RespSize[DAP_PACKET_COUNT];                                                        // Response Size
 
 volatile struct cdc_line_coding g_cdc_lincoding;
@@ -462,7 +462,7 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
     case USBD_EVENT_CONFIGURED:
         /* setup first out ep read transfer */
         USB_RequestIdle = 0U;
-        usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_PACKET_SIZE);
+        usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_XFER_SIZE);
         usbd_ep_start_read(0, CDC_OUT_EP, usb_tmpbuffer, DAP_PACKET_SIZE);
         /* Re-arm the UART bridge as well: the reset above cleared
          * config_uart_transfer and a host that reuses its previous line coding
@@ -497,7 +497,7 @@ void dap_out_callback(uint8_t busid, uint8_t ep, uint32_t nbytes)
 
     // Start reception of next request packet
     if ((uint16_t)(USB_RequestCountI - USB_RequestCountO) != DAP_PACKET_COUNT) {
-        usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[USB_RequestIndexI], DAP_PACKET_SIZE);
+        usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[USB_RequestIndexI], DAP_XFER_SIZE);
     } else {
         USB_RequestIdle = 1U;
     }
@@ -754,7 +754,7 @@ void chry_dap_handle(void)
         if (USB_RequestIdle) {
             if ((uint16_t)(USB_RequestCountI - USB_RequestCountO) != DAP_PACKET_COUNT) {
                 USB_RequestIdle = 0U;
-                usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[USB_RequestIndexI], DAP_PACKET_SIZE);
+                usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[USB_RequestIndexI], DAP_XFER_SIZE);
             }
         }
 

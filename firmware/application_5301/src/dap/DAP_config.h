@@ -99,7 +99,33 @@
 /// 命令和响应数据的最大包大小。
 /// 此配置设置用于优化与调试器的通信性能，并取决于 USB 外设。典型值为：全速 USB HID 或 WinUSB 使用 64、
 /// 高速 USB HID 使用 1024，高速 USB WinUSB 使用 512。
-#define DAP_PACKET_SIZE         512U            ///< 指定包大小（单位：字节）。
+#define DAP_PACKET_SIZE         512U            ///< 指定包大小（单位：字节），同时也是批量端点的 wMaxPacketSize。
+
+/// 单条 CMSIS-DAP 命令/响应允许的最大字节数（**可以跨多个 USB 包**，与端点 mps 无关）。
+///
+/// CMSIS-DAP 的 `DAP_Info(DAP_ID_PACKET_SIZE)`（= USB 上的 INFO_ID_PKT_SZ）报的是这个值，
+/// 主机（OpenOCD 的 cmsis_dap_usb_bulk.c）据此决定"一次能带多少数据"：
+/// 一次 `DAP_TransferBlock` 写命令 = 3 + 4×N 字节，N 由本值反推。
+///
+/// 所以它必须同时满足**两个方向**：
+///   - IN ：响应缓冲要放得下，`usbd_ep_start_write` 一次发 3 + 4×N 字节（跨多包）
+///   - OUT：**请求缓冲要收得下，`usbd_ep_start_read(DAP_OUT_EP, ...)` 必须按本值武装**
+///          —— 否则设备只收下头一个 mps 的数据就完成一次 dTD，而 DAP 解析器仍按请求头里
+///          的 count 去读越界内存当写数据（曾因此让方案 A 在 1 MHz 也校验失败）。
+///
+/// 取值：HS 批量端点的整数倍。512 → 一次只能带 508 B（往返次数是瓶颈的根因）；
+/// 1024/2048 把每次往返的数据量翻倍/翻四倍，代价是 DLM 里的缓冲占用（×DAP_PACKET_COUNT）。
+#ifndef DAP_XFER_SIZE
+#define DAP_XFER_SIZE           (2U * DAP_PACKET_SIZE)
+#endif
+
+#if (DAP_XFER_SIZE < 64U) || (DAP_XFER_SIZE > 32768U)
+#error "DAP_XFER_SIZE out of range (64 .. 32768)"
+#endif
+
+#if (DAP_XFER_SIZE % DAP_PACKET_SIZE) != 0U
+#error "DAP_XFER_SIZE must be an integer multiple of the bulk endpoint mps"
+#endif
 
 /// 命令和响应数据的最大包缓冲区数量。
 /// 此配置设置用于优化与调试器的通信性能，并取决于 USB 外设。对于 RAM 或 USB 缓冲区有限的设备，可以
