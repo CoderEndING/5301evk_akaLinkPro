@@ -10,6 +10,11 @@
 
 靶子固件: web-serial-rtt-tools/tools/target-firmware/stm32f103_scope（10 kHz 契约波形）
 """
+try:
+    sys.stdout.reconfigure(encoding="utf-8")   # GBK 控制台编不出 ⚠️ 之类的字符，会把脚本自己打崩
+except Exception:
+    pass
+
 import argparse
 import os
 import struct
@@ -209,8 +214,8 @@ def main():
     do_config(dev, a.period, vars_, a.flags)
     st = status(dev)
     print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
-          % (len(vars_), a.period, st['spans'], (1 if a.vset in ('pack', 'one') else 2)))
-    if st['spans'] != ((1 if a.vset in ('pack', 'one') else 2)):
+          % (len(vars_), a.period, st['spans'], {'pack': 1, 'one': 1, 'cross': 3}[a.vset]))
+    if st['spans'] != ({'pack': 1, 'one': 1, 'cross': 3}[a.vset]):
         print("⚠️ span 数与本地计划不一致 —— 检查合并规则/地址")
 
     if a.cmd == 'bench':
@@ -343,19 +348,24 @@ def main():
                 fo += size
             samples.append(row)
     print("解出 %d 个样本（frame %d B，期望 %d 个/包）" % (len(samples), fb, PAYLOAD // fb))
+    # 校验按"这组里实际有哪些变量"自适应 —— 单选一个 g_tick 时没有 i_tick/u_hi
     if len(samples) >= 2:
-        # g_tick 斜率 = 采样率；跳变 > 1 就是丢样本
-        ts = [s['i_tick'] for s in samples]
+        tkey = next((k for k in ('i_tick', 'g_tick', 'g_far_cnt') if k in samples[0]), None)
+        if tkey is None:
+            print("（这组没有 tick 类变量，跳过斜率校验）")
+            return 0
+        # tick 斜率 = 采样率/目标 tick 率；跳变 > 1 就是丢样本
+        ts = [s[tkey] for s in samples]
         d = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
         ones = sum(1 for x in d if x == 1)
         jumps = sum(x - 1 for x in d if x > 1)
-        print("i_tick 斜率: 连续+1 占 %d/%d，跳变丢样本合计 %d（probe dropped+usbDrop=%d）"
+        print("tick 斜率: 连续+1 占 %d/%d，跳变丢样本合计 %d（probe dropped+usbDrop=%d）"
               % (ones, len(d), jumps, st['dropped']))
         expect_period = (d and sorted(d)[len(d) // 2]) or 0
         print("目标 tick 步进中位数 = %d（=1 表示采样率与目标 10 kHz 同拍）" % expect_period)
-        # u_hi 精度
-        bad = [s for s in samples if (s['u_hi'] >> 28) != 1]
-        print("u_hi 高位校验: %d/%d 正确" % (len(samples) - len(bad), len(samples)))
+        if "u_hi" in samples[0]:
+            bad = [s for s in samples if (s["u_hi"] >> 28) != 1]
+            print("u_hi 高位校验: %d/%d 正确" % (len(samples) - len(bad), len(samples)))
     return 0
 
 
