@@ -1,9 +1,11 @@
 <#
   STM32F103 测试固件编译脚本（不需要 make，也不需要 Keil）
-    pwsh -File build.ps1
+    pwsh -File build.ps1                 # 默认 C8（64KB flash / 20KB RAM）
+    pwsh -File build.ps1 -Board ze       # ZET6（512KB flash / 64KB RAM），RTT 上行 32KB
+    pwsh -File build.ps1 -Board ze -Clean
   依赖：arm-none-eabi-gcc 在 PATH 里（本机在 E:\Share\env-windows\tools\gnu_gcc\arm_gcc\mingw\bin）
 #>
-param([switch]$Clean)
+param([switch]$Clean, [ValidateSet('c8', 'ze')][string]$Board = 'c8')
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -28,6 +30,11 @@ $sources = @(
 )
 $elf = Join-Path $build 'fw.elf'
 
+$ld = Join-Path $root ("ld\stm32f103{0}.ld" -f $Board)
+if (-not (Test-Path $ld)) { throw "找不到链接脚本 $ld" }
+# ZE 有 64 KB SRAM：RTT 上行缓冲从 12 KB 提到 32 KB（狂发时更抗主机轮询间隔）
+$boardDefs = if ($Board -eq 'ze') { @('-DBUFFER_SIZE_UP=32768') } else { @() }
+
 # 参数一律加引号并用数组 splat：
 # PowerShell 会把 -specs=nano.specs 按点号拆成两段（"-specs=nano" + ".specs"），
 # 直接导致 "cannot read spec file 'nano'"。这是本脚本第一版踩的坑。
@@ -36,10 +43,12 @@ $cflags = @(
   '-ffunction-sections', '-fdata-sections', '-fno-common',
   '-Wall', '-Wextra', '-Wno-unused-parameter',
   "-I$root\src", "-I$root\segger_rtt",
-  "-T$root\ld\stm32f103c8.ld",
+  "-T$ld",
   '-nostartfiles', '-specs=nano.specs', '-specs=nosys.specs',
   '-Wl,--gc-sections', "-Wl,-Map=$build\fw.map"
-)
+) + $boardDefs
+
+Write-Output ("board   : {0}  ({1})" -f $Board, (Split-Path -Leaf $ld))
 
 & $gcc @cflags @sources -o $elf
 if ($LASTEXITCODE -ne 0) { throw "编译失败 (exit $LASTEXITCODE)" }

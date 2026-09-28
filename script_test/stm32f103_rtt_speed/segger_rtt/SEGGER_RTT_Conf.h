@@ -12,7 +12,10 @@
 #ifndef SEGGER_RTT_CONF_H
 #define SEGGER_RTT_CONF_H
 
+/* C8（20 KB SRAM）用 12 KB；ZE（64 KB SRAM）构建用 -DBUFFER_SIZE_UP=32768 覆盖 */
+#ifndef BUFFER_SIZE_UP
 #define BUFFER_SIZE_UP                  (12288)   /* 12 KB: 4 KB 时每次取数都撞满，吞吐被轮询次数吃掉 */
+#endif
 #define BUFFER_SIZE_DOWN                (256)
 #define SEGGER_RTT_MAX_NUM_UP_BUFFERS   (2)
 #define SEGGER_RTT_MAX_NUM_DOWN_BUFFERS (1)
