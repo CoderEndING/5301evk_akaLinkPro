@@ -134,6 +134,22 @@ def boost_target_clock(tn):
     time.sleep(0.05)
 
 
+def ocd_speed(text):
+    """Rate OpenOCD itself reports for load_image/dump_image: '... (3384.095 KiB/s)'.
+
+    That timer covers the target transfer only - no telnet round trip, no image
+    file read/format - so it is the caliber the upstream akaLinkPro benchmark
+    (script_test/swd/benchmark_readback.tcl) quotes. Both are reported: the wall
+    clock answers "how long does the command take end to end", this one answers
+    "how fast does the data actually move".
+    """
+    m = re.search(r"\(([0-9.]+) (KiB|MiB)/s\)", text)
+    if not m:
+        return None
+    value = float(m.group(1))
+    return value * 1024.0 if m.group(2) == "MiB" else value
+
+
 def main():
     os.makedirs(WORKDIR, exist_ok=True)
     src_bin = os.path.join(WORKDIR, "sram_test.bin")
@@ -232,14 +248,22 @@ def main():
 
             w_kbps = SIZE / (t1 - t0) / 1024.0
             r_kbps = SIZE / (t2 - t1) / 1024.0
-            results.append((label, w_kbps, r_kbps))
+            w_xfer = ocd_speed(out_w)
+            r_xfer = ocd_speed(out_r)
+            results.append((label, w_kbps, r_kbps, w_xfer, r_xfer))
             print(f"{label:>8} | write {w_kbps:8.1f} KB/s | read {r_kbps:8.1f} KB/s | verified")
+            print(f"{'':>8} |   xfer-only: write {w_xfer or 0:8.1f} | read {r_xfer or 0:8.1f} KB/s"
+                  f"  <- OpenOCD's own timer")
 
         print()
         print("=== summary (20KB via CMSIS-DAP + OpenOCD load/dump) ===")
-        print(f"{'SWD clock':>9} | {'write':>12} | {'read':>12}")
-        for label, w, r in results:
-            print(f"{label:>9} | {w:10.1f} K/s | {r:10.1f} K/s")
+        print("wall = this script's timer (one telnet round trip per command included)")
+        print("xfer = OpenOCD's own timer (target transfer only; upstream's caliber)")
+        print(f"{'SWD clock':>9} | {'wall w':>9} | {'wall r':>9} | {'xfer w':>9} | {'xfer r':>9}")
+        for label, w, r, wx, rx in results:
+            sw = f"{wx:9.1f}" if wx else "      n/a"
+            sr = f"{rx:9.1f}" if rx else "      n/a"
+            print(f"{label:>9} | {w:8.1f}K | {r:8.1f}K | {sw} | {sr}")
 
         try:
             tn.cmd("shutdown")
