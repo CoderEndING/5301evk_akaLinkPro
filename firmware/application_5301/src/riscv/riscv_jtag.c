@@ -250,6 +250,13 @@ static uint32_t sba_clear_errors(void)
     return sbcs;
 }
 
+/* Public wrapper: the bridge's error-recovery path needs the same "clear the
+ * sticky bits" step the SWD backend gets from swd_clear_errors(). */
+uint32_t riscv_jtag_clear_errors(void)
+{
+    return sba_clear_errors();
+}
+
 static int sba_config(uint32_t extra)
 {
     uint32_t sbcs = SBCS_SBACCESS32 | SBCS_SBAUTOINC | extra;

@@ -84,6 +84,26 @@ def main():
     cmd(dev, ACT_TARGET, [1])
     print("2. chunk = 1024 B")
     cmd(dev, ACT_CONFIG, u32(0) + [0x00, 0x04, 0, 0xFF])   # hz=keep, chunk=1024
+
+    # 先把 COM 口打开并把读线程跑起来，**再**启动桥。
+    # 反过来（先 start、后 open+reset_input_buffer）会把桥搬出的第一块数据整个丢掉：
+    # 桥在 ACT_START 返回后一两毫秒内就开始推数据，而 pyserial 的 reset_input_buffer()
+    # 会把驱动里已经缓冲好的字节全部清掉。
+    import serial
+    ser = serial.Serial(port, 115200, timeout=0.1)
+    ser.reset_input_buffer()
+
+    got = 0
+    stop = threading.Event()
+
+    def drain():
+        nonlocal got
+        while not stop.is_set():
+            got += len(ser.read(65536))
+
+    th = threading.Thread(target=drain, daemon=True)
+    th.start()
+
     print("3. start bridging [0x%08X, +0x%X) channel 0" % (addr, size))
     r = cmd(dev, ACT_START, u32(addr) + u32(size) + [0])
     w = words(r)
@@ -94,16 +114,14 @@ def main():
     if w:
         print("   flags=0x%08X cb=0x%08X up=0x%08X" % (w[0], w[1], w[2]))
 
-    import serial
-    ser = serial.Serial(port, 115200, timeout=0.1)
-    ser.reset_input_buffer()
     print("4. draining %s for %.1fs ..." % (port, secs))
-    got = 0
     t0 = time.time()
-    while time.time() - t0 < secs:
-        n = len(ser.read(65536))
-        got += n
+    time.sleep(secs)
     dt = time.time() - t0
+    first = got
+    stop.set()
+    th.join(timeout=1.0)
+    got = first
     ser.close()
 
     w = words(cmd(dev, ACT_STATUS))

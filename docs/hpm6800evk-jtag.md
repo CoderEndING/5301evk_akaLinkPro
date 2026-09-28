@@ -180,36 +180,95 @@ mdw 0x1240000 -> 47474553 52205245 00005454   "SEGGER RTT" —— 固件在跑
 > `#include "trace_log.h"`**，而该头只存在于 `samples/lwip/lwip_tcpecho/src/TRACE_LOG/`，
 > 任何新工程都会因此编不过；本工程把该目录加进 include 路径绕过（没动 SDK）。
 
-### 5.3 RTT 交付率 —— **未达标，卡在探针侧 SBA 的确定性失败**
+### 5.3 RTT 交付率 —— **已打通：1109~1165 KB/s，字节级零丢包**
 
-探针侧 RTT 桥已加上 RISC-V 后端（`rtt_bridge_set_target(1)`，HID CMD_RTT
-action 10；`rtt_read_bytes` / RdOff 回写分别走 `riscv_jtag_read` /
-`riscv_jtag_write_word`）。实测（`script_test/hpm6800_rtt_delivery.py COM5 5`）：
+探针侧 RTT 桥的 RISC-V 后端（`rtt_bridge_set_target(1)`，HID CMD_RTT action 10；
+`rtt_read_bytes` / RdOff 回写分别走 `riscv_jtag_read` / `riscv_jtag_write_word`）
+加上之后，实测（`script_test/hpm6800_rtt_delivery.py COM5 5`）：
 
 ```
-rc=0                          <- 桥启动成功
-up=0x01240018                 <- 找到了控制块（CB 在 0x01240000）
-host read 0 bytes             <- 主机侧一个字节都没收到
-bridge: drained=2048 polls=54 moves=1 rderr=75 wderr=15
+rc=0, cb=0x01240000, up=0x01240018
+host read 5963776 bytes in 5.00s -> 1164.7 KB/s
+bridge: drained=6033408 bytes, polls=2947, moves=2946, rderr=0, wderr=0
 ```
 
-现象是**确定性**的：**第一次搬运成功（2048 B），之后每一次读控制块都失败**
-（`rderr` 每轮必涨、`moves` 恒等于 1）。已经试过三个健壮性修复都**完全没有变化**
-（计数逐字节相同），说明没打在失败点上：
+10 秒长跑 + 字节流校验（`script_test/hpm6800_rtt_loss.py COM5 10`）：
 
-1. 块读失败重试 3 次；
-2. 单字 BUSY 重发 4 次；
-3. `sbcs` 的 `sbbusyerror/sberror` 改成 **写 1 清零**（原先写成 `& ~bits` 是错的）。
+```
+host received   11358208 bytes in 10.000s -> 1109.1 KB/s
+probe drained   11347968 bytes (polls=5542 moves=5541 rderr=0 wderr=0 zips=0)
+stream check OK: 873708 complete records + 0 trailing bytes, pattern exact
+```
 
-下一步应该做的（留给下一轮）：
+狂发固件写的是同一条 13 字节记录 `"hello world!\n"`，**丢一个字节模式必然错位**，
+所以"873708 条完整记录、模式精确复现"比计数更能说明问题：**11.36 MB 一个字节
+不丢、不重**。速率贴着探针侧 SBA 的 1.18 MB/s 天花板（§4），CDC/USB 那一跳不是
+瓶颈。
 
-- 在失败点上直接 dump **41 位原始响应**与 `sbcs`/`dmstatus`（`CMD_RISCV` 已有
-  `action 8` 的 DMI 原始扫描入口），先确认失败到底是 DMI `op != 0`、
-  还是 SBA `sbbusyerror`；
-- 顺带查主机侧收不到字节的问题：`s_cdc_src_rtt` 是否真的切过来了、CDC IN
-  是否在 RTT 路径里被启动（SWD 侧同一套代码是通的，所以更可能是 RTT 桥在
-  第一次失败后就再没把数据推进环）；
-- 参考量级：探针侧 SBA 实测 1.18 MB/s（§4），所以交付率上限就在那附近。
+#### 真因：`rtt_write_word()` 对 RISC-V 的返回码极性反了
+
+这是本轮唯一的功能性 bug，也是最难看出来的一类 —— 它不报错、不崩，只是**静默地
+把成功当失败**。桥里两个后端的底层约定相反：
+
+| 底层调用 | 成功 | 失败 |
+|---|---|---|
+| `swd_write_word()` | 1 | 0 |
+| `riscv_jtag_write_word()` | 0 | 负 |
+
+`rtt_write_word()` 的调用方一律按 **`0 = 失败`** 判：
+
+```c
+if (rtt_write_word(up + RDOFF, new_rd) == 0) { s_write_err++; s_rd_pending = ...; return -1; }
+```
+
+SWD 分支写对了（成功返回 `-1`），RISC-V 分支忘了取反。后果是一条**死循环**：
+第一块 2048 B 搬完 → 回写 RdOff 其实成功 → 被判成失败 → 置 `s_rd_pending` 并
+`return -1` → 下一轮先进"幂等补写"分支 → 又"成功当失败" → 再 `return -1`……
+**从此再也不读控制块**，`drained` 永远冻在 2048、`write_err` 每轮 +1。
+
+实测指纹（`script_test/hpm6800_rtt_diag.py`，用 HID PEEK 直接读探针 RAM）：
+
+```
+s_write_err     = 0x0D        <- 在涨
+s_rd_pend_v     = 0           <- 但 pending 又总被清掉（写真的失败了才会清）
+s_drained       = 0x800       <- 冻在第一块
+uartrx.in/out   = 0x800/0x800 <- 注意：数据其实已经过 USB 走了
+```
+
+修法就是归一语义：`rtt_write_word()` 明确成 **0 = 成功 / -1 = 失败**（与
+`rtt_read_bytes` 一致），两个后端各自取反，两个调用点同步改成 `!= 0` 判失败。
+
+#### "主机读 0 字节"是**测量脚本自己的坑**，不是固件问题
+
+`uartrx.in` 和 `out` 都是 `0x800`：2048 B 早就被 USB 取走了。原脚本的顺序是
+`ACT_START` → `sleep(0.3)` → 读状态 → **才** `serial.Serial()` +
+`reset_input_buffer()`，把桥推出来的唯一一块数据整个丢掉；而桥又因为上面的 bug
+再没产出第二块，于是"读 0 字节"看起来像固件不发数据。现在读线程在 `ACT_START`
+**之前**起来。
+
+#### 顺带修掉的第二个坑：错误路径里调了 `swd_clear_errors()`
+
+桥的错误恢复路径（`rtt_find_cb()` 重试、`rtt_bridge_poll()` 每 3 次失败后的重扫、
+基准重试）都在调 DAPLink 的 `swd_clear_errors()`。在 JTAG 模式下这等于**把 SWD
+引擎的时钟打在 JTAG 引脚上**，TAP 状态机当场被打散 —— 之后每一次 DMI 扫描都只能
+读到 IDCODE（实测 `s_dbg` 四条全是 `0x…1000563D`），比不清还糟。
+现在按目标分派：SWD 走 `swd_clear_errors()`，RISC-V 走新的
+`riscv_jtag_clear_errors()`（SBCS 的 `sbbusyerror`/`sberror` 写 1 清零）。
+同理 `rtt_clock_step_down()`（SWD 的降档阶梯）对 RISC-V 无意义，改成
+`rtt_link_recover()`：只重走 `riscv_jtag_open()`（TAP 复位 + 重新加载 IR=DMI）。
+
+> 教训：**跨后端的适配层必须显式归一"成功/失败"的方向**，而且要把可观测计数
+> 打进状态字里 —— 这次就是靠 `s_write_err` 在涨、`s_rd_pend_v` 却是 0 这一对
+> 互相矛盾的读数才定位到的。只加"重试"类健壮性补丁完全没用：四次构建的计数
+> **逐字节相同**，因为失败点根本不在那些分支上。
+
+#### 速率上限在哪
+
+探针侧 SBA 块读 1.18 MB/s（§4）就是天花板，交付率已经到它的 98%。再往上只有
+抬 DMI 引擎本身：一次 DMI 访问 = `idle(8) + 导航(5) + 41 bit = 54 TCK`，移位
+循环约 19 cycle/bit（SWD 的 60 MHz blob 是 6 cycle/bit）。也就是说 RISC-V 侧
+现在**是 CPU 周期受限**，不是协议受限。
+
 
 ---
 
@@ -234,9 +293,19 @@ python script_test\hpm6800_riscv.py wbench 0x1200000 1024 50
 :: 4) 主机侧 SRAM 口径
 python script_test\sram_speed_hpm6800.py --size 65536 --regions axi
 
-:: 5) 时序扫描（每点一次构建+烧写+自检，约 2 分钟）
+:: 5) RTT 交付率（探针自己搬环，主机只读串口）
+python script_test\hpm6800_rtt_delivery.py COM5 5     :: 速率
+python script_test\hpm6800_rtt_loss.py COM5 10        :: 字节级丢包校验（模式必须精确复现）
+python script_test\hpm6800_rtt_diag.py COM5 3         :: 出问题时读探针 RAM 定位
+python script_test\hpm6800_cdc_check.py COM5          :: CDC 通路 / 环 vs 主机字节数对照
+
+:: 6) 时序扫描（每点一次构建+烧写+自检，约 2 分钟）
 powershell -File script_test\hpm6800_timing_sweep.ps1
 ```
+
+> `hpm6800_rtt_diag.py` 里的符号地址是**按当前构建**从
+> `build_dfu_evklite/output/akaLinkPro_App.asm` 的 `# <sym>` 注释里取的；
+> 改了固件后要重新取（`s_drained` 之类是 `static`，map 里不一定有）。
 
 ### HID 协议补充
 

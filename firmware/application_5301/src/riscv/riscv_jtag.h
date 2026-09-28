@@ -64,6 +64,13 @@ uint32_t riscv_jtag_get_delay(void);
 uint32_t riscv_jtag_last_sbcs(void);
 uint32_t riscv_jtag_last_dmstatus(void);
 
+/* Clear the sticky SBA error bits (sbbusyerror / sberror are write-1-to-clear).
+ * This is the RISC-V counterpart of DAPLink's swd_clear_errors(): a transient
+ * system-bus error otherwise latches and every later SBA access returns FAULT.
+ * The two are NOT interchangeable - swd_clear_errors() drives the SWD engine on
+ * the same pins and wrecks the TAP state machine. */
+uint32_t riscv_jtag_clear_errors(void);
+
 /* Bring-up diagnostics: raw 41-bit DR values of the most recent DMI scans. */
 uint64_t riscv_jtag_dbg(uint32_t idx);
 

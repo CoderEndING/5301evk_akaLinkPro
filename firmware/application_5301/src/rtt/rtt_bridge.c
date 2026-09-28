@@ -169,13 +169,37 @@ void rtt_bridge_set_target(uint32_t kind)
     s_target = (kind != 0U) ? 1U : 0U;
 }
 
+/* 写目标内存里的一个字。返回 0 = 成功、-1 = 失败（与 rtt_read_bytes 同约定）。
+ *
+ * 两个后端底层的返回约定相反，必须在这里归一：
+ *   swd_write_word()        1 = 成功、0 = 失败
+ *   riscv_jtag_write_word() 0 = 成功、负 = 失败
+ * 早先这个包装漏了对 RISC-V 取反，于是"回写 RdOff 成功"被判成失败：桥搬完第一块
+ * 就永久卡在补写分支里（每个 poll 补写一次、write_err 每轮必涨、drained 再也不动，
+ * 连控制块都不再读）。 */
 static int rtt_write_word(uint32_t addr, uint32_t val)
 {
     if (s_target == 1U)
     {
         return (riscv_jtag_write_word(addr, val) == 0) ? 0 : -1;
     }
-    return (swd_write_word(addr, val) == 0U) ? 0 : -1;
+    return swd_write_word(addr, val) ? 0 : -1;
+}
+
+/* 清掉链路上的 sticky 错误，成功后重试才有意义。
+ *
+ * 必须分目标：SWD 的清错是往 DP_ABORT 写 DAPLink 的四个 CLR 位；JTAG 下这条路径
+ * 会把 SWD 引擎的时钟直接打在 JTAG 引脚上，TAP 状态机当场被打散 —— 之后每一次
+ * DMI 扫描都只能读到 IDCODE（实测 s_dbg 四条全是 0x…1000563D），比不清还糟。
+ * RISC-V 这边对应的是 SBCS 的 sbbusyerror / sberror（写 1 清零）。 */
+static void rtt_clear_link_errors(void)
+{
+    if (s_target == 1U)
+    {
+        (void)riscv_jtag_clear_errors();
+        return;
+    }
+    (void)swd_clear_errors();
 }
 
 /* Load the fast bit-bang blob and set the SWD timing. Uses the DAP command
@@ -320,7 +344,7 @@ static int rtt_find_cb(void)
             /* 一次失败先清 sticky 错误重试同一段（换挡后的瞬态很常见）；仍失败才
              * 认为已经走出目标 SRAM（搜索区间默认 64 KB，而 F103C8 只有 20 KB），
              * 后面全是未映射区，再扫没有意义，直接收工。 */
-            (void)swd_clear_errors();
+            rtt_clear_link_errors();
             if (rtt_read_bytes(s_search_addr + off, s_scan, want) != 0)
             {
                 s_read_err++;
@@ -357,7 +381,7 @@ static int rtt_poll_once(uint32_t *moved)
      * 目标上了）就会被误判为"没写成功"，两边对不齐 —— 要么丢一段、要么重一段。 */
     if (s_rd_pending_valid)
     {
-        if (rtt_write_word(s_up_addr + RTT_UP_RDOFF_OFF, s_rd_pending) == 0)
+        if (rtt_write_word(s_up_addr + RTT_UP_RDOFF_OFF, s_rd_pending) != 0)
         {
             s_write_err++;
             return -1; /* 下轮再补 */
@@ -434,7 +458,7 @@ static int rtt_poll_once(uint32_t *moved)
     *moved = target;
 
     uint32_t new_rd = (up.rd + target) % up.size;
-    if (rtt_write_word(s_up_addr + RTT_UP_RDOFF_OFF, new_rd) == 0)
+    if (rtt_write_word(s_up_addr + RTT_UP_RDOFF_OFF, new_rd) != 0)
     {
         s_write_err++;
         s_rd_pending = new_rd;
@@ -459,6 +483,25 @@ static int rtt_clock_step_down(void)
         }
     }
     return 0;
+}
+
+/* 链路上的"重来一次"。
+ *   SWD    —— 降一档再初始化（高频档抖了就往稳的档退）。
+ *   RISC-V —— 没有档位可降：DMI 一旦不应答，唯一的出路是重走 TAP 复位并把
+ *             IR 重新加载成 DMI，而 riscv_jtag_open() 干的正好是这件事。 */
+static void rtt_link_recover(void)
+{
+    if (s_target == 1U)
+    {
+        s_swd_ready = 0U;
+        (void)rtt_swd_init();
+        return;
+    }
+    if (rtt_clock_step_down())
+    {
+        s_swd_ready = 0U;
+        (void)rtt_swd_init();
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -763,7 +806,7 @@ static void rtt_bridge_run_bench(void)
             if (retried == 0U)
             {
                 retried = 1U;
-                (void)swd_clear_errors();
+                rtt_clear_link_errors();
                 continue;
             }
             s_bench_err = -4;
@@ -844,19 +887,15 @@ void rtt_bridge_poll(void)
              * （STICKYERR/STICKYORUN/WDERR…），之后**每一次**访问都直接返回 FAULT。
              * 不主动清，一次瞬态就会变成永久失效 —— 高频档尤其容易踩到。
              * swd_clear_errors() 即 DAPLink 的 DP_ABORT 写（STKCMPCLR|STKERRCLR|
-             * WDERRCLR|ORUNERRCLR）。 */
-            (void)swd_clear_errors();
+             * WDERRCLR|ORUNERRCLR）；RISC-V 下换成 SBCS 的写 1 清零。 */
+            rtt_clear_link_errors();
             s_cb_addr = 0U;
             if (rtt_find_cb() != 0)
             {
                 /* 重扫也找不到：这才是「这一档真的用不了」，降一档重来。
                  * （注意不能一有错就降档：目标运行中出现几次读失败是正常的瞬态，
                  *   那样会把 45 MHz 平白降到 20 MHz。） */
-                if (rtt_clock_step_down())
-                {
-                    s_swd_ready = 0U;
-                    (void)rtt_swd_init();
-                }
+                rtt_link_recover();
                 s_backoff_until = now + (RTT_ERROR_BACKOFF_MS * (RTT_MCHTMR_HZ / 1000U));
                 return;
             }
@@ -866,11 +905,7 @@ void rtt_bridge_poll(void)
             if (++s_rescans_since_step >= RTT_RESCANS_PER_STEP_DOWN)
             {
                 s_rescans_since_step = 0U;
-                if (rtt_clock_step_down())
-                {
-                    s_swd_ready = 0U;
-                    (void)rtt_swd_init();
-                }
+                rtt_link_recover();
             }
         }
         s_backoff_until = now + (RTT_ERROR_BACKOFF_MS * (RTT_MCHTMR_HZ / 1000U));
