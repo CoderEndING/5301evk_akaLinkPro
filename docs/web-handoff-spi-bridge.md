@@ -265,14 +265,36 @@ def step_frame(cmd, params, delay_ms=0, rsp=False):
 
 **两块屏的档位与线上效果**（都已在真机/LA 上验证过字节格式）：
 
-**天马 2P01 / AXS15352（档 1，4 线 SPI + DC）**
+**天马 2P01 / AXS15352（档 1，4 线 SPI + DC）—— 已上真屏验证，照抄即可**
+
 ```
-profile=1, dc_active_high=1, cs_hold_in_step=1
-pad_dc=PB11, pad_rst=PB12, pad_bl=PB13, pad_te=PB10
-STEP{cmd=0xCE, params=[5A A5]}  →  线上：CS↓ DC=0 发 CE → DC=1 发 5A A5 → CS↑
-STEP{cmd=0x11, nparams=0, delay_ms=100}  →  发完 0x11 再等 100 ms
+配置: profile=1, dc_active_high=1, cs_hold_in_step=1, cs_policy=0(PA26 自动 CS),
+      pad_dc=PB11(1), pad_rst=PB12(2), pad_bl=PB13(3), pad_te=PB10(4), sclk=40~75 MHz
+接线: SCLK=J3[23] MOSI=J3[19] CS=J3[24] DC=J3[13] RST=J3[27] BL=J3[28] TE=J3[26]
+      （屏的 VCI/VDDI 接 3V3；背光是裸 LED，LEDA/LEDK 要单独供，别指望 GPIO）
+
+序列:
+  RESET{low_ms=10, post_ms=120}
+  STEP{0x36, [0x08]}                 ★ MADCTL: BGR=1（色序，不设就红蓝互换）
+  STEP{0x3A, [0x55]}                 ★ COLMOD: RGB565/16bpp（厂家表里没有，必须补！）
+  ...厂家 30 条（0xCE 5A A5 开头，含 0x11 + Delay(100ms) + 0x29）...
+  STEP{0x2A, [00 00 00 EF]}          列 0..239
+  STEP{0x2B, [00 00 01 27]}          行 0..295
+  XFER{dc_en, dc_level=0, tx=0x2C}  flags=CS_HOLD    ← RAMWR（命令，DC 低）
+  XFER{dc_en, dc_level=1, tx=480B}  flags=CS_HOLD    ← 像素（数据，DC 高），CS 一直不抬
+  ...重复...                        flags=0           ← 最后一片释放 CS
 ```
-（LA 实测 MOSI = `CE 5A A5`，一个 CS 窗口 24 拍。）
+
+⚠️ **三条"屏黑"级注意事项**：
+1. 厂家给的初始化表**不含 `0x36`/`0x3A`**，这两条必须自己补在 vendor 序列**之前**
+   （ESP-IDF 的 `esp_lcd_st77916` 组件就是这么做的）。缺了 → 全黑。
+2. `MADCTL` 的 **bit3 = BGR**：`0x00` 时红蓝互换，这块屏要 `0x08`。
+   颜色不对先动这一位，别急着换数据字节序。
+3. 刷图**只有最后一片带 `RSP`**。每片都带会把吞吐砍半（实测 4.22 → 2.08 MB/s）。
+   另外**一帧一次 bulk 写**，把多帧拼成一个 blob 会被 512 B 包边界切断 → `BAD_FRAME`。
+
+实测：40 MHz 整屏 142 KB 用 32.1 ms（**4.22 MB/s，线速的 88%**）；
+60/75 MHz 吞吐饱和在 ~4.7 MB/s（瓶颈转到主机侧每帧开销），75 MHz 无花屏。
 
 **ST77916（档 2，QSPI）**
 ```
