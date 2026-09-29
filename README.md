@@ -954,6 +954,7 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 | [`docs/HPM5301EVKLite_port.md`](docs/HPM5301EVKLite_port.md) | EVKLite 移植说明：引脚映射、构建、烧录、自调试、验证清单 |
 | [`docs/HANDOVER-evklite-20260927.md`](docs/HANDOVER-evklite-20260927.md) | 移植过程交接记录（含 CDC 回环故障的根因与修复） |
 | [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议（0x31 RTT / 0x32 SCOPE / 0x33 RISCV / 0x34 BRIDGE） |
+| [`docs/web-handoff-riscv-scope.md`](docs/web-handoff-riscv-scope.md) | **给网页侧的最小改动说明**：波形页采 RISC-V 需要的三个新位、哪些 SWD 专属控件该藏、按后端分档的采样率提示 |
 | [`script_test/stm32f103_scope/`](script_test/stm32f103_scope) | J-Scope 的靶子固件（F103C8/ZE，96 MHz，10 kHz 契约波形）+ `check.py` 客观验收 |
 | [`firmware/application_5301/Flash_Memory_Map.md`](firmware/application_5301/Flash_Memory_Map.md) | Flash 布局 |
 | [`firmware/application_5301/Firmware_Integrity_Plan.md`](firmware/application_5301/Firmware_Integrity_Plan.md) | 固件头/CRC 校验设计 |
