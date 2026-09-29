@@ -286,6 +286,22 @@ void riscv_svc_poll(void)
         }
         break;
     }
+    case RISCV_ACT_SBASTAT:
+    {
+        /* 硬件回读 SBCS（不信缓存里的那份）+ sticky 错误统计。
+         * 状态字：[6] = SBCS 实值、[9] = 错误事件数、[10] = 首次出错的 SBCS、
+         * [11] = 重读/重挂次数（低位 16 位重读整块、高位 16 位单字重挂）。 */
+        uint32_t ev = 0U;
+        uint32_t first = 0U;
+        uint32_t retries = 0U;
+        uint32_t recovers = 0U;
+
+        (void)riscv_jtag_clear_errors();      /* 回读 SBCS（顺带清 sticky），更新 last_sbcs */
+        riscv_jtag_sba_stats(&ev, &first, &retries, &recovers);        s_check = ev;
+        s_check_words[0] = first;
+        s_check_words[1] = (retries & 0xFFFFU) | ((recovers & 0xFFFFU) << 16);
+        break;
+    }
     case RISCV_ACT_CONFIG:
     case RISCV_ACT_STATUS:
     default:

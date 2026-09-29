@@ -60,6 +60,12 @@ static uint32_t s_last_dmstatus;
  * 任何重新配置 sbcs 的路径（sba_config）都会把它清掉。 */
 static uint32_t s_hold_addr;
 static uint8_t s_hold_ok;
+static uint32_t s_hold_reads;      /* 本段"抱住"里读了多少拍（用于摊薄错误检查） */
+
+/* 单字流水路径上每这么多拍回读一次 SBCS 查 sticky 错误。
+ * 32 拍 = 2 次扫描的检查摊到 32 次扫描上，开销 ~6%；期间最多 32 拍可能是坏值
+ * （J-Scope 300 kHz 下约 0.1 ms），换来的是"错误不会永久静默"。 */
+#define SBA_ERR_CHECK_PERIOD 32U
 
 /* SBCS 配置缓存 + "上次失败过"标志。
  *
@@ -119,6 +125,14 @@ static uint32_t s_delay = 8U;
 /* Bring-up diagnostics: the raw 41-bit DR values of the last few DMI scans. */
 static uint64_t s_dbg[4];
 static uint32_t s_dbg_n;
+
+/* SBA sticky 错误（sbbusyerror / sberror）统计 —— 见 sba_check_errors()。
+ * 这三个数通过 CMD_RISCV 的 action=9（sbastat）读出来：正常情况下应当恒为 0，
+ * 一旦增长就说明"读到过恒定值"，是排查读冻结的第一现场。 */
+static uint32_t s_sba_err_events;   /* 发现 sticky 错误的次数 */
+static uint32_t s_sba_err_sbcs;     /* 第一次发现错误时的 SBCS 原值 */
+static uint32_t s_sba_err_retries;  /* 因 sticky 错误而重读整块的次数 */
+static uint32_t s_sba_err_recover;  /* 单字流水路径上就地重挂地址的次数 */
 
 uint64_t riscv_jtag_dbg(uint32_t idx)
 {
@@ -300,9 +314,33 @@ static uint32_t sba_clear_errors(void)
          * `sbcs & ~bits`（写 0）等于什么都没做，于是第一次出错之后 SBA 永久
          * 卡在错误态：RTT 桥表现为"搬了一块就再也搬不动"（rderr 每轮必涨、
          * moves 恒等于 1）。这里保持配置位不变、把错误位写 1。 */
+        if (s_sba_err_events == 0U)
+        {
+            s_sba_err_sbcs = sbcs;   /* 留一份原始现场，别被后面的清错覆盖 */
+        }
+        s_sba_err_events++;
         (void)dmi_write(DM_SBCS, sbcs | SBCS_SBBUSYERROR | SBCS_SBERROR);
+        s_sbcs_valid = 0U;           /* 这次整字写回，保守点：下次重新配置 */
     }
     return sbcs;
+}
+
+/* 🚨 读块之后必须核对 SBA 的 sticky 错误位 —— **DMI 应答是 SUCCESS 并不代表
+ * SBA 真的做了这次访问**。
+ *
+ * 只要有一次 SBA 访问落在 sbbusy 期间，DM 就把 `sbbusyerror` 置起来，然后
+ * **静默忽略之后所有的 SBA 访问**：DMI op 照样回 SUCCESS，`sbdata0` 一直返回
+ * 上一次成功读到的那个值。表现出来就是"读到的值永远不变、而且不会自己恢复"
+ * （实测：J-Scope 稳定输出一串恒定值 0xBF19999A；OpenOCD 的 sysbus 读同一块
+ * 区域直接报 "Failed to read memory via system bus" —— 同一个原因）。
+ * 唯一手段是回读 SBCS，写 1 清掉，再把整块重读一遍。
+ *
+ * 代价：2 次 DMI 扫描。块读（1 KB = 256 字）可以忽略；8 字 span 约 +17%。 */
+static int sba_check_errors(void)
+{
+    uint32_t sbcs = sba_clear_errors();     /* 里面已经"读 + 写 1 清" */
+
+    return ((sbcs & (SBCS_SBBUSYERROR | SBCS_SBERROR)) != 0U) ? -1 : 0;
 }
 
 /* Public wrapper: the bridge's error-recovery path needs the same "clear the
@@ -310,6 +348,17 @@ static uint32_t sba_clear_errors(void)
 uint32_t riscv_jtag_clear_errors(void)
 {
     return sba_clear_errors();
+}
+
+/* SBA sticky 错误的统计（诊断用，见 sba_check_errors）：正常情况下应当全 0。
+ * 任一非 0 都说明"读到过恒定值/静默失败"曾经发生过。 */
+void riscv_jtag_sba_stats(uint32_t *events, uint32_t *first_sbcs,
+                          uint32_t *retries, uint32_t *recovers)
+{
+    if (events != NULL)      { *events = s_sba_err_events; }
+    if (first_sbcs != NULL)  { *first_sbcs = s_sba_err_sbcs; }
+    if (retries != NULL)     { *retries = s_sba_err_retries; }
+    if (recovers != NULL)    { *recovers = s_sba_err_recover; }
 }
 
 /* 写 SBCS 并更新缓存（失败就把缓存标脏，下次一定重写）。 */
@@ -467,6 +516,12 @@ int riscv_jtag_read_word(uint32_t addr, uint32_t *val)
     {
         return -4;
     }
+    /* 同上：DMI 应答漂亮不代表 SBA 真的读了（sticky 错误会让它静默返回旧值）。 */
+    if (sba_check_errors() != 0)
+    {
+        s_sba_failed = 1U;
+        return -5;
+    }
     return 0;
 }
 
@@ -515,6 +570,7 @@ int riscv_jtag_hold_prepare(uint32_t addr)
 
     s_hold_addr = addr;
     s_hold_ok = 1U;
+    s_hold_reads = 0U;              /* 重新计时：下一次错误检查在 32 拍之后 */
     return 0;
 }
 
@@ -525,6 +581,23 @@ int riscv_jtag_hold_read(uint32_t *val)
     if (!s_hold_ok)
     {
         return -1;
+    }
+
+    /* 🚨 这条路径每拍只有 1 次 DMI 扫描，"每拍都回读 SBCS"会把吞吐砍掉一半
+     * （2 次扫描的检查 vs 1 次扫描的读取）。所以**摊薄**：每 HOLD_ERR_CHECK_PERIOD
+     * 拍核对一次 sticky 错误。发现错误就地重挂地址再读一次 —— 对采样器透明，
+     * 最多丢一拍；不这么做的话，sbbusyerror 会让读值永久冻结（静默、不恢复）。 */
+    if ((++s_hold_reads % SBA_ERR_CHECK_PERIOD) == 0U)
+    {
+        if (sba_check_errors() != 0)
+        {
+            s_hold_ok = 0U;
+            if (riscv_jtag_hold_prepare(s_hold_addr) != 0)
+            {
+                return -1;
+            }
+            s_sba_err_recover++;
+        }
     }
 
     resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
@@ -696,6 +769,14 @@ int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
     (void)dmi_post(DMI_OP_NOP, 0U, 0U);
     (void)tail;
 
+    /* 🚨 必须核对 sticky 错误：DMI 应答 SUCCESS 只说明"这次 DMI 传输没问题"，
+     * SBA 侧可能整块都被静默忽略了（详见 sba_check_errors）。出错就让调用方重读。 */
+    if (sba_check_errors() != 0)
+    {
+        s_sba_failed = 1U;
+        return -5;
+    }
+
     /* 🚨 成功路径**不**再读一遍 SBCS 清错（那是 2 次扫描的纯开销）：出错时上面各
      * 分支已经清过，下一次 sba_config() 也会因为 s_sba_failed 再清一次。 */
     return 0;
@@ -818,19 +899,25 @@ void riscv_jtag_probe(uint32_t n, uint64_t *out)
 
 /* 目标 CPU 在跑的时候，SBA 偶发一次非 0 响应（sbbusy/sberror）就把整个 1 KB
  * 块判死，实测 RTT 桥下每块几乎必中一次 -> 搬运几乎停摆。这里按块重试：
- * 清掉 sticky 错误再重来，通常第二次就干净。 */
+ * 清掉 sticky 错误再重来，通常第二次就干净。
+ * 另外 read_once 末尾发现 sticky 错误（op 仍是 SUCCESS 的"静默"失败）也走这里。 */
 int riscv_jtag_read(uint32_t addr, uint8_t *dst, uint32_t len)
 {
     int rc = -4;
 
-    for (uint32_t attempt = 0U; attempt < 3U; attempt++)
+    for (uint32_t attempt = 0U; attempt < 4U; attempt++)
     {
         rc = riscv_jtag_read_once(addr, dst, len);
         if (rc == 0)
         {
             break;
         }
+        if (attempt != 0U)
+        {
+            s_sba_err_retries++;
+        }
         s_last_sbcs = sba_clear_errors();
+        s_sba_failed = 1U;
     }
     return rc;
 }

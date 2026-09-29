@@ -272,13 +272,51 @@ class PktStream:
         return out
 
 
+def rv_expect(t):
+    """靶子契约：给定一拍 g_tick，算出这一拍除 LFSR 外的字段该是什么。"""
+    p20 = t % 20
+    return {
+        'u_hi':   0x10000000 | (t & 0xFFFF),
+        'f_sin':  RV_SIN20[p20],
+        'f_tri':  ((p20 if p20 < 10 else 20 - p20) / 10.0) - 1.0,
+        'i_sq1k': 1000 if (t % 10) < 5 else -1000,
+        'i_sq5k': 1000 if (t & 1) else -1000,
+        'u_ramp': t % 1000,
+    }
+
+
+RV_ORDER = ('u_hi', 'f_sin', 'f_tri', 'i_sq1k', 'i_sq5k', 'u_ramp')
+
+
+def rv_same(name, got, want):
+    if isinstance(want, float):
+        return abs(got - want) <= 1e-6
+    return got == want
+
+
+def lfsr_next(v):
+    """靶子里的那个 32 位 LFSR（x^32 + x^22 + x^2 + x + 1 的右移形式）。"""
+    return ((v >> 1) ^ ((0xFFFFFFFF if (v & 1) else 0) & 0x80200003)) & 0xFFFFFFFF
+
+
 def verify_rv(samples):
     """逐字段精确核对 HPM6800EVK scope 靶子的契约。
 
-    靶子的每个字段都是由 `g_tick` 算出来的（见 hpm6800evk_scope/src/main.c），
-    而 `g_tick` 与它们**在同一拍**被采到 —— 所以能反算核对，而不是"看着像波形"。
-    顺带证明帧内各字段来自同一瞬间（不是拼出来的）。"""
-    print("—— 靶子契约核对（每字段都由同一拍的 g_tick 反算）——")
+    靶子的每个字段都由同一拍 `g_tick` 算出（见 hpm6800evk_scope/src/main.c），所以能
+    反算核对，而不是"看着像波形"。
+
+    🚨 但**靶子的 8 个字不是原子更新的**：探针读一整个 32 B span 要 ~30 µs，而靶子
+    每 100 µs 更新一次，所以偶尔会在读的过程中推进到下一拍。此时帧内会出现
+    "前 k 个字是 tick 的值、后面是 tick+1 的值"——这是**目标侧**的固有竞态
+    （任何调试器都一样），不是探针读错。所以判据是：
+
+      * 每个字都必须等于 `tick` 或 `tick+1` 推出来的值（**不允许**别的取值）；
+      * 这些取值必须随字偏移**单调**（先 tick 后 tick+1）—— 顺带证明确实按地址
+        顺序读、没有重排/错位；
+      * LFSR 必须是那条唯一的 32 位序列（逐拍步进核对）—— 错位、串值、重排都过不去。
+
+    任何一条不满足即为 FAIL。撕裂率单独报出来（它是采样率/总线争用的函数）。"""
+    print("—— 靶子契约核对（逐字段由同一拍 g_tick 反算；允许读期间靶子推进一拍）——")
     n = len(samples)
     if n == 0:
         print("  没有样本")
@@ -292,38 +330,95 @@ def verify_rv(samples):
               % ticks[0])
         return False
 
-    bad = dict.fromkeys(('u_hi', 'f_sin', 'f_tri', 'i_sq1k', 'i_sq5k', 'u_ramp', 'lfsr'), 0)
-    lfsr_changes = 0
-    prev = None
+    matched = dict.fromkeys(RV_ORDER, 0)     # 与 tick 或 tick+1 之一相符
+    exact = 0                                 # 整帧同拍
+    torn = 0                                  # 读期间靶子推进了一拍
+    torn_boundary = {}                        # 撕裂点分布（第几个字开始是新的一拍）
+    bad = []                                  # 无法用契约解释的样本
+    gens = {}                                 # 每个样本选定/允许的"字段世代"
 
-    for s in samples:
+    for idx, s in enumerate(samples):
         t = s['g_tick']
-        p20 = t % 20
-        if s['u_hi'] != (0x10000000 | (t & 0xFFFF)):
-            bad['u_hi'] += 1
-        if abs(s['f_sin'] - RV_SIN20[p20]) > 1e-6:
-            bad['f_sin'] += 1
-        if abs(s['f_tri'] - (((p20 if p20 < 10 else 20 - p20) / 10.0) - 1.0)) > 1e-6:
-            bad['f_tri'] += 1
-        if s['i_sq1k'] != (1000 if (t % 10) < 5 else -1000):
-            bad['i_sq1k'] += 1
-        if s['i_sq5k'] != (1000 if (t & 1) else -1000):
-            bad['i_sq5k'] += 1
-        if s['u_ramp'] != (t % 1000):
-            bad['u_ramp'] += 1
-        if s['lfsr'] == 0:
-            bad['lfsr'] += 1
-        if prev is not None and s['lfsr'] != prev:
-            lfsr_changes += 1
-        prev = s['lfsr']
+        e0, e1 = rv_expect(t), rv_expect(t + 1)
+        allow = {}
+        for f in RV_ORDER:
+            m0 = rv_same(f, s[f], e0[f])
+            m1 = rv_same(f, s[f], e1[f])
+            if m0 or m1:
+                matched[f] += 1
+            allow[f] = {g for g, m in ((0, m0), (1, m1)) if m}
+        # 单调赋值：能选出"先 0 后 1"的序列才算合法
+        prev, gen, why = 0, [], None
+        for i, f in enumerate(RV_ORDER):
+            pick = next((g for g in sorted(allow[f]) if g >= prev), None)
+            if pick is None:
+                why = "第 %d 个字 %s=0x%X 既不是 tick 也不是 tick+1 的值" % (
+                    i + 1, f, s[f] if isinstance(s[f], int) else 0)
+                break
+            prev = pick
+            gen.append(pick)
+        if why is None:
+            if 1 in gen:
+                torn += 1
+                torn_boundary[gen.index(1) + 1] = torn_boundary.get(gen.index(1) + 1, 0) + 1
+            else:
+                exact += 1
+        else:
+            bad.append((s, why))
+        gens[idx] = None if why else gen
 
-    ok = True
-    for k in ('u_hi', 'f_sin', 'f_tri', 'i_sq1k', 'i_sq5k', 'u_ramp', 'lfsr'):
-        good = n - bad[k]
-        print("  %-7s %6d/%d 正确%s" % (k, good, n, "" if bad[k] == 0 else "   ← %d 个不符" % bad[k]))
-        ok = ok and (bad[k] == 0)
-    print("  %-7s %6d/%d 逐拍变化%s" % ("lfsr动", lfsr_changes, max(n - 1, 0),
-                                     "" if lfsr_changes == max(n - 1, 0) else "   ← 有拍没变"))
+    # LFSR：只能是那条唯一的 32 位序列，逐拍步进核对（错位/串值/重排都过不去）。
+    # 🚨 lfsr 是第 8 个字，撕裂同样可能"只发生在它身上"，所以它也允许推进一拍：
+    #    期望值由参考点推进 (tick - tick_ref) 或 (tick + 1 - tick_ref) 步得到。
+    lfsr_ok = lfsr_bad = 0
+    ref = None                                # (世代, lfsr)
+    for idx, s in enumerate(samples):
+        gen = gens.get(idx)
+        if gen is None:
+            continue
+        prev_gen = (gen[-1] if gen else 0)
+        t = s['g_tick']
+        if ref is None:
+            if prev_gen != 0:
+                continue                      # 撕裂帧不当参考，等一个同拍帧定基准
+            ref = (t, s['lfsr'])
+            continue
+        cand = []
+        for g in (t, t + 1):
+            if g < ref[0] or (g - ref[0]) > 64:
+                continue                      # 倒退/跳太远：不当候选
+            v = ref[1]
+            for _ in range(g - ref[0]):
+                v = lfsr_next(v)
+            cand.append((g, v))
+        # 单调性：字段已经推进到下一拍时，lfsr 不能反而停在上一拍
+        ok_c = [g for g, v in cand if v == s['lfsr'] and g >= t + prev_gen]
+        if ok_c:
+            lfsr_ok += 1
+            ref = (max(ok_c), s['lfsr'])
+        else:
+            lfsr_bad += 1
+            if cand:
+                ref = (cand[0][0], s['lfsr'])  # 重新对齐，避免一处错报成一片
+
+    ok = (not bad)
+    for f in RV_ORDER:
+        print("  %-7s %6d/%d 与 tick 或 tick+1 相符%s" % (
+            f, matched[f], n, "" if matched[f] == n else "   ← %d 个不符" % (n - matched[f])))
+    print("  %-7s %6d/%d 逐拍步进正确%s" % (
+        "lfsr", lfsr_ok, max(lfsr_ok + lfsr_bad, 1),
+        "" if lfsr_bad == 0 else "   ← %d 处断链" % lfsr_bad))
+    print("  同拍帧 %d (%.1f%%)；读期间推进一拍（目标侧非原子更新）%d (%.1f%%)%s" % (
+        exact, 100.0 * exact / n, torn, 100.0 * torn / n,
+        "" if not torn_boundary else "，撕裂点分布 %s" %
+        ", ".join("第%d字×%d" % (k, v) for k, v in sorted(torn_boundary.items()))))
+    if bad:
+        s, why = bad[0]
+        print("  ❌ 无法解释的样本：%s" % why)
+        print("     实际 tick=%d u_hi=0x%X f_sin=%r f_tri=%r i_sq1k=%d i_sq5k=%d u_ramp=%d lfsr=0x%X"
+              % (s['g_tick'], s['u_hi'], s['f_sin'], s['f_tri'], s['i_sq1k'], s['i_sq5k'],
+                 s['u_ramp'], s['lfsr']))
+    ok = ok and (lfsr_bad == 0)
     print("  契约核对：%s" % ("PASS" if ok else "FAIL"))
     return ok
 

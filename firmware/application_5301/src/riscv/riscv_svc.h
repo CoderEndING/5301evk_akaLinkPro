@@ -22,6 +22,7 @@
 #define RISCV_ACT_STATUS  6U
 #define RISCV_ACT_CONFIG  7U  /* args: clock delay override */
 #define RISCV_ACT_DMIPROBE 8U /* args: number of NOP scans (<= 8) */
+#define RISCV_ACT_SBASTAT  9U /* 回读 DM 的 SBCS + SBA sticky 错误统计（诊断） */
 
 void riscv_svc_request(uint32_t action, uint32_t addr, uint32_t arg1, uint32_t arg2);
 void riscv_svc_poll(void);

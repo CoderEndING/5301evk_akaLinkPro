@@ -88,6 +88,12 @@ uint32_t riscv_jtag_last_dmstatus(void);
  * the same pins and wrecks the TAP state machine. */
 uint32_t riscv_jtag_clear_errors(void);
 
+/* SBA sticky 错误（sbbusyerror / sberror）统计，诊断用：正常应当全 0。
+ * 非 0 说明"SBA 曾经静默忽略访问、读值冻结"发生过（见 riscv_jtag.c 的
+ * sba_check_errors 注释）。任一参数可为 NULL。 */
+void riscv_jtag_sba_stats(uint32_t *events, uint32_t *first_sbcs,
+                          uint32_t *retries, uint32_t *recovers);
+
 /* Bring-up diagnostics: raw 41-bit DR values of the most recent DMI scans. */
 uint64_t riscv_jtag_dbg(uint32_t idx);
 

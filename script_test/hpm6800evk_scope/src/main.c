@@ -5,7 +5,7 @@
  * 让探针的 HSS 采样器（HID 0x32 + bulk IN 0x83，走 JTAG 的 SBA 后端）采回来之后
  * 能逐项核对"采到的到底对不对"，而不只是"有多少包"。
  *
- * 契约（8 × u32 = 32 B，全部 4 字节对齐，`g_v` 的地址构建后用 nm 查）：
+ * 契约（8 × u32 = 32 B，全部 4 字节对齐）：
  *
  *   | 偏移 | 名字    | 类型 | 内容 |
  *   | --- | --- | --- | --- |
@@ -18,19 +18,33 @@
  *   | +24 | u_ramp  | u32  | 0..999 每拍 +1 的斜坡（10 kHz 周期 = 100 ms） |
  *   | +28 | lfsr    | u32  | 32 位 LFSR，每拍一步（伪随机，验"值在动"） |
  *
+ * 🚨 **变量块必须放非缓存区**（`.noncacheable.bss` → 0x01240000 起，256 KB）。
+ * 原因：探针读目标内存走 **SBA（系统总线访问）**，**绕过 CPU 的 D-cache**。放在可
+ * 缓存区（0x01200000~0x0123FFFF）的变量，只要那一行还待在 cache 里没被逐出，
+ * SRAM 里就一直是旧值 —— 实测靶子在跑、OpenOCD 经 CPU 读到活的 tick，探针读回**全 0**。
+ * 这条是 SBA 类调试器的固有属性（J-Link 同理），不是探针能修的：要么把变量放非缓存区
+ * （本固件的做法），要么每拍把 cacheline 写回（`l1c_dc_writeback`，注意 64 B 对齐 +
+ * 长度是 64 的整数倍，否则 SDK 里的断言会直接 abort，见 README）。
+ *
+ * 对照样本 `g_v_cached` / `g_updates_cached`：同一份数据放**可缓存**区、且**不写回**，
+ * 用来把上面那条限制钉成可复现的证据（探针应当读到"停在旧值/全 0"）。
+ *
  * 时基：MCHTMR（machine timer）直接轮询，每 `f/10000` 个计数更新一拍。不用中断
  * —— 靶子的职责只是"让变量按已知速率变化"，polling 的抖动是纳秒级，比 ISR 简单
- * 且不依赖 SDK 的定时器驱动。实测频率上报在 `g_mchtmr_hz`，主机可以据此核对
- * "10 kHz 时基"是不是真的 10 kHz。
+ * 且不依赖 SDK 的定时器驱动。实测频率上报在 `g_mchtmr_hz`。
  *
- * 构建/烧录：见同目录 README。变量地址：
- *   riscv32-unknown-elf-nm -S build/flash_xip/output/hpm6800evk_scope.elf | findstr g_v
+ * 异常自报：覆盖 SDK 的 weak `exception_handler`，把第一次异常的 cause/epc/mtval
+ * 记在**非缓存区**再停住 —— 主机（或 OpenOCD）可以直接把现场读出来。SDK 默认实现是
+ * `return epc`，会把出错指令无限重试，表现出来就是"靶子不动了"，没有任何线索。
+ *
+ * 构建/烧录：见同目录 README。变量地址用 nm 查（会随编译变化，不要硬编码）：
+ *   riscv32-unknown-elf-nm -S build/flash_xip/output/demo.elf | findstr g_v
  */
 #include <stdint.h>
 
 #include "board.h"
 #include "hpm_clock_drv.h"
-#include "hpm_l1c_drv.h"
+#include "hpm_common.h"
 #include "hpm_mchtmr_drv.h"
 
 typedef struct
@@ -45,9 +59,24 @@ typedef struct
     volatile uint32_t lfsr;
 } scope_vars_t;
 
-volatile scope_vars_t g_v;          /* ← 主机要的地址就是这个符号（32 B，一个 span） */
-volatile uint32_t g_mchtmr_hz;      /* 实测 MCHTMR 频率（给主机对账时基） */
-volatile uint32_t g_updates;        /* 更新次数（= tick 的镜像，便于"到底在不在跑"） */
+/* ---- 契约块（非缓存区，探针 SBA 直读得到当前值）---- */
+ATTR_PLACE_AT_NONCACHEABLE_BSS_WITH_ALIGNMENT(32) volatile scope_vars_t g_v;
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_mchtmr_hz;  /* 实测 MCHTMR 频率 */
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_updates;    /* 更新次数（tick 的镜像） */
+/* 自描述头：主机可以先读这两个字确认"这里的 32 B 就是变量块" */
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_block_magic; /* 'SCOP' */
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_block_addr;  /* = (uint32_t)&g_v */
+
+/* ---- 异常现场（非缓存区，出问题也能读出来）---- */
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_trap_count;
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_trap_cause;
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_trap_epc;
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_trap_mtval;
+ATTR_PLACE_AT_NONCACHEABLE_BSS volatile uint32_t g_trap_tick;
+
+/* ---- 对照样本（可缓存区 + 不写回：SBA 读不到新值，见文件头注释）---- */
+volatile scope_vars_t g_v_cached;
+volatile uint32_t g_updates_cached;
 
 /* 500 Hz 正弦：20 个点一个周期（10 kHz / 20 = 500 Hz）。
  * 用查表而不是 sinf()：一是避免拖 libm 进固件，二是表就是契约的一部分。 */
@@ -58,10 +87,34 @@ static const float kSin20[20] = {
     -1.000000f, -0.951057f, -0.809017f, -0.587785f, -0.309017f,
 };
 
+/* 覆盖 SDK 的 weak 实现（soc/HPM6800/HPM6880/toolchains/trap.c）：
+ * 记现场 → 停在原地。停住比"无限重试出错指令"好排查得多，而现场的四个字都在
+ * 非缓存区，任何 SBA 调试器（本探针 / OpenOCD / J-Link）都能直接读出来。 */
+long exception_handler(long cause, long epc);
+long exception_handler(long cause, long epc)
+{
+    uint32_t mtval = 0U;
+
+    __asm volatile("csrr %0, mtval" : "=r"(mtval));
+
+    g_trap_cause = (uint32_t)cause;
+    g_trap_epc   = (uint32_t)epc;
+    g_trap_mtval = mtval;
+    g_trap_tick  = g_v.tick;
+    g_trap_count++;
+
+    for (;;)
+    {
+    }
+}
+
 int main(void)
 {
     board_init();
     board_init_led_pins();
+
+    g_block_magic = 0x53434F50U;                  /* 'SCOP' */
+    g_block_addr  = (uint32_t)(uintptr_t)&g_v;
 
     uint32_t hz = (uint32_t)clock_get_frequency(clock_mchtmr0);
     g_mchtmr_hz = hz;
@@ -90,28 +143,36 @@ int main(void)
         uint32_t p10 = t % 10U;                       /* 1 kHz 相位（10 拍一周期） */
         uint32_t p20 = t % 20U;                       /* 500 Hz 相位 */
 
-        g_v.tick   = t;
-        g_v.u_hi   = 0x10000000U | (t & 0xFFFFU);
-        g_v.f_sin  = kSin20[p20];
-        g_v.f_tri  = ((float)((p20 < 10U) ? p20 : (20U - p20)) / 10.0f) - 1.0f;  /* -1..+1 */
-        g_v.i_sq1k = (p10 < 5U) ? 1000 : -1000;
-        g_v.i_sq5k = ((t & 1U) != 0U) ? 1000 : -1000;
-        g_v.u_ramp = t % 1000U;
-
         /* x^32 + x^22 + x^2 + x^1 + 1（标准 maximal LFSR 的右移形式） */
         lfsr = (lfsr >> 1) ^ ((uint32_t)(-(int32_t)(lfsr & 1U)) & 0x80200003U);
-        g_v.lfsr = lfsr;
 
-        g_updates = t;
+        float    f_sin  = kSin20[p20];
+        float    f_tri  = ((float)((p20 < 10U) ? p20 : (20U - p20)) / 10.0f) - 1.0f;
+        int32_t  i_sq1k = (p10 < 5U) ? 1000 : -1000;
+        int32_t  i_sq5k = ((t & 1U) != 0U) ? 1000 : -1000;
+        uint32_t u_ramp = t % 1000U;
 
-        /* 🚨 必须把 D-cache 写回：探针是用 **SBA（系统总线访问）** 读目标内存的，
-         * **绕过 CPU 的 D-cache** —— 不写回的话探针读到的永远是 SRAM 里那份
-         * "最初的 0"（实测踩过：同一时刻 OpenOCD 读到活的 163549，探针读回 0）。
-         * OpenOCD 的内存访问走抽象命令、是**经 CPU** 的，所以它看得见新值；
-         * 而这几行字一直待在 cache 里从没被逐出过。40 B 的写回开销可忽略。 */
-        l1c_dc_writeback((uint32_t)(uintptr_t)&g_v, sizeof(g_v));
-        l1c_dc_writeback((uint32_t)(uintptr_t)&g_updates, sizeof(g_updates));
-        l1c_dc_writeback((uint32_t)(uintptr_t)&g_mchtmr_hz, sizeof(g_mchtmr_hz));
+        /* 契约块（非缓存区：写入直达 SRAM，探针读到的就是这一拍的值） */
+        g_v.tick   = t;
+        g_v.u_hi   = 0x10000000U | (t & 0xFFFFU);
+        g_v.f_sin  = f_sin;
+        g_v.f_tri  = f_tri;
+        g_v.i_sq1k = i_sq1k;
+        g_v.i_sq5k = i_sq5k;
+        g_v.u_ramp = u_ramp;
+        g_v.lfsr   = lfsr;
+        g_updates  = t;
+
+        /* 对照样本：同一份数据写进可缓存区，不做写回（探针走 SBA 应当读不到新值） */
+        g_v_cached.tick   = t;
+        g_v_cached.u_hi   = 0x10000000U | (t & 0xFFFFU);
+        g_v_cached.f_sin  = f_sin;
+        g_v_cached.f_tri  = f_tri;
+        g_v_cached.i_sq1k = i_sq1k;
+        g_v_cached.i_sq5k = i_sq5k;
+        g_v_cached.u_ramp = u_ramp;
+        g_v_cached.lfsr   = lfsr;
+        g_updates_cached  = t;
 
         if ((t & 0x1FFFU) == 0U)                      /* ~0.8 s 闪一次，证明在跑 */
         {

@@ -11,6 +11,7 @@ Usage:
   python hpm6800_riscv.py wbench <addr> <bytes> <iters>
   python hpm6800_riscv.py sbench <addr> <iters>
   python hpm6800_riscv.py rcheck <addr> <words>
+  python hpm6800_riscv.py sbastat
   python hpm6800_riscv.py stop
   python hpm6800_riscv.py delay <n>
 """
@@ -27,6 +28,7 @@ CMD_RISCV = 0x33   # 0x32 让给了网页「J-Scope 波形」页的 SCOPE
 ACT_STOP, ACT_OPEN, ACT_RBENCH, ACT_WBENCH = 0, 1, 2, 3
 ACT_SBENCH, ACT_RCHECK, ACT_STATUS, ACT_CONFIG = 4, 5, 6, 7
 ACT_DMIPROBE = 8
+ACT_SBASTAT = 9
 
 MCHTMR_HZ = 24000000
 
@@ -112,6 +114,19 @@ def request(dev, action, addr=0, a1=0, a2=0, timeout=60.0):
     raise RuntimeError("operation did not finish in %.0fs (status=%s)" % (timeout, w))
 
 
+def decode_sbcs(v):
+    """把 SBCS 拆成人话 —— sticky 错误位是"读到恒定值"的元凶，必须一眼看见。"""
+    cfg = "sbaccess=%d" % ((v >> 17) & 7)
+    if v & (1 << 16): cfg += "|autoinc"
+    if v & (1 << 20): cfg += "|ronaddr"
+    if v & (1 << 15): cfg += "|rondata"
+    bad = []
+    if v & (1 << 21): bad.append("sbbusy")
+    if v & (1 << 22): bad.append("SBBUSYERROR")
+    if (v >> 12) & 7: bad.append("SBERROR=%d" % ((v >> 12) & 7))
+    return cfg + ("  <-- " + ",".join(bad) if bad else "")
+
+
 def show(w, label=""):
     if w is None:
         print("  no status")
@@ -120,12 +135,12 @@ def show(w, label=""):
     print("  %sopen=%d pending=%d rc=0x%X action=%d" %
           (label, flags & 0xFF, (flags >> 8) & 0xFF, (flags >> 16) & 0xFFFF, (flags >> 24) & 0xFF))
     print("    idcode=0x%08X dtmcs=0x%08X dmstatus=0x%08X" % (w[1], w[2], w[3]))
-    print("    moved=%d ticks=%d (%.1f ms) sbcs=0x%08X delay=%d iters=%d" %
-          (w[4], w[5], w[5] / (MCHTMR_HZ / 1000.0), w[6], w[7] & 0xFF, (w[7] >> 8) & 0xFFFFFF))
+    print("    moved=%d ticks=%d (%.1f ms) sbcs=0x%08X [%s] delay=%d iters=%d" %
+          (w[4], w[5], w[5] / (MCHTMR_HZ / 1000.0), w[6], decode_sbcs(w[6]), w[7] & 0xFF, (w[7] >> 8) & 0xFFFFFF))
     if w[4] and w[5]:
         print("    rate = %.1f KB/s (%.0f bytes/s)" % (w[8] / 1024.0, w[8]))
     if w[9] or w[10] or w[11]:
-        print("    check sum=0x%08X | raw DR: %08X %08X %08X" % (w[9], w[10], w[11], w[9]))
+        print("    check=0x%08X word0=0x%08X word1=0x%08X" % (w[9], w[10], w[11]))
 
 
 def main(argv):
@@ -172,6 +187,16 @@ def main(argv):
         addr = int(argv[1], 0)
         words = int(argv[2], 0)
         show(request(dev, ACT_RCHECK, addr=addr, a1=words), "RCHECK: ")
+    elif cmd == "sbastat":
+        w = request(dev, ACT_SBASTAT)
+        show(w, "SBASTAT: ")
+        print("    SBCS 硬件回读 = 0x%08X  [%s]" % (w[6], decode_sbcs(w[6])))
+        print("    sticky 错误事件 = %d（首次出错时 SBCS = 0x%08X）" % (w[9], w[10]))
+        print("    整块重读 = %d 次，单字流水重挂 = %d 次" % (w[11] & 0xFFFF, w[11] >> 16))
+        if w[9] == 0:
+            print("    => 干净：没有发生过 SBA 静默失败（读值不会冻结）")
+        else:
+            print("    => 发生过 SBA sticky 错误（sbbusyerror/sberror）：不查这一位就会读出一串恒定值")
     else:
         print(__doc__)
         return 1
