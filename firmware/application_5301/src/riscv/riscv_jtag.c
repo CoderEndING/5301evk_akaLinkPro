@@ -480,11 +480,19 @@ int riscv_jtag_open(void)
      * without it a DMI request just stays busy (RISC-V Debug Spec 1.0, 3.2). */
     (void)dmi_post(DMI_OP_NOP, 0U, 0U);
     (void)dmi_post(DMI_OP_NOP, 0U, 0U);
-    if (dmi_write(DM_DMCONTROL, DMCONTROL_DMACTIVE) != 0)
-    {
-        return -3;
-    }
 
+    /* 🚨 先把 DM **复位**一次（dmactive 写 0 再写 1），而不是只写 1。
+     *
+     * 这是 SBA 卡死时唯一的解药：如果读到一个没挂载的地址，总线访问可能永远不返回，
+     * `sbbusy` 就一直挂着 —— 此后**每一次** SBA 访问都失败（清 sticky 错误位没用，
+     * sbbusy 不是 sticky 的错，是"忙"），实测连 TAP 复位都救不回来：
+     * 读一次 0x40000000（无 SDRAM）之后，读正常地址一律 rc=-1。
+     * 写 dmactive=0 会复位 DM（中止所有进行中的操作），再写 1 唤醒 —— 这才是
+     * "重新开始"的语义（Debug Spec 1.0 §3.2：dmcontrol 在 dmactive=0 时也可写）。 */
+    (void)dmi_write(DM_DMCONTROL, 0U);
+    (void)dmi_write(DM_DMCONTROL, DMCONTROL_DMACTIVE);
+
+    /* 真正的判据是"DM 醒了吗"，不是上面那次写的返回码（复位瞬间的应答可能不可信）。 */
     if (dmi_read(DM_DMSTATUS, &s_dmstatus) != 0)
     {
         return -2;
@@ -640,6 +648,12 @@ int riscv_jtag_write_word(uint32_t addr, uint32_t val)
     if (dmi_write(DM_SBDATA0, val) != 0)
     {
         return -4;
+    }
+    /* 同上：写也可能被 sticky 错误静默吞掉（RTT 桥的回写就靠这条路）。 */
+    if (sba_check_errors() != 0)
+    {
+        s_sba_failed = 1U;
+        return -5;
     }
     return 0;
 }
@@ -863,6 +877,14 @@ int riscv_jtag_write(uint32_t addr, const uint8_t *src, uint32_t len)
     }
 
     (void)dmi_post(DMI_OP_NOP, 0U, 0U); /* drain the stale response */
+
+    /* 🚨 写路径同样会被 sticky 错误**静默**吞掉（DMI 应答 SUCCESS、数据没进内存），
+     * 所以这里也要核对一次：RTT 桥的回写 RdOff 一旦被吞，下一块会重复搬旧数据。 */
+    if (sba_check_errors() != 0)
+    {
+        s_sba_failed = 1U;
+        return -4;
+    }
     return 0;
 }
 

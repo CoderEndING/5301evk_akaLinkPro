@@ -366,6 +366,26 @@ Byte[0x03-0x3F] = Command data（可选）
     （SWD 侧也一样互斥，只是 JTAG 上没有"让路一拍"这种折中）。
     另外 RISC-V 每次采样都会占目标系统总线，高频采样可能影响目标实时性。
 
+    **RISC-V 走 SBA 的两个固有属性（不是探针能修的，用之前必须知道）**：
+
+    1. **变量在可缓存区里读到的可能是旧值。** SBA 是系统总线主设备，**绕过目标的
+       D-cache**：目标刚写进 cache、还没写回 SRAM 的变量，探针读到的是上一次写回的
+       值（极端情况读到全 0 —— 实测靶子变量放可缓存区时探针读回全 0，而同一时刻
+       OpenOCD 经 CPU 读到的是活值）。**J-Link 读 RISC-V 同理**，这是 SBA 类通路的
+       通性。三种应对：① 变量放非缓存区（推荐，HPM6800EVK 上是
+       `ATTR_PLACE_AT_NONCACHEABLE_BSS`；判据见 `script_test/hpm6800evk_scope/README.md`）；
+       ② 目标每拍把变量的 cacheline 写回（`l1c_dc_writeback`，**地址和长度都要
+       cacheline 对齐**：HPM6880 是 64 B，写错会挂 SDK 断言 → abort → `_exit` 停车）；
+       ③ 把该区域配成 write-through/write-around。
+    2. **一帧里多个字不是同一瞬间的（撕裂）。** 读一个 32 B span 要 ~30 µs，期间目标
+       可能已经更新到下一拍，于是帧内会出现"前几个字是上一拍、后面是下一拍"。
+       任何调试器都一样；要避免就只盯 1~2 个变量、或让目标用 seqlock/双缓冲。
+
+    ⚠️ 还有一个**会静默发生**的故障：SBA 的 `sbbusyerror` 一旦置位，之后所有 SBA
+    访问都会被 DM 悄悄忽略（DMI 应答仍是 SUCCESS），读值**永久冻结在某个曾经正确的
+    值**上、且不会自愈。固件已经做了检测与恢复（见第 17 条 action 9），
+    真出问题先跑 `python script_test/hpm6800_riscv.py sbastat` 看计数。
+
     响应：Byte[0x01] = 长度，Byte[0x02] = 0x32，**Byte[0x03] = 启动码**（网页读 `res[2]`，
     -100 = 排队中，0 = 正常，-1/-2/-3/-4 见 scopeRcText），Byte[0x04..0x33] = 12 个状态字。
     ⚠️ 状态字 0 的 **bit1 = 生效后端是 RISC-V/JTAG**（丢弃模式下没有 DEF 包，就靠这一位
@@ -428,6 +448,7 @@ Byte[0x03-0x3F] = Command data（可选）
     | 6 | 查状态，**不排队**（也是所有动作的默认查询口） | — |
     | 7 | `config`：设 DMI idle 周期数，**立即生效、不排队** | addr = 周期数 |
     | 8 | `dmiprobe`：原始 DMI 扫描（TAP 复位 → `IR=DMI` → 4 次请求），把原始 41 位响应塞进状态块 | addr = 扫描条数（0 = 6） |
+    | 9 | `sbastat`：回读 SBCS 实值 + SBA sticky 错误统计（**读值冻结时第一个该看的**） | — |
 
     设备回应 response
     Byte[0x00] = 0x02 // Report ID
@@ -458,9 +479,37 @@ Byte[0x03-0x3F] = Command data（可选）
     每次占两个字（低 32 位 + 高 9 位），看 `op[1:0]` / `data` / `addr` 用来判断
     "DMI 应答了吗、应答的是哪个寄存器"。
 
+    **action=9（`sbastat`）**：回读 DM 的 SBCS 实值 + SBA sticky 错误统计，
+    排查"读到的值永远不变"时第一个该看的动作：
+
+    | 字 | 含义 |
+    | --- | --- |
+    | [6] | SBCS 硬件回读值（不信配置缓存那份）：`sbbusy` bit21、`sbbusyerror` bit22、`sberror` [14:12] |
+    | [9] | sticky 错误事件数（**正常情况下恒为 0**） |
+    | [10] | 第一次发现错误时的 SBCS 原值（现场） |
+    | [11] | 低 16 = 因 sticky 错误重读整块的次数；高 16 = 单字流水就地重挂的次数 |
+
+    > 🚨 **为什么必须有这一位**：只要有一次 SBA 访问落在 `sbbusy` 期间，DM 就把
+    > `sbbusyerror` 置起来，之后**所有 SBA 访问都不再执行** —— DMI op 照样回
+    > `SUCCESS`，`sbdata0` 一直返回**上一次成功读到的那个值**。表现就是"读到的值
+    > 永远不变、而且不会自己恢复"（实测：J-Scope 稳定输出恒定值 `0xBF19999A`，
+    > 而同时刻 OpenOCD 的 sysbus 读同一区域直接报
+    > `Failed to read memory via system bus` —— 同一个原因）。
+    > 现在块读收尾会回读 SBCS 并写 1 清错、有错就整块重读；单字流水路径每 32 拍
+    > 查一次、发现就地重挂地址。代价：8 字 span 30.8 → 37.6 µs，1 KB 块读 +0.2%。
+
+    **action=5（`rcheck`）** 仍然是写已知图案再读回比校验和的完整性门禁，
+    但注意它只能验"探针读到的是它自己写进去的东西"；读**目标正在写的**内存要用
+    契约型靶子（`script_test/hpm6800evk_scope`）。
+
     说明与约束：
     - **探针必须先切到 `output_mode=1`（SWD+JTAG）**，`output_mode=0` 会拒绝 JTAG；
       该设置只在 RAM 里，探针复位/重插即丢。见第 9 条 `CMD_SET_CONFIG`。
+      ⚠️ 把全局目标类型切回 SWD/ARM（第 16 条里 scope 的 `--swd`）会**顺带**把端口
+      模式改成 SWD-only，此后 OpenOCD 报 `CMSIS-DAP: JTAG not supported` /
+      `Unsupported DTM version: -1`，要用 `CMD_SET_CONFIG` 切回 1 才恢复。
+    - **RISC-V 引擎开着的时候会一直占着 TAP**（`open=1`）；要让 OpenOCD/DFU 用这条
+      JTAG 链路，先发 `action=0`（`stop`）把端口交出来。
     - `idle` 周期数**不能减**：HPM6880 的 DTM `dtmcs.idle` 读出来是 7，实测 8 稳、
       6 只跑得动 6/50 轮就死、≤4 立刻不应答。HPM6800EVK 侧 JTAG TCK 规格上限
       25 MHz，当前引擎跑在 ~16.4 MHz（一次 DMI 访问 54 TCK）。

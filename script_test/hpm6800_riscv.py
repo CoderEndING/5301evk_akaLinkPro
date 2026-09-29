@@ -193,10 +193,15 @@ def main(argv):
         print("    SBCS 硬件回读 = 0x%08X  [%s]" % (w[6], decode_sbcs(w[6])))
         print("    sticky 错误事件 = %d（首次出错时 SBCS = 0x%08X）" % (w[9], w[10]))
         print("    整块重读 = %d 次，单字流水重挂 = %d 次" % (w[11] & 0xFFFF, w[11] >> 16))
-        if w[9] == 0:
+        if w[6] & (1 << 21):
+            print("    => 🚨 SBA 挂死：sbbusy 一直挂着。通常是访问了没有响应的地址"
+                  "（未挂载/未上电的区域 —— 总线事务永远不返回）。清 sticky 位、复位 DM、"
+                  "复位 TAP 都解不开，只能复位目标（ndmreset / 断电重上电）。")
+        elif w[9] == 0:
             print("    => 干净：没有发生过 SBA 静默失败（读值不会冻结）")
         else:
-            print("    => 发生过 SBA sticky 错误（sbbusyerror/sberror）：不查这一位就会读出一串恒定值")
+            print("    => 发生过 SBA sticky 错误（sbbusyerror/sberror），已自动清掉并重读；"
+                  "不查这一位就会读出一串恒定值")
     else:
         print(__doc__)
         return 1
