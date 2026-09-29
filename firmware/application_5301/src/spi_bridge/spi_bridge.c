@@ -136,6 +136,16 @@ typedef struct
     volatile uint16_t out_r;
     volatile uint16_t out_used;
     volatile uint8_t out_inflight;
+    /* 环的"代数"：复位时 +1。武装读/写时记下当时的代数，完成回调如果发现代数对不上，
+     * 说明这一笔是**跨复位**收到的旧包，必须丢掉。
+     * 踩过的坑：复位只把 out_w/r/used 清零、同时还把 out_inflight 清零，但端点上那一笔
+     * 已武装的读**照样会完成**，回调于是往刚清零的环里写 —— 把复位前的旧帧"复活"成新帧
+     * 执行。实测症状：`loop --lens 1` 的帧（seq=1、data=01）在十几分钟后、经过多次
+     * enable/disable，仍被当作下一批命令的第一帧执行，还顺手把 CS_HOLD 的 CS 释放了。 */
+    volatile uint8_t out_gen;
+    volatile uint8_t out_armed_gen;
+    volatile uint8_t in_gen;
+    volatile uint8_t in_armed_gen;
     /* 每槽实际收到的字节数。**不能存在槽里**：槽的前 8 B 是第一帧的帧头，offset 6
      * 正是该帧的 len 字段，写在那里会把帧头改坏。 */
     volatile uint16_t out_pkt_len[SB_OUT_SLOTS];
@@ -167,6 +177,7 @@ typedef struct
     uint32_t last_ticks;     /* 上一笔事务耗时（mchtmr tick，24 MHz）——给阈值定档用 */
 
     volatile uint8_t reset_req;
+    volatile uint8_t usb_reset_req; /* 总线复位：在飞传输作废、回调不会来，必须清在飞标志 */
     volatile uint8_t abort_req;
 
     uint16_t cs_pad; /* GPIO 模式下生效的 CS 脚；0 = 用硬件 CS0 */
@@ -195,6 +206,10 @@ static sb_state_t s_st;
 #define s_out_r (s_st.out_r)
 #define s_out_used (s_st.out_used)
 #define s_out_inflight (s_st.out_inflight)
+#define s_out_gen (s_st.out_gen)
+#define s_out_armed_gen (s_st.out_armed_gen)
+#define s_in_gen (s_st.in_gen)
+#define s_in_armed_gen (s_st.in_armed_gen)
 #define s_out_pkt_len (s_st.out_pkt_len)
 #define s_in_w (s_st.in_w)
 #define s_in_r (s_st.in_r)
@@ -214,6 +229,7 @@ static sb_state_t s_st;
 #define s_dma_ok (s_st.dma_ok)
 #define s_last_ticks (s_st.last_ticks)
 #define s_reset_req (s_st.reset_req)
+#define s_usb_reset_req (s_st.usb_reset_req)
 #define s_abort_req (s_st.abort_req)
 #define s_cs_pad (s_st.cs_pad)
 #define s_cs_asserted (s_st.cs_asserted)
@@ -1009,6 +1025,7 @@ static void sb_out_kick(void)
     }
     if (usbd_ep_start_read(0, SB_OUT_EP, s_out_buf[s_out_w], SB_PKT_SIZE) == 0)
     {
+        s_out_armed_gen = s_out_gen; /* 记下这一笔属于哪一代 */
         s_out_inflight = 1U;
     }
     sb_irq_restore(lvl);
@@ -1017,6 +1034,12 @@ static void sb_out_kick(void)
 void spi_bridge_out_done(uint32_t nbytes)
 {
     s_out_inflight = 0U;
+    if (s_out_armed_gen != s_out_gen)
+    {
+        /* 跨复位收到的旧包：丢掉，绝不入环（否则会被当新帧执行） */
+        sb_out_kick();
+        return;
+    }
     if (nbytes != 0U)
     {
         if (nbytes > SB_PKT_SIZE)
@@ -1049,6 +1072,7 @@ static void sb_in_kick(void)
     }
     if (usbd_ep_start_write(0, SB_IN_EP, s_in_buf[slot], len) == 0)
     {
+        s_in_armed_gen = s_in_gen;
         s_in_inflight = 1U;
     }
     sb_irq_restore(lvl);
@@ -1089,6 +1113,13 @@ static uint8_t *sb_rsp_init(uint8_t *slot, uint8_t type, uint8_t status, uint16_
 void spi_bridge_in_done(uint32_t nbytes)
 {
     (void)nbytes;
+    if (s_in_armed_gen != s_in_gen)
+    {
+        /* 跨复位的那一包：环已经清过，别再去减 s_in_used（会下溢） */
+        s_in_inflight = 0U;
+        sb_in_kick();
+        return;
+    }
     if (s_in_used != 0U)
     {
         s_in_r = (uint16_t)((s_in_r + 1U) % SB_IN_SLOTS);
@@ -1585,9 +1616,14 @@ static void sb_process_packets(void)
 
 void spi_bridge_poll(void)
 {
-    if (s_reset_req != 0U)
+    if (s_usb_reset_req != 0U)
     {
-        s_reset_req = 0U;
+        /* USB 总线复位：端点上在飞的传输被硬件作废、完成回调**不会再来**，
+         * 所以这里必须把在飞标志清掉，否则桥从此再也不武装端点。
+         * 代数 +1 是为了让万一迟到的回调被识别成旧包丢弃。 */
+        s_usb_reset_req = 0U;
+        s_out_gen++;
+        s_in_gen++;
         s_out_w = 0U;
         s_out_r = 0U;
         s_out_used = 0U;
@@ -1596,6 +1632,29 @@ void spi_bridge_poll(void)
         s_in_r = 0U;
         s_in_used = 0U;
         s_in_inflight = 0U;
+        s_pkt_active = 0U;
+        s_pkt_off = 0U;
+        s_pkt_len = 0U;
+        s_delay_active = 0U;
+        s_rst_state = 0U;
+    }
+    if (s_reset_req != 0U)
+    {
+        /*
+         * 清环（HID RESET / ENABLE 时的 CLEAR_ON_ENABLE）：只丢"已收但还没处理"的帧。
+         * 两个刻意的选择：
+         *   ① **不动 s_out_inflight / s_in_inflight**：端点上那一笔已武装的传输照样会
+         *      完成，置 0 会让 sb_*_kick() 重复武装，而 DWC2 对忙端点再来一笔是静默顶掉
+         *      （回调永不来）→ 在飞标志永久卡住。
+         *   ② **也不 bump 代数**：那一笔完成时收到的是"复位之后主机才发来的新数据"，
+         *      必须当新帧执行（实测按代数丢弃会把 enable 后的第一帧直接吃掉）。
+         *      代数只在 USB 总线复位（传输被硬件作废）时才 +1。
+         */
+        s_reset_req = 0U;
+        s_out_r = s_out_w;
+        s_out_used = 0U;
+        s_in_r = s_in_w;
+        s_in_used = 0U;
         s_pkt_active = 0U;
         s_pkt_off = 0U;
         s_pkt_len = 0U;
@@ -1823,6 +1882,11 @@ void spi_bridge_init(void)
     s_pkt_active = 0U;
     s_pkt_off = 0U;
     s_pkt_len = 0U;
+    s_out_gen = 0U;
+    s_out_armed_gen = 0U;
+    s_in_gen = 0U;
+    s_in_armed_gen = 0U;
+    s_usb_reset_req = 0U;
     s_delay_active = 0U;
     s_rst_state = 0U;
     s_rst_post_ms = 0U;
@@ -1842,7 +1906,7 @@ void spi_bridge_usb_reset(void)
 {
     /* 总线复位（重枚举/驱动重启/唤醒）：在飞的 0x0B/0x8B 传输全部作废、完成回调
      * 不会再来，所以要清账。这里只置标志，真正的清账在主循环里做（不和回调抢状态）。 */
-    s_reset_req = 1U;
+    s_usb_reset_req = 1U;
 }
 
 uint8_t spi_bridge_is_enabled(void)
