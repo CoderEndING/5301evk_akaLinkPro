@@ -97,19 +97,16 @@ void riscv_jtag_invalidate_cache(void)
     s_cfg_ops = 0U;
 }
 
-/* 距离上一次 DMI 活动太久 ⇒ 认为中间可能有外部复位，把缓存作废。 */
+/* 距离上一次 DMI 活动太久 ⇒ 认为中间可能有外部复位，把缓存作废。
+ *
+ * 🚨 只在**没有在飞读**的时刻判断（间隙 ≥50 ms ⇒ 流水线早就空了）。早先还加过一条
+ * "每 4096 次操作强制重配"，结果把 DMI 的一深流水打歪：SBCS 在 posted 读还在飞的时候
+ * 被改写，之后每次 dmi_post 收到的都是更早那一拍的响应，读值就**冻结在某个曾经正确
+ * 的值**上（实测：scope 读回恒定 tick，而同时 OpenOCD 读同一地址是活的）。
+ * 配置只能在"安静点"改：会话开始/结束，或长时间空闲。 */
 static uint8_t sba_cfg_stale(void)
 {
-    if ((uint32_t)(mchtmr_now() - s_dmi_stamp) > SBA_CFG_GAP_TICKS)
-    {
-        return 1U;
-    }
-    if (++s_cfg_ops >= SBA_CFG_RECHECK)
-    {
-        s_cfg_ops = 0U;
-        return 1U;                    /* 定期免检：不管中间发生过什么，强制重配一次 */
-    }
-    return 0U;
+    return (uint8_t)((uint32_t)(mchtmr_now() - s_dmi_stamp) > SBA_CFG_GAP_TICKS);
 }
 
 /* Run-Test/Idle TCK cycles inserted before every DR scan. This is not optional

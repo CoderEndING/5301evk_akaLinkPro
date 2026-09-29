@@ -30,6 +30,7 @@
 
 #include "board.h"
 #include "hpm_clock_drv.h"
+#include "hpm_l1c_drv.h"
 #include "hpm_mchtmr_drv.h"
 
 typedef struct
@@ -102,6 +103,15 @@ int main(void)
         g_v.lfsr = lfsr;
 
         g_updates = t;
+
+        /* 🚨 必须把 D-cache 写回：探针是用 **SBA（系统总线访问）** 读目标内存的，
+         * **绕过 CPU 的 D-cache** —— 不写回的话探针读到的永远是 SRAM 里那份
+         * "最初的 0"（实测踩过：同一时刻 OpenOCD 读到活的 163549，探针读回 0）。
+         * OpenOCD 的内存访问走抽象命令、是**经 CPU** 的，所以它看得见新值；
+         * 而这几行字一直待在 cache 里从没被逐出过。40 B 的写回开销可忽略。 */
+        l1c_dc_writeback((uint32_t)(uintptr_t)&g_v, sizeof(g_v));
+        l1c_dc_writeback((uint32_t)(uintptr_t)&g_updates, sizeof(g_updates));
+        l1c_dc_writeback((uint32_t)(uintptr_t)&g_mchtmr_hz, sizeof(g_mchtmr_hz));
 
         if ((t & 0x1FFFU) == 0U)                      /* ~0.8 s 闪一次，证明在跑 */
         {
