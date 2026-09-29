@@ -272,6 +272,8 @@ def main():
                          '用于 HPM6800EVK 这类只有 JTAG 的 RISC-V 目标（见 Custom HID Protocol 第 16 条）')
     ap.add_argument('--swd', action='store_true',
                     help='把全局目标类型切回 SWD/ARM（它是粘的：采过 RISC-V 之后要显式切回来）')
+    ap.add_argument('--dump', type=int, default=0,
+                    help='打印前 N 个解码后的样本值（拿已知内容的地址采，用来验值的正确性）')
     ap.add_argument('--addr', type=lambda s: int(s, 0), default=0,
                     help='覆盖 --set one 那个变量的地址（RISC-V 冒烟测试：随便给个会变的 RAM 地址）')
     ap.add_argument('--base', type=lambda s: int(s, 0), default=0,
@@ -478,6 +480,12 @@ def main():
                 fo += size
             samples.append(row)
     print("解出 %d 个样本（frame %d B，期望 %d 个/包）" % (len(samples), fb, PAYLOAD // fb))
+
+    if a.dump and samples:
+        # 值的正确性只能靠"拿已知内容的地址采"来验（例如靶子里一段常量）：
+        #   scope_hss_test.py run --riscv --set one --addr 0x1240000 --dump 6
+        for i, s in enumerate(samples[:a.dump]):
+            print("  样本[%d] = %s" % (i, " ".join("%s=0x%X" % (k, v) for k, v in s.items())))
 
     # ★ 端到端速率：窗口内**主机实收**的样本数 ÷ 窗口时长。探针侧的 produced 增量
     #   用来把「探针自己跳拍」和「USB 没送到」分开 —— 两者看着都是掉数据，成因差很远。
