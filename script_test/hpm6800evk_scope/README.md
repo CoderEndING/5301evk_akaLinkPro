@@ -56,6 +56,10 @@ python script_test/scope_hss_test.py run --riscv --set rv --base 0x01240000 --pe
 | `--dump 20` | 打印样本值，人工看 | — |
 | `python script_test/hpm6800_riscv.py sbastat` | SBCS 实值 + SBA sticky 错误计数（必须为 0） | 0 |
 
+> ⚠️ 如果 `sbastat` 报 `sbbusy` 挂着（不是 0），说明 SBA 被"没有响应的地址"挂死了
+> （例如有人读了 0x40000000 —— 这块板没挂 SDRAM）。清错/复位 DM/复位 TAP 都解不开，
+> **只能复位目标**（重新烧录或断电重上电）。
+
 ## 三、两个必须知道的坑（都踩过，别再踩）
 
 ### 1. 变量必须放**非缓存区**，否则探针读到的永远是旧值
