@@ -292,14 +292,20 @@ RX flush 定时器周期**按波特率动态调整**（目标每次约 512 字�
 | --- | --- | --- |
 | **探针写图案读回校验和** | `got 0x08ECD0B4 want 0x08ECD0B4` → **PASS** | `hpm6800_selfcheck.py` |
 | **字节流模式精确** | `pattern exact` + `lost=0 dup=0` + `probe-host delta: 0` | `hpm6800_rtt_loss.py COM5 20` |
-| 探针侧 SBA 块读 | **1504.5 KB/s**（1024 B × 50；长跑 2048×64 三次 1505.4/1505.6/1505.8） | `hpm6800_riscv.py rbench 0x1200000 1024 50` |
-| 探针侧 SBA 块写 | **1511.8 KB/s** | `hpm6800_riscv.py wbench 0x1200000 1024 50` |
-| 单字 SBA 读 | 25.6 µs（= 4 次 DMI 扫描/字） | `hpm6800_riscv.py sbench 0x1200000 200` |
-| RTT 交付率 | **1389 KB/s**（20 s / 28.5 MB），`rderr=0 wderr=0` | `hpm6800_rtt_delivery.py COM5 5` |
+| 探针侧 SBA 块读 | **1527 KB/s**（1024 B × 50；SBA 配置缓存之前是 1504.5） | `hpm6800_riscv.py rbench 0x1200000 1024 50` |
+| 探针侧 SBA 块写 | **1551 KB/s**（前 1511.8） | `hpm6800_riscv.py wbench 0x1200000 1024 50` |
+| 单字 SBA 读 | **10.3 µs**（前 25.6；配置缓存后只剩 4 次 DMI 扫描/字） | `hpm6800_riscv.py sbench 0x1200000 200` |
+| RTT 交付率 | **1419.8 KB/s**（前 1389；20 s / 28.5 MB），`rderr=0 wderr=0` | `hpm6800_rtt_delivery.py COM5 5` |
+| J-Scope over JTAG（HID 0x32 `flags bit6`） | 单字 **2.937 µs / 340.5 kHz**；8 通道（32 B span）**30.81 µs / 32.5 kHz** | `scope_hss_test.py bench --riscv --set one --addr 0x1240000` |
 | 主机驱动 OpenOCD（`progbuf`） | 写 154.0 / 读 95.9 KB/s | `hpm6800_jtag_bench.tcl` |
 | TAP 身份 | IDCODE `0x1000563D`、DTMCS `0x00007071`、DMSTATUS `0x00400CA2` | `hpm6800_riscv.py status` |
 | 目标启动自检 | `0x80001000`=`009010BF`、复位后 PC=`0x80003000`、`0x1240000`=`"SEGGER RTT"` | `hpm6800_flash_target.py` |
-| 有效 TCK 频率 | **~20.7 MHz**（54 TCK/字 × 1504.5 KB/s ÷ 4），规格上限 25 MHz | 由 rbench 反推 |
+| 有效 TCK 频率 | **~21 MHz**（54 TCK/字 × 1527 KB/s ÷ 4），规格上限 25 MHz | 由 rbench 反推 |
+
+> ⚠️ `hpm6800_selfcheck.py` 收尾会发 `ACT_STOP`（关掉 TAP），所以后面要跑 `rbench`/`sbench`
+> 得先 `hpm6800_riscv.py open`，否则状态里是 `open=0` 而基准动作直接判 `iters=0`。
+> 块读/块写/单字读那几行数字在 2026-09-29 的"SBA 配置缓存"改动后**整体上浮**：
+> 每次块读不再白付 6 次扫描（重配 SBCS 4 次 + 收尾读回清错 2 次）。
 
 固件侧时序常量（**四个都已验证是最小值，别再减**）：
 

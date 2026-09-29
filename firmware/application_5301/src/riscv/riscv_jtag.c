@@ -61,6 +61,16 @@ static uint32_t s_last_dmstatus;
 static uint32_t s_hold_addr;
 static uint8_t s_hold_ok;
 
+/* SBCS 配置缓存 + "上次失败过"标志。
+ *
+ * 一次 dmi_write / dmi_read 都是 **2 次 DMI 扫描**，而一次 8 字块读总共才 18 次扫描 ——
+ * 每次调用都"清错 + 重配"要吃掉 6 次（实测 8 通道 32 B span：45.6 µs 里 1/3 是这个）。
+ * 目标在跑时偶发 BUSY 才需要清 sticky 错误，所以只在**上一次操作失败过**时清；
+ * 配置没变就不重写。 */
+static uint32_t s_sbcs_cfg;
+static uint8_t s_sbcs_valid;
+static uint8_t s_sba_failed;
+
 /* Run-Test/Idle TCK cycles inserted before every DR scan. This is not optional
  * on the HPM6880's DTM: dtmcs.idle reads 7, and without idle clocks the DTM
  * silently stops accepting requests - the response freezes at op = 3 (which
@@ -263,6 +273,20 @@ uint32_t riscv_jtag_clear_errors(void)
     return sba_clear_errors();
 }
 
+/* 写 SBCS 并更新缓存（失败就把缓存标脏，下次一定重写）。 */
+static int sba_write_cfg(uint32_t sbcs)
+{
+    if (dmi_write(DM_SBCS, sbcs) != 0)
+    {
+        s_sbcs_valid = 0U;
+        return -1;
+    }
+    s_sbcs_cfg = sbcs;
+    s_sbcs_valid = 1U;
+    s_last_sbcs = sbcs;      /* 诊断用：写进去的就是当前值，不必再读回来 */
+    return 0;
+}
+
 static int sba_config(uint32_t extra)
 {
     uint32_t sbcs = SBCS_SBACCESS32 | SBCS_SBAUTOINC | extra;
@@ -270,12 +294,19 @@ static int sba_config(uint32_t extra)
     /* 重新配置 sbcs 会把"抱住固定地址"的状态一起作废（见 riscv_jtag_hold_prepare）。 */
     s_hold_ok = 0U;
 
-    (void)sba_clear_errors();
-    if (dmi_write(DM_SBCS, sbcs) != 0)
+    /* 🚨 只在**上一次操作失败过**时清 sticky 错误（理由见上面缓存那段注释）。
+     * 安全性：各失败路径自己会清，块读外面还有 riscv_jtag_read() 的整块重试兜底。 */
+    if (s_sba_failed)
     {
-        return -1;
+        (void)sba_clear_errors();
+        s_sba_failed = 0U;
     }
-    return 0;
+
+    if (s_sbcs_valid && (s_sbcs_cfg == sbcs))
+    {
+        return 0;                        /* 已经是这个配置：0 次扫描 */
+    }
+    return sba_write_cfg(sbcs);
 }
 
 /* ------------------------------------------------------------ public ---- */
@@ -288,6 +319,9 @@ int riscv_jtag_is_open(void)
 void riscv_jtag_close(void)
 {
     s_open = 0U;
+    s_sbcs_valid = 0U;       /* TAP 关掉后 DM 里的配置不再是"已知状态" */
+    s_sba_failed = 0U;
+    s_hold_ok = 0U;
     DAP_Data.debug_port = DAP_PORT_DISABLED;
     PORT_OFF();
 }
@@ -317,6 +351,9 @@ int riscv_jtag_open(void)
     s_idcode = 0U;
     s_dtmcs = 0U;
     s_dmstatus = 0U;
+    s_sbcs_valid = 0U;       /* TAP 复位会把 DM 的寄存器打回默认，缓存必须作废 */
+    s_sba_failed = 0U;
+    s_hold_ok = 0U;
 
     DAP_Data.debug_port = DAP_PORT_JTAG;
     PORT_JTAG_SETUP();
@@ -410,8 +447,12 @@ int riscv_jtag_hold_prepare(uint32_t addr)
     }
 
     s_hold_ok = 0U;
-    (void)sba_clear_errors();
-    if (dmi_write(DM_SBCS, SBCS_SBACCESS32 | SBCS_SBREADONADDR | SBCS_SBREADONDATA) != 0)
+    if (s_sba_failed)
+    {
+        (void)sba_clear_errors();
+        s_sba_failed = 0U;
+    }
+    if (sba_write_cfg(SBCS_SBACCESS32 | SBCS_SBREADONADDR | SBCS_SBREADONDATA) != 0)
     {
         return -2;
     }
@@ -446,6 +487,7 @@ int riscv_jtag_hold_read(uint32_t *val)
     if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
     {
         s_last_sbcs = sba_clear_errors();
+        s_sba_failed = 1U;
         s_hold_ok = 0U;              /* 出错后"抱住"不可信：下一次 prepare 重新配 */
         return -1;
     }
@@ -537,6 +579,7 @@ int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
                 if (ok == 0U)
                 {
                     s_last_sbcs = sba_clear_errors();
+                    s_sba_failed = 1U;
                     return -4;
                 }
             }
@@ -554,6 +597,7 @@ int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
             if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
             {
                 s_last_sbcs = sba_clear_errors();
+                s_sba_failed = 1U;
                 return -4;
             }
             w = dmi_resp_data(resp);
@@ -601,7 +645,8 @@ int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
     (void)dmi_post(DMI_OP_NOP, 0U, 0U);
     (void)tail;
 
-    s_last_sbcs = sba_clear_errors();
+    /* 🚨 成功路径**不**再读一遍 SBCS 清错（那是 2 次扫描的纯开销）：出错时上面各
+     * 分支已经清过，下一次 sba_config() 也会因为 s_sba_failed 再清一次。 */
     return 0;
 }
 
@@ -686,7 +731,6 @@ int riscv_jtag_write(uint32_t addr, const uint8_t *src, uint32_t len)
     }
 
     (void)dmi_post(DMI_OP_NOP, 0U, 0U); /* drain the stale response */
-    s_last_sbcs = sba_clear_errors();
     return 0;
 }
 
