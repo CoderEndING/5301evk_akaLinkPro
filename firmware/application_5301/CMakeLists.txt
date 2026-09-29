@@ -32,6 +32,30 @@ set(CONFIG_USB_DEVICE_MSC 1)
 # emulation below (HPM SDK 1.11+ removed flash_dfu) link through this script.
 set(CUSTOM_GCC_LINKER_FILE ${CMAKE_CURRENT_SOURCE_DIR}/linker/flash_dfu_app.ld)
 
+# ---------------------------------------------------------------- DLM 空间 ----
+# DLM 只有 128 KB（0x80300 起），曾经用到 127072 B = 97.5%。这两块是白拿的：
+#
+# ① 堆 16 KB → 2 KB：SDK 的 HEAP_SIZE/STACK_SIZE 默认 0x4000 是抄 Segger 的模板值
+#    （cmake/application.cmake:307/312），不是按本工程算的。本工程**没有任何
+#    malloc/calloc/realloc 调用**（cherryusb 只有 host 栈和 RTOS OSAL 用 malloc，
+#    都没链进来），堆的唯一入口是 newlib stdio 的 setvbuf/__sfmoreglue（stdout
+#    缓冲，BUFSIZ=1 KB 量级），留 2 KB 已是一倍余量。
+#    ⚠️ 必须在 find_package 之前设：application.cmake 用 `if(NOT HEAP_SIZE)` 兜底。
+#    栈暂不动（真实用量还没量过，见 README 的 DLM 账）。
+set(HEAP_SIZE 0x800)      # 2 KB
+
+# ② USB 的 QHD/QTD 竞技场 10 KB → 4 KB：`dcd_data_t` 的大小由
+#    USB_SOC_DCD_QTD_COUNT_EACH_ENDPOINT 决定（qtd 池 = 16 端点 × 2 方向 × 该值 ×
+#    32 B；默认 8 → 8192 B）。SDK 自己的约束是"单笔传输需要的 QTD 数 ≤ 该值"，而
+#    一个 QTD 覆盖 16 KB（hpm_usb_device.c:262 与 xfer_len = 0x4000 的分块）——
+#    本工程单笔最大 1 KB（DAP_XFER_SIZE；scope 包 512 B、MSC 512 B/块），所以 2
+#    已经是 32 KB 的单笔上限、共享池 64 项，余量很大。
+#    ⚠️ 两个坑：一是**必须走 CMAKE_C_FLAGS**——SDK 的库是在 find_package 里
+#    add_subdirectory 出来的，sdk_compile_definitions() 之后的调用传不进那些已创建的
+#    目标，而结构体布局 app 与 SDK 必须一致（不一致就是 ABI 错乱）；二是它必须在
+#    find_package 之前设好。
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSB_SOC_DCD_QTD_COUNT_EACH_ENDPOINT=2")
+
 find_package(hpm-sdk REQUIRED HINTS $ENV{HPM_SDK_BASE})
 project(akaLinkPro_App)
 

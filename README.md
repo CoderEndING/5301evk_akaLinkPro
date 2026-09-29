@@ -946,6 +946,17 @@ SWD-only，此后 OpenOCD 报 `CMSIS-DAP: JTAG not supported`，要 `set-mode 1`
 全部落在 ±2% 的 run-to-run 噪声内、`swdErr=0` ⇒ **"RISC-V 后端对 SWD 没有可测影响"成立**。
 内存代价：DLM **一个字节没涨**（127072 B / 130304，97.52%），FLASH 110096 B（12.11%）。
 
+> **2026-09-29 追加：DLM 从 97.5% 降到 81.8%**（127072 → **106592 B**）。两块白拿的空间：
+> ① SDK 的 `HEAP_SIZE`/`STACK_SIZE` 默认 0x4000 是抄 Segger 模板的（`cmake/application.cmake:307/312`），
+> 而本工程**没有任何 malloc 调用**（唯一入口是 newlib stdio 的 `setvbuf`，1 KB 量级）⇒ 堆收到 **2 KB**（−14 KB）；
+> ② USB 的 QHD/QTD 竞技场按"16 端点 × 8 QTD"算要 10 KB，而本工程只用 10 个端点、单笔最大 1 KB
+> （一个 QTD 覆盖 16 KB）⇒ `USB_SOC_DCD_QTD_COUNT_EACH_ENDPOINT=2` 把它压到 **4 KB**（−6 KB）。
+> 改完的复测：DFU 烧录、HID/配置子系统、raw DAP（1 KB 传输 + 混合读写 + 计数钳位）、
+> scope bulk IN（1.7 MB/s、重同步 0、`u_hi` 303776/303776 正确）、SWD 标定（1.586/11.181 µs）、
+> **VCOM 回环 115200~11.25 Mbps 全过（9 Mbps 起 975 KB/s 零丢包）** —— 全部无回归。
+> 还能再挖的（未做）：**32 KB 的 AHB_SRAM（0xF0400000）一个字节没用**，`uartrx_ringbuffer`（32 KB）
+> 是纯 CPU 环形、可整块搬过去；栈的 16 KB 也还没量过真实水位。详见本次分析记录。
+
 > SWD 侧的代码路径**本次一行未改**（改动全在 `src/riscv/` 与 `script_test/`）；上面这轮是
 > F103ZE 接上之后补测的（夹具先用 `stm32f103_scope/check.py` 验过：契约全过、时基
 > 10014.7 Hz / +0.15%）。
