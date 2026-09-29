@@ -1048,6 +1048,31 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 | 轮询 vs DMA | 都贴着 SPI 线速；DMA 固定开销 1~4.5 µs，40 MHz 约 200 B 交叉、75 MHz 约 128 B 交叉 |
 | 资源 | FLASH 127384 B (14.01%)、**DLM 106592 B 零增长**、AHB_SRAM 24880 B |
 
+### 回归验证：加了 SPI 桥没搞坏原有功能（2026-09-29，F103ZE 靶子）
+
+SPI 桥改了 USB 描述符（新增接口 + 一对端点）与 EP0 请求缓冲，理论上会影响枚举路径。
+实测逐个条件对下来：
+
+| 场景 | RTT→CDC 交付率 | 丢包 |
+|---|---|---|
+| SPI 桥**关闭** | 2496.3 KB/s | 0 |
+| SPI 桥关闭（复测） | 2497.7 KB/s | 0 |
+| SPI 桥**使能**（空闲） | 2494.6 KB/s（−0.1%） | 0 |
+| **一边整屏刷屏一边跑 RTT** | **2493.2 KB/s（−0.2%）** | **0** |
+| 加 SPI 桥之前的基线 | 2527 KB/s | 0 |
+
+- 全部落在基线的 **1.4% 以内且字节级零丢包**（`LOSSLESS: 0 gap, 0 lost, 0 duplicated`）。
+- 并发场景是后台连刷 8 次整屏（每次 4.1~4.4 MB/s 走新端点 + SPI DMA），RTT 同时跑满 ——
+  两条通道互不干扰，因为 SPI 桥的数据面是独立的 bulk 对，控制面只是 HID 里多一个 action。
+- 同时顺带确认了原有各接口都在：**DAP**（OpenOCD 能 boost 目标、读 `RCC_CFGR`）、
+  **CDC**（2.49 MB/s 交付）、**HID**（`CMD_RTT 0x31`）、**DFU Runtime**（今天用它刷了十几次）、
+  **WebUSB**（界面正常枚举）。
+
+> ⚠️ 一个已知的小 wart：`ENABLE 0` 关桥时**引脚保持现状**（不还原成默认复用）。
+> 也就是用过 SPI 桥之后，`PA26`（它同时是 CDC 的 UART break 脚 `BOARD_APP_UART_BREAK_SIGNAL_PIN`）
+> 会一直留在 SPI/GPIO 状态，直到重启。实测不影响 RTT/CDC 数据通路，但要用 UART break 的话
+> 得先复位探针。要改成"关桥即还原引脚"可以再做。
+
 ### 用自检工具跑一遍
 
 ```powershell
