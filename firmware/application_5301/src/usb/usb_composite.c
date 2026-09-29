@@ -43,9 +43,19 @@
 #define USBD_WINUSB_DESC_SET_LEN (WINUSB_DESCRIPTOR_SET_HEADER_SIZE +        \
                                   USBD_WEBUSB_ENABLE * FUNCTION_SUBSET_LEN + \
                                   USBD_BULK_ENABLE * FUNCTION_SUBSET_LEN +   \
+                                  SPI_BRIDGE_ENABLE * FUNCTION_SUBSET_LEN +  \
                                   USBD_DFU_RUNTIME_ENABLE * FUNCTION_SUBSET_LEN)
 
 #define USBD_NUM_DEV_CAPABILITIES (USBD_WEBUSB_ENABLE + USBD_WINUSB_ENABLE)
+
+/* CherryUSB serves the MS OS 2.0 descriptor set through the shared EP0 request
+ * buffer and STALLs the request when it does not fit ("Request buffer too
+ * small", usbd_core.c). A stalled WCID request makes Windows fail the whole
+ * composite device (Code 10) - no HID, no bulk, nothing. Keep the two numbers
+ * tied together at compile time. */
+#if (USBD_WINUSB_DESC_SET_LEN > CONFIG_USBDEV_REQUEST_BUFFER_LEN)
+#error "MS OS 2.0 descriptor set does not fit into CONFIG_USBDEV_REQUEST_BUFFER_LEN (see src/usb/usb_config.h)"
+#endif
 
 #define USBD_WEBUSB_DESC_LEN 24
 #define USBD_WINUSB_DESC_LEN 28
@@ -131,6 +141,36 @@ __ALIGN_BEGIN const uint8_t USBD_WinUSBDescriptorSetDescriptor[] = {
     '4', 0, '6', 0, '6', 0, '3', 0, '-', 0,
     'A', 0, 'A', 0, '3', 0, '6', 0, '-',
     0, '1', 0, 'A', 0, 'A', 0, 'E', 0, '4', 0, '6', 0, '4', 0, '6', 0, '3', 0, '7', 0, '7', 0, '6', 0,
+    '}', 0, 0, 0, 0, 0,
+#endif
+#if SPI_BRIDGE_ENABLE
+    /* WinUSB function subset for the USB->SPI bridge interface so that Windows
+     * binds WinUSB to it and libusb / WebUSB can claim it. Without this subset
+     * the interface enumerates fine but cannot be opened (libusb NOT_SUPPORTED),
+     * which is exactly what the first on-board P1 run hit. */
+    WBVAL(WINUSB_FUNCTION_SUBSET_HEADER_SIZE), /* wLength */
+    WBVAL(WINUSB_SUBSET_HEADER_FUNCTION_TYPE), /* wDescriptorType */
+    SPI_INTF_NUM,                              /* bFirstInterface */
+    0,                                         /* bReserved */
+    WBVAL(FUNCTION_SUBSET_LEN),                /* wSubsetLength */
+    WBVAL(WINUSB_FEATURE_COMPATIBLE_ID_SIZE),  /* wLength */
+    WBVAL(WINUSB_FEATURE_COMPATIBLE_ID_TYPE),  /* wDescriptorType */
+    'W', 'I', 'N', 'U', 'S', 'B', 0, 0,        /* CompatibleId*/
+    0, 0, 0, 0, 0, 0, 0, 0,                    /* SubCompatibleId*/
+    WBVAL(DEVICE_INTERFACE_GUIDS_FEATURE_LEN), /* wLength */
+    WBVAL(WINUSB_FEATURE_REG_PROPERTY_TYPE),   /* wDescriptorType */
+    WBVAL(WINUSB_PROP_DATA_TYPE_REG_MULTI_SZ), /* wPropertyDataType */
+    WBVAL(42),                                 /* wPropertyNameLength */
+    'D', 0, 'e', 0, 'v', 0, 'i', 0, 'c', 0, 'e', 0,
+    'I', 0, 'n', 0, 't', 0, 'e', 0, 'r', 0, 'f', 0, 'a', 0, 'c', 0, 'e', 0,
+    'G', 0, 'U', 0, 'I', 0, 'D', 0, 's', 0, 0, 0,
+    WBVAL(80), /* wPropertyDataLength */
+    '{', 0,
+    '3', 0, 'E', 0, '7', 0, 'B', 0, '1', 0, 'C', 0, '4', 0, '8', 0, '-', 0,
+    '9', 0, 'D', 0, '2', 0, 'A', 0, '-', 0,
+    '4', 0, 'F', 0, '6', 0, '1', 0, '-', 0,
+    'B', 0, '5', 0, 'E', 0, '8', 0, '-', 0,
+    '7', 0, 'C', 0, '0', 0, '4', 0, 'A', 0, '9', 0, 'D', 0, '3', 0, 'F', 0, '2', 0, '1', 0, '0', 0,
     '}', 0, 0, 0, 0, 0,
 #endif
 #if USBD_DFU_RUNTIME_ENABLE

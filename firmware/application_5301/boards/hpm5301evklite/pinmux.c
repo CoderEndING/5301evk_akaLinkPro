@@ -181,7 +181,21 @@ void init_spi1_bridge_pins(uint8_t quad, uint8_t hw_cs)
 {
     HPM_IOC->PAD[IOC_PAD_PA26].FUNC_CTL =
         hw_cs ? IOC_PA26_FUNC_CTL_SPI1_CS_0 : IOC_PA26_FUNC_CTL_GPIO_A_26;
-    HPM_IOC->PAD[IOC_PAD_PA27].FUNC_CTL = IOC_PA27_FUNC_CTL_SPI1_SCLK;
+    /*
+     * ⚠️ PA27(SCLK) 上的 `LOOP_BACK` 位**必须留着**，这是 SDK 的
+     * hpm5301evklite/init_spi1_pins() 的原样做法（只加在 SCLK 上，MISO/MOSI 都不加）。
+     *
+     * 它是"force input on"：把该 pad 的输入通路强制打开。SPI 主机发完时钟后，
+     * **接收移位是靠 SCLK 这条输入通路回来打拍的** —— 少了它，波形看起来完全正常
+     * （LA 上 8 字节 = 64 拍、MOSI 数据对、下降沿采样 MOSI=MISO=发送数据），
+     * 但控制器的 RX FIFO 里读出来是**恒定的空闲电平**（CPOL=0 时全 00、CPOL=1 时全 FF），
+     * 也就是"一个 bit 都没移进来"。
+     *
+     * P1 当初"特意不抄 LOOP_BACK"（以为是自环测试用的）就是这个坑的源头。
+     * 反过来也不要乱加：实测加在 PA28/PA29 上会把波形搞坏（len=4 只发 8 拍、
+     * MOSI 几乎不动），所以只在 SCLK 上按 SDK 的原样加。
+     */
+    HPM_IOC->PAD[IOC_PAD_PA27].FUNC_CTL = IOC_PA27_FUNC_CTL_SPI1_SCLK | IOC_PAD_FUNC_CTL_LOOP_BACK_MASK;
     HPM_IOC->PAD[IOC_PAD_PA28].FUNC_CTL = IOC_PA28_FUNC_CTL_SPI1_MISO;
     HPM_IOC->PAD[IOC_PAD_PA29].FUNC_CTL = IOC_PA29_FUNC_CTL_SPI1_MOSI;
 

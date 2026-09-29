@@ -641,6 +641,109 @@ DLM 精确回到 106592 B。**这条对以后所有往 DLM 加小变量的人都
 这三个都用整数分频出不来 ⇒ 固件会挑最接近的档并把**实际值**回给主机（`GET_CFG`/`STATUS` 的
 `s_actual_sclk`）。若 PLL1 恰好是 480 MHz 且未被 USB 占用，80 MHz 就有解。
 
+> ⚠️ **上面这两段已被 §5.5 的实测推翻/修正**：80 MHz 现在能配出来（模块时钟来自 PLL1
+> 的分频），但用一根跳线做回环跑不动；而且**绝不能拿 PLL0 原频 720 MHz 当模块时钟**。
+
+---
+
+### 5.5 P1 上板验证（2026-09-29，HPM5301EVKLite + Kingst LA）
+
+P1 代码写完后一直没上板。这次接上探针实测，**验收标准全部达成**，同时挖出 4 个只有硬件才
+暴露得出来的坑 —— 全部已修并复测。
+
+**验收结果**
+
+| 项目 | 结果 |
+|---|---|
+| `loop`（J3[19]↔[21] 跳线回环，1/2/32/99/100/101/256/492 B，单线） | **16/16 PASS** |
+| 边界长度 3/255/257/491/492/493 B | PASS |
+| SPI 模式 0/1/2/3（CPOL/CPHA 四种组合） | 全部 PASS |
+| SCLK 档位（256 B 回环） | 20 / 40 / 60 / **75** MHz PASS；**80 / 100 MHz FAIL** |
+| `frames`（PING / DELAY / AUX_IN / CS） | PASS（DELAY 2000 µs 实测墙钟 2.1 ms） |
+| 计数器 | `bytes_tx == bytes_rx`，`frames_err=0`，`out_overrun=0`，`in_drop=0` |
+| 资源 | FLASH 13.85%、DLM 106592 B（**零增长**）、AHB_SRAM 24848 B |
+
+80/100 MHz 的失败是**跳线本身的物理极限**（一根杜邦线跑 80 MHz 方波），不是固件问题；
+真要定这两个档，得接真从器件或用 LA 看波形质量。
+
+**坑 1：MS OS 2.0 描述符集超了 EP0 请求缓冲 → 整个复合设备 Code 10**
+
+新接口要能被 libusb/WebUSB 打开，就得在 MS OS 2.0 描述符集里给它加一条 WinUSB
+function subset（160 B）。加完之后描述符集从 490 B 变成 650 B，**超过
+`CONFIG_USBDEV_REQUEST_BUFFER_LEN = 512`**，而 CherryUSB 对超出缓冲的 vendor 请求是
+**直接 STALL**（`usbd_core.c`: "Request buffer too small"）。后果不是"这个接口打不开"，
+而是**整个复合设备启动失败**：设备管理器黄叹号、Code 10、HID 与 bulk 全部消失，
+拔插/删节点重扫都没用。
+
+- 修：`CONFIG_USBDEV_REQUEST_BUFFER_LEN` 512 → **768**；
+- 防回归：`usb_composite.c` 里加编译期断言
+  `#if (USBD_WINUSB_DESC_SET_LEN > CONFIG_USBDEV_REQUEST_BUFFER_LEN) #error`。
+
+**坑 2：SPI1 模块时钟顶到 720 MHz → SPI 一次都不移位**
+
+原来的选频逻辑是把 PLL0 的 720/600/400 MHz 逐个试、取能整除出目标 SCLK 的那个，20 MHz
+落在 720/36 上。实测后果：**事务"完成"但一个 bit 都没移**——LA 上 CS 拉了 614 µs、
+MOSI 只有几个毛刺、**SCLK 全程不动**；`spi_write_read_data` 卡满 5000 次重试后超时，
+之后每一笔都在 `spi_is_active()` 上直接 BUSY。
+
+- 修：改成在「时钟源 × 整数分频」里搜**能整除出目标 SCLK 的最小模块时钟**（上限 240 MHz）。
+  20 MHz 现在落在 40 MHz 模块时钟 / N=2 上，事务立刻正常。
+- 另加 `cfg.module_clk_hz`（配置块偏移 24）作为在线扫频旋钮，0 = 自动。
+
+**坑 3（最隐蔽）：SCLK 焊盘少了 `LOOP_BACK` → RX 移位不打拍，回读恒为"空闲电平"**
+
+`IOC_PAD_FUNC_CTL_LOOP_BACK_MASK` 这个名字极具误导性，它在 HPM5300 的 IOC 里官方说明是
+**"force input on"**。SDK 的 `hpm5301evklite/init_spi1_pins()` 把它**只加在 SCLK 上**
+（MISO/MOSI 都没有）—— 因为 SPI 主机的**接收移位是靠 SCLK 这条输入通路回来打拍的**。
+P1 当初以为是"自环测试专用"而特意删掉，于是出现了最迷惑人的现象：
+
+- LA 波形**完全正确**：8 字节 = 64 拍 SCLK（周期 50 ns = 20 MHz）、MOSI 数据对、
+  下降沿采样 `MOSI = MISO = 发送数据`**逐字节相同**；
+- 寄存器**完全正常**：`TRANSCTRL` 里 wcount/rcount 对、`TIMING` 分频对、`SDK status=0`、
+  两个 FIFO 都空（驱动确实读走了 N 个字节）；
+- 但 **RX FIFO 里读出来是恒定的空闲电平**：CPOL=0 时全 `00`、CPOL=1 时全 `FF`。
+
+"全 00 / 全 FF 跟着 CPOL 变"这一点是判据：说明一个 bit 都没移进来，而不是相位错位。
+加回这一位后回环立通。
+
+- 修：`init_spi1_bridge_pins()` 里 PA27 加 `IOC_PAD_FUNC_CTL_LOOP_BACK_MASK`，与 SDK 逐字一致；
+  **不要**加在 PA28/PA29 上（实测那样会把波形搞坏：len=4 只发 8 拍、MOSI 几乎不动）。
+- 调试手段（都留在固件里了，HID action 10/11/12）：
+  `dbg` 读 SPI 寄存器现场快照、`pintest` 把 MOSI/MISO 当 GPIO 验跳线通断、
+  `wiggle` 在 SCLK/CS/MOSI 上发慢方波给 LA 验接线。这三样把"线没插好 / 焊盘坏 /
+  控制器没出时钟 / 只是收尾没清"四种情况彻底分开了。
+
+**坑 4：同一 USB 包里的 DELAY 挡不住后面的帧，且 mchtmr 频率取成了 0**
+
+`sb_delay_pending()` 原来只在 `spi_bridge_poll()` 入口检查，而 `sb_process_packets()`
+会把一个包里后面的帧全执行掉 —— 面板初始化序列（"发完命令等 120 ms 再发下一条"，且多条
+STEP 常挤在同一个包里）正好会踩。另外 `clock_get_frequency(clock_mchtmr0)` 在本 SoC 的
+频率表里没有兜底、返回 0，导致所有延时都被夹成 1 个 tick（实测 500 ms 只等出 50 ms）。
+
+- 修：① 每执行完一帧就检查 `sb_delay_pending()/s_rst_state`，有等待就立刻让出主循环；
+  ② mchtmr 频率硬编码 24 MHz（与 scope/rtt/riscv 三个模块一致）。
+  复测：2000/20000/50000/200000 µs 实测 2.60/20.66/50.59/200.50 ms（多出的 ~0.5 ms 是主机往返）。
+
+**其它一并修掉的小问题**（都是上板前 review 或上板时发现的）
+
+- 状态字 bit8..15 原先把 `frames_err` 的**计数**当"最近错误码"报，改成真正的 `last_err`；
+- `sb_out_kick()` / `sb_in_kick()` 现在整个"查在飞 + 武装"过程关中断：它们既被主循环调、
+  也被完成回调（ISR）调，中间被打断会重复 `usbd_ep_start_*`，而 DWC2 端口层对忙端点
+  再来一笔是**静默顶掉**（回调永不来）→ 在飞标志永久停在 1；
+- 事务失败后置 `s_spi_need_reset`，下一笔前先复位控制器（否则 SPIACTIVE 卡住，
+  后续全级联成 BUSY，长度扫描从第二条起就什么都测不出来）；
+- `pad_active_low` 默认值改 **0x06**（RST/CS 低有效）：原来默认 0 会让 RST 上电就被拉在
+  低电平（一直摁住面板复位），而 CS 的有效电平又与文档说的不一致；
+- `XFER` 的读数据**即使事务报错也照样带回**（原来只在 `SB_OK` 时才回）——
+  "回读全 0 / 全 FF / 数据正确"是调 SPI 时唯一能区分"线没通"和"只是收尾没清"的线索。
+
+**测试工具（`script_test/spi_bridge_test.py`）新增**
+
+`dbg`（寄存器快照）、`pintest`（跳线通断）、`wiggle`（慢方波给 LA）、
+`cfg --module-clk`（在线扫模块时钟）。另外 `loop` 默认只跑**单线**：双线/四线相位下
+DAT0/DAT1 都是推挽输出，短接等于两个输出对打（我们的脚还配了最大驱动 DS=4），
+多线相位要用 LA 看波形或接真从器件。
+
 
 ---
 

@@ -162,7 +162,18 @@ typedef enum
     SB_ACT_ABORT = 6,        /* 丢弃未处理帧与 IN 队列 */
     SB_ACT_SET_PROFILE = 7,  /* req[4..] = 面板档块 */
     SB_ACT_GET_PROFILE = 8,  /* res[4..] = 面板档块 */
+    SB_ACT_DBG = 10,         /* 上板诊断：res[4..] = 12 × u32 SPI 寄存器现场快照 */
+    SB_ACT_PINTEST = 11,     /* 上板诊断：把 MOSI/MISO 当普通 GPIO 验跳线通断 */
+    SB_ACT_WIGGLE = 12,      /* 上板诊断：在 SCLK/CS/MOSI 脚上发慢方波（给 LA 看接线） */
 } sb_hid_action_t;
+
+/* SB_ACT_PINTEST 的 res[4] 结果位 */
+#define SB_PIN_MOSI_LOW (1U << 0)   /* 驱动 MOSI=0 时 MISO 读到 0 */
+#define SB_PIN_MOSI_HIGH (1U << 1)  /* 驱动 MOSI=1 时 MISO 读到 1（这两位都置 = 跳线通） */
+#define SB_PIN_FLOAT_PD (1U << 2)   /* MISO 悬空 + 下拉，读到 0（输入通路正常） */
+#define SB_PIN_FLOAT_PU (1U << 3)   /* MISO 悬空 + 上拉，读到 1 */
+#define SB_PIN_MISO_DRV (1U << 4)   /* 反过来驱动 MISO，MOSI 能读到（双向都通） */
+#define SB_PIN_DONE (1U << 7)       /* 自检跑完了 */
 
 /* 状态字 res[4..7]（u32 小端） */
 #define SB_ST_ENABLED (1U << 0)  /* 桥已使能 */
@@ -184,14 +195,20 @@ typedef struct
     uint8_t pad_rst;
     uint8_t pad_cs_aux;
     uint8_t pad_bl;
-    uint8_t pad_active_low; /* 位图：bit0 DC、bit1 RST、bit2 CS、bit3 BL */
+    uint8_t pad_active_low; /* 位图：bit0 DC、bit1 RST、bit2 CS、bit3 BL（默认 0x06：RST/CS 低有效） */
     uint8_t pad_te;         /* 辅助**输入**脚（TE） */
     uint8_t flags;          /* bit0 = ENABLE 时自动清环 */
     uint8_t reserved0;
     uint16_t out_ring_kb;   /* 请求的 OUT 环大小（受总预算夹取） */
     uint16_t in_ring_kb;
     uint16_t max_frame_bytes; /* v1 固定 504 */
-    uint8_t reserved[10];
+    uint16_t reserved1;
+    /* SPI1 模块时钟目标（Hz），0 = 自动。
+     * 自动规则：模块时钟 ≤ 240 MHz，且取能**整除出目标 SCLK 的最小型号**。
+     * 上板实测：模块时钟给到 PLL0 原频 720 MHz 时 SPI 一次都不移位（SCLK 全程不动、
+     * TX FIFO 只进不出），所以绝不能再用 720。这个字段留作在线扫频用。 */
+    uint32_t module_clk_hz;
+    uint8_t reserved[4];
 } sb_cfg_t;
 
 /* ---- 面板档块（SET_PROFILE / GET_PROFILE），总长 16 B ---- */

@@ -20,7 +20,16 @@
 #define USBD_PID           0x0204
 #define USBD_MAX_POWER     250
 
-#define CONFIG_USBDEV_REQUEST_BUFFER_LEN 512
+/* EP0 in/out transfer buffer. CherryUSB copies every class/vendor request
+ * payload into this buffer and **STALLs the request** when the payload does not
+ * fit (`usbd_core.c`: "Request buffer too small"). The MS OS 2.0 descriptor set
+ * (usb_composite.c, USBD_WINUSB_DESC_SET_LEN) is requested through exactly this
+ * path, so it must fit here: with one 160 B function subset per WinUSB interface
+ * (DAP + WebUSB + SPI bridge + DFU) the set is 10 + 160*4 = 650 B.
+ * 512 B used to be enough for 3 subsets (490 B) and silently broke enumeration
+ * as soon as the SPI bridge added the 4th (Windows: Code 10, no HID, no bulk).
+ * usb_composite.c has a compile-time #error guard so this cannot regress. */
+#define CONFIG_USBDEV_REQUEST_BUFFER_LEN 768
 #define CONFIG_USBDEV_ADVANCE_DESC
 #define CONFIG_USBDEV_MAX_BUS 1
 

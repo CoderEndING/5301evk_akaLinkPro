@@ -35,6 +35,9 @@ USAGE_PAGE = 0xFF00
 CMD_SPI = 0x35
 ACT_STATUS, ACT_ENABLE, ACT_RESET, ACT_SET_CFG, ACT_GET_CFG = 0, 1, 2, 3, 4
 ACT_PIN_CFG, ACT_ABORT, ACT_SET_PROFILE, ACT_GET_PROFILE = 5, 6, 7, 8
+ACT_DBG = 10
+ACT_PINTEST = 11
+ACT_WIGGLE = 12
 
 # ---- frames (sb_frame_type_t) ----
 T_XFER, T_CS, T_GPIO, T_DELAY, T_PING, T_CFG, T_STEP, T_RESET, T_AUX_IN = 1, 2, 3, 4, 5, 6, 7, 8, 9
@@ -162,6 +165,24 @@ class Hid:
             raise RuntimeError("PIN_CFG timeout")
         return struct.unpack_from("<I", bytes(r[4:8]))[0]
 
+    def dbg(self):
+        r = self.xfer(CMD_SPI, [ACT_DBG])
+        if r is None:
+            raise RuntimeError("DBG timeout")
+        return struct.unpack_from("<13I", bytes(r[4:56]))
+
+    def pintest(self):
+        r = self.xfer(CMD_SPI, [ACT_PINTEST])
+        if r is None:
+            raise RuntimeError("PINTEST timeout")
+        return struct.unpack_from("<I", bytes(r[4:8]))[0]
+
+    def wiggle(self):
+        r = self.xfer(CMD_SPI, [ACT_WIGGLE], tmo=3.0)
+        if r is None:
+            raise RuntimeError("WIGGLE timeout")
+        return struct.unpack_from("<I", bytes(r[4:8]))[0]
+
 
 # -------------------------------------------------------------------------- bulk
 class Bulk:
@@ -277,6 +298,8 @@ def cmd_cfg(args):
         cfg[6] = args.cs_policy
     if args.threshold is not None:
         cfg[7] = args.threshold
+    if args.module_clk is not None:
+        struct.pack_into("<I", cfg, 24, args.module_clk)
     for name, idx in (("dc", 8), ("rst", 9), ("cs_aux", 10), ("bl", 11), ("te", 13)):
         val = getattr(args, name, None)
         if val is not None:
@@ -316,6 +339,57 @@ def cmd_enable(args):
         cfg = h.cfg_get()
         st2 = h.status()
         print("          sclk=%d Hz" % st2["sclk"])
+    h.close()
+    return 0
+
+
+def cmd_dbg(args):
+    h = Hid()
+    d = h.dbg()
+    print("--- SPI bring-up snapshot ---")
+    print("reset self-test iters : 0x%08X %s" %
+          (d[0], "(STUCK - reset bits never clear!)" if d[0] >= 100000 else "(cleared)"))
+    print("CTRL after selftest   : 0x%08X" % d[1])
+    print("spi1 node clk         : %d Hz" % d[2])
+    print("actual sclk           : %d Hz" % d[3])
+    print("STATUS (last xfer)    : 0x%08X  (txfull=%d rxempty=%d active=%d)" %
+          (d[4], (d[4] >> 23) & 1, (d[4] >> 20) & 1, 0))
+    print("CTRL   (last xfer)    : 0x%08X" % d[5])
+    print("TRANSCTRL             : 0x%08X" % d[6])
+    print("TRANSFMT              : 0x%08X" % d[7])
+    print("TIMING                : 0x%08X" % d[8])
+    print("WR|RD_TRANS_CNT       : wr=%d rd=%d" % (d[9] & 0xFFFF, (d[9] >> 16) & 0xFFFF))
+    print("SDK status            : %d" % d[10])
+    print("busy before call      : %d   wcnt=%d" % (d[11] & 1, (d[11] >> 16) & 0xFFFF))
+    print("stage                 : %d  (1=就绪 2=spi_transfer 已返回)" % d[12])
+    h.close()
+    return 0
+
+
+def cmd_pintest(args):
+    """MOSI/MISO 当普通 GPIO：验 pad 输入通路 + J3[19]<->J3[21] 跳线到底通不通。"""
+    h = Hid()
+    r = h.pintest()
+    bits = [("MISO reads 0 while MOSI=0   ", 0, "float+PD ok"),
+            ("MISO reads 1 while MOSI=1   ", 1, "JUMPER OK"),
+            ("MISO float + pulldown = 0   ", 2, "input path ok"),
+            ("MISO float + pullup  = 1    ", 3, "input path ok"),
+            ("drive MISO -> MOSI reads 1  ", 4, "jumper ok (reverse)"),
+            ("self-test ran to completion ", 7, "")]
+    for name, bit, note in bits:
+        print("%s: %d   %s" % (name, (r >> bit) & 1, note))
+    wired = ((r >> 1) & 1) and ((r >> 0) & 1)
+    print()
+    print("jumper J3[19]<->J3[21]: %s" % ("CONNECTED" if wired else "*** NOT CONNECTED (or MISO pad dead) ***"))
+    h.close()
+    return 0 if wired else 1
+
+
+def cmd_wiggle(args):
+    """在 SCLK/CS/MOSI 脚上发慢方波（SCLK 最快、CS 4 分频、MOSI 16 分频），给 LA 验接线。"""
+    h = Hid()
+    r = h.wiggle()
+    print("wiggle done (result=0x%02X) - SCLK=100 toggles, CS=25, MOSI=~7 over ~3 ms" % r)
     h.close()
     return 0
 
@@ -390,7 +464,23 @@ def cmd_loop(args):
 
     lens = [int(x) for x in args.lens.split(",")]
     fails = 0
-    cases = [(1, TC_LINES_1), (2, TC_LINES_2)]
+    # 单线回环 = MOSI 短接到 MISO，是唯一安全的跳线回环。双线/四线**不能**这样验：
+    # 那两种相位下 DAT0/DAT1(/DAT2/DAT3) 都是推挽输出，短接等于两个输出对打
+    # （我们的引脚还配了最大驱动 DS=4）。多线相位请用逻辑分析仪看波形，或接真从器件。
+    lines_wanted = [int(x) for x in args.lines.split(",")]
+    cases = []
+    for ln in lines_wanted:
+        if ln == 1:
+            cases.append((1, TC_LINES_1))
+        elif ln == 2:
+            cases.append((2, TC_LINES_2))
+        elif ln == 4:
+            cases.append((4, TC_LINES_4))
+        else:
+            raise SystemExit("--lines only accepts 1/2/4")
+    if len(cases) > 1:
+        print("!! 警告：多线相位在跳线短接下是输出对打，仅作「是否发得出去」的冒烟，"
+              "结果不作为数据正确性判据")
     for lines, tcfg in cases:
         for ln in lens:
             if ln > FRAME_MAX - XFER_HDR:
@@ -434,6 +524,8 @@ def main():
     c.add_argument("--mode", type=int, choices=[0, 1, 2, 3], default=None)
     c.add_argument("--cs-policy", type=int, choices=[0, 1, 2, 3], default=None, dest="cs_policy")
     c.add_argument("--threshold", type=int, default=None)
+    c.add_argument("--module-clk", type=int, default=None, dest="module_clk",
+                   help="SPI1 module clock target in Hz (0 = auto); debug knob")
     c.add_argument("--dc", default=None)
     c.add_argument("--rst", default=None)
     c.add_argument("--cs-aux", default=None, dest="cs_aux")
@@ -457,9 +549,13 @@ def main():
     s.set_defaults(func=cmd_status)
 
     sub.add_parser("frames").set_defaults(func=cmd_frames)
+    sub.add_parser("dbg").set_defaults(func=cmd_dbg)
+    sub.add_parser("pintest").set_defaults(func=cmd_pintest)
+    sub.add_parser("wiggle").set_defaults(func=cmd_wiggle)
 
     l = sub.add_parser("loop")
     l.add_argument("--lens", default="1,2,32,99,100,101,256,492")
+    l.add_argument("--lines", default="1", help="1=单线（跳线回环的正确用法）；2/4 仅冒烟")
     l.add_argument("--no-dma", action="store_true", dest="no_dma")
     l.add_argument("--no-enable", action="store_true", dest="no_enable")
     l.add_argument("-v", "--verbose", action="store_true")
