@@ -397,7 +397,7 @@ CS↓ ─ [cmd] ─ [addr] ─ [dummy] ─ [data(tx/rx, 1/2/4 线)] ─ CS↑
  0: u32 sclk_hz          期望 SCLK（0 = 板级默认 20 MHz）
  4: u8  mode             SPI 模式 0~3（CPOL/CPHA）
  5: u8  bits             数据位宽（v1 固定 8）
- 6: u8  cs_policy        0 = 硬件 CS0 每帧自动；1 = 辅助 CS 每帧自动；2 = 手动
+ 6: u8  cs_policy        0 = GPIO CS（PA26，默认）；1 = 辅助 GPIO CS；2 = 手动（CS 帧控制）；3 = 硬件 CS0
  7: u8  tx_dma_threshold 默认 100；0 = 全轮询；0xFF = 全 DMA
  8: u8  pad_dc           辅助脚 pad 索引（0 = 不用）
  9: u8  pad_rst
@@ -597,7 +597,12 @@ while (1) {
 
 1. **引脚复用只在使能时做**：默认（未使能）固件行为完全不变，不会影响 DAP/VCOM/RTT/Scope。
 2. **每帧一次事务**：轮询用 `spi_transfer()`；DMA 用 `spi_setup_dma_transfer()` + `dma_mgr` 申请的 `HPM_DMA_SRC_SPI1_TX` 通道，等 `dma_check_transfer_status()` 的 TC 后 `spi_wait_for_idle_status()` 再收尾 CS。
-3. **CS 策略**：默认硬件 CS0 每帧自动；`CS_HOLD`/`CS_OFF`/`CS` 帧支持手动跨帧保持；`cs_policy = 1` 时改用辅助 GPIO 当 CS（多器件）。
+3. **CS 策略**（实现时定稿）：默认 **`cs_policy = 0`，PA26 作 GPIO CS**，由固件按帧拉低/释放；
+   `CS_HOLD`/`CS_OFF`/`CS` 帧支持手动跨帧保持；`cs_policy = 1` 改用辅助 GPIO 当 CS（多器件）；
+   `cs_policy = 2` 完全手动；`cs_policy = 3` 才是硬件 CS0（每帧自动、时序由 TIMING 寄存器管，
+   但**不支持**面板档 1 的「一个 CS 窗口内翻 DC」，那种情况下会返回 `RANGE`）。
+   为什么默认不用硬件 CS：面板初始化必须「CS↓ → 命令 → 翻 DC → 参数 → CS↑」在**同一个 CS 窗口**
+   里完成，硬件 CS 每次 `spi_transfer()` 都会自己收尾。
 4. **RX 轮询**：`spi_transfer()` 内部逐次读 RX FIFO（8 深）；全双工时驱动已按「写一次、收一次」交错，不会溢出（`drivers/src/hpm_spi_drv.c:211`）。
 5. **DMA 阈值判定**：看 `tx_len`（数据相位发送字节数），不看整帧长度。
 6. **`data_merge`**：v1 用 0（与 SDK 阻塞 API 语义一致，字节精确）；若上板实测轮询路径成瓶颈，再考虑改用 DataMerge（8-bit 下每次 DATA 读写 4 字节，FIFO 一项抵 4 字节）配合自写 FIFO 循环。
@@ -606,6 +611,36 @@ while (1) {
 9. **延时非阻塞**：`DELAY` / `STEP.delay_ms` / `RESET` 都只登记「下一个允许执行时刻」（`mchtmr` 计时），`spi_bridge_poll()` 到点才继续处理后续帧。面板序列里有 100/120 ms 的等待，**绝不能在主循环里忙等**（那会让 DAP/RTT/Scope 停摆 100 ms）。等待期间 OUT 环继续被 USB 回调填充，不丢数据。
 10. **面板档执行**（§4.7）：档 1 的一次 `STEP` 内部是「同一个 CS 窗口里的两次 SPI 传输 + 一次 DC 翻转」，用 GPIO CS + `board_write_spi_cs` 风格的软件 CS 实现最稳（硬件 CS 无法在一次事务中间翻 DC）；档 2 直接映射到一次 `XFER`。
 11. **SCLK 配置**：`clock_set_source_divider(clock_spi1, src, div)` 显式选源（PLL0 三路 720/600/400 MHz 可用），再由 `spi_master_timing_init()` 分频到目标 `sclk_hz`；改频前先 `spi_wait_for_idle_status()`，改频后校验实际频率并回读给主机。
+
+### 5.4 P1 实施记录（2026-09-28，已提交 06c0928）
+
+**资源占用（`build_dfu_evklite`，与改动前对比）**
+
+| 区域 | 改动前 | 改动后 | 说明 |
+|---|---|---|---|
+| FLASH | 110080 B (12.11%) | **122312 B (13.45%)** | 代码 + 描述符 +12.2 KB |
+| ILM | 31352 B (23.92%) | 31352 B | 不变 |
+| DLM | 106592 B (81.80%) | **106592 B (81.80%)** | **零增长**（见下） |
+| AHB_SRAM | 0 B | **24784 B (75.63%)** | OUT 环 16 KB + IN 环 8 KB + 状态 208 B |
+
+**踩坑：把状态放 `.bss` 会让 DLM 涨整整 2048 B**
+第一版把桥的状态（环游标、配置、统计，一共才 ~144 B）放在普通 `.bss`，DLM 立刻从 106592 变成
+108640。原因不是状态本身，而是 `.noncacheable` 段带 **2 KB 对齐**：往它前面的 `.bss` 里加一百多
+字节，就把这 2 KB 对齐空洞一起算进了 DLM 用量。把全部状态搬进 `.ahb_sram`（连同两个环）之后
+DLM 精确回到 106592 B。**这条对以后所有往 DLM 加小变量的人都适用。**
+
+**另外两处实现决策**
+- `init_spi1_bridge_pins()` 不复制 SDK `init_spi1_pins()` 里的 `LOOP_BACK` 位（那是 SPI 自环
+  测试用的，正常通信会把自己的输出环回进输入），并给 SCLK/IO 脚配了 fast slew + 最大驱动。
+- 桥的模块门控：`BOARD_HAS_SPI_BRIDGE`（EVKLite = 1，akaLinkPro = 0）。置 0 时整个模块编成
+  空实现、描述符里也不挂这个接口（实测：FLASH 110144 B、DLM 106592 B、AHB_SRAM 0），
+  所以 akaLinkPro 构建的枚举与资源占用与改动前一致。
+
+**SCLK 的现实边界（P2 上板实测）**：SPI 的 SCLK = 模块时钟 / N，N 必须整除且为偶数。PLL0 的
+720/600/400 MHz 能给出 20/40/60/75/100 MHz，但 **80 MHz 需要模块时钟落在 160/320/480 MHz**，
+这三个都用整数分频出不来 ⇒ 固件会挑最接近的档并把**实际值**回给主机（`GET_CFG`/`STATUS` 的
+`s_actual_sclk`）。若 PLL1 恰好是 480 MHz 且未被 USB 占用，80 MHz 就有解。
+
 
 ---
 
