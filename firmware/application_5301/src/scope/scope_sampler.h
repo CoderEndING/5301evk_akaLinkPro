@@ -82,6 +82,10 @@ int  scope_sampler_bench_result(uint32_t *iters, uint32_t *ticks, int32_t *err);
 /* USB 完成回调（在 swo_in_callback 里调）：还回一个包缓冲。 */
 void scope_sampler_tx_complete(void);
 
+/* USB 总线复位（重枚举 / 驱动重启 / 睡眠唤醒）时调：在飞的 0x83 传输全被作废、
+ * 完成回调不会再来，所以要把包缓冲的账一次清干净（真正的清账在主循环里做）。 */
+void scope_sampler_usb_reset(void);
+
 int      scope_sampler_is_running(void);
 uint32_t scope_sampler_plan_hash(void);   /* 与网页 planHash 同一算法，用来对账"配置生效了吗" */
 

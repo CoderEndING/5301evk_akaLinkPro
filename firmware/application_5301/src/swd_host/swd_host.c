@@ -284,12 +284,21 @@ uint8_t swd_write_ap(uint32_t adr, uint32_t val)
     int2array(data, val, 4);
 
     if (swd_transfer_retry(req, (uint32_t *)data) != 0x01) {
+        /* 这一趟没落地，硬件里还是旧值，可缓存在上面已经按"新值"记下了 ——
+         * 不作废的话，下一次调用会拿"命中"的缓存跳过写入，而 AP.TAR 可能早被
+         * 自增带跑，采样数据会静默错位（不报错、看着还正常）。 */
+        swd_invalidate_ap_cache();
         return 0;
     }
 
     req = SWD_REG_DP | SWD_REG_R | SWD_REG_ADR(DP_RDBUFF);
     ack = swd_transfer_retry(req, NULL);
-    return (ack == 0x01);
+    if (ack != 0x01) {
+        /* AP 写本身 ACK 了，但这笔 posted 写没能确认完成 —— 按"不确定"处理。 */
+        swd_invalidate_ap_cache();
+        return 0;
+    }
+    return 1;
 }
 
 

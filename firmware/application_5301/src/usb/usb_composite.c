@@ -6,6 +6,7 @@
 #include "hpm_otp_drv.h"
 #include "DAP.h"
 #include "cdc_interface.h"
+#include "scope_sampler.h"
 
 #define CMSIS_DAP_INTERFACE_SIZE (9 + 7 + 7 + 7)
 #define CUSTOM_HID_LEN (9 + 9 + 7 + 7)
@@ -454,6 +455,23 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
         usbtx_idle_flag = 0;
         uarttx_idle_flag = 0;
         config_uart_transfer = 0;
+        /* DAP 的队列索引/计数必须一起复位：下面的 CONFIGURED 固定从 USB_Request[0]
+         * 重新武装，索引不复位的话，dap_out_callback 会拿旧 IndexI 去判 TransferAbort
+         * （读的是旧缓冲），而数据其实落在 [0] —— 命令流错乱，一直到下一次复位。
+         * 计数清零同时也让主循环里那个 while (CountI != CountO) 变空转。 */
+        USB_RequestIndexI = 0U;
+        USB_RequestIndexO = 0U;
+        USB_RequestCountI = 0U;
+        USB_RequestCountO = 0U;
+        USB_ResponseIndexI = 0U;
+        USB_ResponseIndexO = 0U;
+        USB_ResponseCountI = 0U;
+        USB_ResponseCountO = 0U;
+        USB_RequestIdle = 1U;
+        USB_ResponseIdle = 1U;
+        /* J-Scope 采样器的包缓冲账本同理：在飞的 bulk IN 0x83 传输全被复位作废，
+         * 完成回调不会再来。这里只置标志，真正的清账放主循环做（不和推包抢状态）。 */
+        scope_sampler_usb_reset();
         break;
     case USBD_EVENT_CONNECTED:
         break;
@@ -522,8 +540,6 @@ void dap_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes)
         USB_ResponseIdle = 1U;
     }
 }
-
-#include "scope_sampler.h"
 
 void swo_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {

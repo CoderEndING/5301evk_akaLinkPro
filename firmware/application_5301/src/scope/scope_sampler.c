@@ -29,6 +29,9 @@
 #include "hpm_common.h"
 #include "usb_composite.h"   /* usbd_ep_start_write / SWO_IN_EP / ATTR_PLACE_AT_NONCACHEABLE_BSS_* */
 #include "rtt_bridge.h"      /* 复用的 SWD 原语（patch-notes §1 的 5 个 adapter） */
+#include "swd_host.h"        /* swd_read_block4 / swd_read_word_hold_prepare / swd_read_word_pipe
+                              * 的声明 —— 缺了它这三个调用是"隐式声明"（GCC 13 只是警告，
+                              * GCC 14 起直接报错），编译产物的返回值约定全靠运气。 */
 #include "scope_sampler.h"
 
 /* ------------------------------------------------------------------ 常量 */
@@ -115,6 +118,7 @@ static uint32_t s_last_cmd, s_last_rsp;
 static uint32_t s_clock_hz;
 static uint32_t s_last_sample_ticks;          /* 最近一次采样的实际耗时（标称 vs 实际） */
 static uint32_t s_tx_done;                    /* USB 完成回调次数（诊断包缓冲为何耗尽） */
+static volatile uint8_t s_usb_reset_req;      /* USB 总线复位：ISR 置标志、主循环清账 */
 
 static uint32_t s_bench_req, s_bench_valid, s_bench_iters, s_bench_ticks;
 static int32_t  s_bench_err;
@@ -314,10 +318,20 @@ static void scope_push_packet(void)
     else
     {
         uint8_t buf = s_fill_buf;
-        s_tx_busy[buf] = 1U;
-        s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
-        s_if_count++;
-        usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET);
+        /* 端点写失败（端口层在端点未使能时返回非 0 —— 例如刚经历 USB 复位的窗口）
+         * 必须**不记账**：记了账却没有完成回调，这个缓冲就永远回不来，之后一包也
+         * 推不出去。注意端点"忙"时端口层是静默顶掉上一笔（仍返回 0），那种情况在
+         * 这里查不出来 —— 靠 USBD_EVENT_RESET 的清账兜底（scope_sampler_usb_reset）。 */
+        if (usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET) != 0)
+        {
+            s_usb_drop += (uint32_t)s_fill_n;   /* 这一包的样本确实没出去，如实计数 */
+        }
+        else
+        {
+            s_tx_busy[buf] = 1U;
+            s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
+            s_if_count++;
+        }
     }
 
     /* 下一包。**拿不到就置 0xFF（"没有缓冲"），绝不退回某个固定下标** ——
@@ -643,8 +657,6 @@ static int scope_start_now(void)
  * 🚨 要先自己把链路拉起来 —— 网页的「标定真实速率」是在**启动推流之前**点的。 */
 static void scope_run_bench(void)
 {
-    uint8_t *dst = &s_pkt[s_fill_buf][SCOPE_HDR];
-
     if (s_nspans == 0U)
     {
         s_bench_err = -3;
@@ -656,6 +668,25 @@ static void scope_run_bench(void)
         int rc = scope_link_ready();
         if (rc != 0) { s_bench_err = rc; s_bench_valid = 1U; return; }
     }
+
+    /* 落点必须是**真实存在**的包缓冲：s_fill_buf 的合法值里有 0xFF 这个"没有缓冲"
+     * 哨兵（8 个包全在飞时点标定就会撞上），拿它当下标取到的是 &s_pkt[255] ——
+     * 越界指针，而下面会按 s_bench_iters（上限 100000）持续往里写。
+     * 先要到缓冲再取址；要不到就如实报错，绝不写越界地址。 */
+    if (s_fill_buf >= SCOPE_TX_BUFS)
+    {
+        if (s_running) { s_bench_err = -5; s_bench_valid = 1U; return; }
+        s_fill_buf = scope_alloc_buf();
+        s_fill_n = 0U;
+    }
+    if (s_fill_buf >= SCOPE_TX_BUFS)
+    {
+        s_bench_err = -5;                  /* -5 = 没有空闲包缓冲（等主机把 0x83 读走） */
+        s_bench_valid = 1U;
+        return;
+    }
+
+    uint8_t *dst = &s_pkt[s_fill_buf][SCOPE_HDR];
 
     uint32_t t0 = mchtmr_now();
     int32_t err = 0;
@@ -671,8 +702,46 @@ static void scope_run_bench(void)
     s_last_sample_ticks = (s_bench_iters != 0U) ? (s_bench_ticks / s_bench_iters) : 0U;
 }
 
+/* USB 总线复位后的清账（在主循环里做，避免和正在推包的状态抢）。
+ *
+ * 复位会把所有在飞的 bulk IN 传输一并作废 —— 它们**不会有完成回调**，于是
+ * scope_sampler_tx_complete 永远等不到，8 个包缓冲就被"记成在飞"占死：表现为
+ * 重枚举之后 usb_drop 狂涨，只能 STOP/START（甚至拔插）才恢复。 */
+static void scope_usb_reset_apply(void)
+{
+    /* 管线里可能还押着一拍读的结果：先交付回它该在的样本槽，再清账。 */
+    if (s_pipe_dst != NULL) { (void)scope_pipe_flush(); }
+
+    for (uint8_t i = 0U; i < SCOPE_TX_BUFS; i++)
+    {
+        s_tx_busy[i] = 0U;
+        s_inflight[i] = 0U;
+    }
+    s_if_head = 0U;
+    s_if_count = 0U;
+
+    /* 正在填的那个缓冲按设计不会是"在飞"的，内容还作数；只有本来就是"没有缓冲"
+     * （0xFF 哨兵）时才需要重新要一个。 */
+    if (s_fill_buf >= SCOPE_TX_BUFS)
+    {
+        s_fill_buf = scope_alloc_buf();
+        s_fill_n = 0U;
+    }
+    s_pipe_dst = NULL;
+}
+
+void scope_sampler_usb_reset(void)
+{
+    s_usb_reset_req = 1U;
+}
+
 void scope_sampler_poll(void)
 {
+    if (s_usb_reset_req)
+    {
+        s_usb_reset_req = 0U;
+        scope_usb_reset_apply();
+    }
     if (s_start_req)
     {
         s_start_req = 0U;

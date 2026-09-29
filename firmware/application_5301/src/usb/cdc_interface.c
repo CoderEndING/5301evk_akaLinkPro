@@ -117,6 +117,14 @@ void uartx_set_cdc_source(uint8_t from_rtt)
     {
         chry_ringbuffer_reset(&g_uartrx);
     }
+    else
+    {
+        /* 交还给串口时同样要"追平并丢弃"：桥运行期间 RX DMA 一直在无限循环里搬，
+         * rb_write_pos 却停在原处 —— 不追平的话，停桥后的第一次 flush 会把期间攒下的
+         * 陈旧字节（长时间桥接后可能超过一整圈）一次性灌给主机。
+         * 与 chry_dap_usb2uart_set_enabled(1) 的恢复路径同一个动作。 */
+        uartx_rx_resync();
+    }
 }
 ATTR_PLACE_AT_NONCACHEABLE_BSS_WITH_ALIGNMENT(4)
 uint8_t uart_rx_buf[UART_RX_DMA_BUFFER_SIZE];

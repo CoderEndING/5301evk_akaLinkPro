@@ -217,7 +217,10 @@ static int rtt_swd_set_clock(uint32_t hz)
     s_req[3] = (uint8_t)(hz >> 16);
     s_req[4] = (uint8_t)(hz >> 24);
     dap_cmd(s_req, s_resp);
-    return (s_resp[2] == DAP_OK) ? 0 : -1;
+    /* SWJ_Clock 的响应是 [0]=命令回显、[1]=状态 —— 状态字节不是 [2]。
+     * 早先写成 s_resp[2]（靠静态零初始化恒等于 DAP_OK）→ 恒判成功，
+     * 换挡失败被静默吞掉，斜坡逻辑失去失败感知。 */
+    return (s_resp[1] == DAP_OK) ? 0 : -1;
 }
 
 /* Debug-port bring-up：官方 swd_host 的 swd_init() + swd_init_debug()。
@@ -697,11 +700,15 @@ void rtt_bridge_trace_dap(const uint8_t *req, const uint8_t *resp)
 
 static volatile uint8_t s_start_pending;
 static volatile uint8_t s_raw_pending;
+static uint8_t s_raw_reject;        /* 1 = 入口挡下的请求（只回 DAP_ERROR，不执行） */
 static uint32_t s_req_addr, s_req_size;
 static uint8_t s_req_channel;
 static uint8_t s_raw_req[24];
 static uint32_t s_raw_req_len;
-static uint8_t s_raw_rsp[24];
+/* 响应缓冲按**一条完整 DAP 响应**给：DAP_TransferBlock 的 count 是请求里声明的
+ * 2 字节字段（一条 5 字节请求就能声明 0xFFFF，响应 4+4×count ≈ 256 KB），
+ * 原来 24 字节的缓冲一碰就溢出。长度上界由 rtt_bridge_request_raw() 在入口保证。 */
+static uint8_t s_raw_rsp[DAP_XFER_SIZE];
 static volatile uint32_t s_raw_rsp_len;
 static volatile int8_t s_start_rc = -100;
 static uint32_t s_bench_addr;
@@ -734,6 +741,34 @@ void rtt_bridge_request_raw(const uint8_t *req, uint32_t len)
     }
     s_raw_req_len = len;
     s_raw_rsp_len = 0U;
+
+    /* 有几类请求的响应长度**不由请求长度限定**，必须在这里就挡住：
+     *   - 空请求：req[0] 还是上一条命令的残留，会被原样再执行一次；
+     *   - ExecuteCommands(0x7F)：嵌套命令的响应叠加，还能再套一层 —— raw 通道的
+     *     语义本来就是"发一条命令"，直接拒绝；
+     *   - TransferBlock(0x06)：count 是请求里声明的 2 字节字段，把 count 钳到
+     *     响应缓冲装得下的上界。
+     * 其余命令的响应长度天然被 24 字节的请求长度限死（最坏是 Transfer 带时间戳：
+     * 3 + 20×8 = 163 B），装得下。 */
+    if ((len == 0U) || (s_raw_req[0] == ID_DAP_ExecuteCommands))
+    {
+        s_raw_rsp[0] = DAP_ERROR;      /* 给主机一个看得见的拒绝 */
+        s_raw_rsp_len = 1U;
+        s_raw_reject = 1U;
+        s_raw_pending = 1U;
+        return;
+    }
+    if ((len >= 4U) && (s_raw_req[0] == ID_DAP_TransferBlock))
+    {
+        uint32_t count = (uint32_t)s_raw_req[2] | ((uint32_t)s_raw_req[3] << 8);
+        uint32_t limit = (uint32_t)((sizeof(s_raw_rsp) - 4U) / 4U);
+        if (count > limit)
+        {
+            s_raw_req[2] = (uint8_t)limit;
+            s_raw_req[3] = (uint8_t)(limit >> 8);
+        }
+    }
+    s_raw_reject = 0U;
     s_raw_pending = 1U;
 }
 
@@ -884,12 +919,25 @@ static void rtt_bridge_service_requests(void)
     if (s_raw_pending)
     {
         s_raw_pending = 0U;
-        for (uint32_t i = 0U; i < sizeof(s_raw_rsp); i++)
+        if (s_raw_reject)
         {
-            s_raw_rsp[i] = 0U;
+            /* 入口挡下的请求：s_raw_rsp 里已经是给主机的 DAP_ERROR，不再执行。 */
+            s_raw_reject = 0U;
         }
-        (void)DAP_ExecuteCommand(s_raw_req, s_raw_rsp);
-        s_raw_rsp_len = sizeof(s_raw_rsp);
+        else
+        {
+            for (uint32_t i = 0U; i < sizeof(s_raw_rsp); i++)
+            {
+                s_raw_rsp[i] = 0U;
+            }
+            (void)DAP_ExecuteCommand(s_raw_req, s_raw_rsp);
+            s_raw_rsp_len = sizeof(s_raw_rsp);
+            /* 这是唯一一条"主机碰了 DAP 却不报备"的入口（主通路 chry_dap_handle
+             * 每条命令都报）：raw 命令会直接改写 DP_SELECT / AP_CSW / AP_TAR，
+             * 而 swd_host 的影子缓存并不知道 —— 不报备的话，随后用 scope/RTT
+             * 会拿着旧认知去读**别的地址**（静默读错）。 */
+            rtt_bridge_note_dap_activity();
+        }
     }
     if (s_start_pending)
     {

@@ -1063,7 +1063,7 @@ ATTR_RAMFUNC static uint32_t DAP_SWD_Transfer(const uint8_t *request, uint8_t *r
 				retry = DAP_Data.transfer.retry_count;
 				do
 				{
-					response_value = SWD_Write(DP_RDBUFF | DAP_TRANSFER_RnW, &data);
+					response_value = SWD_Read(DP_RDBUFF | DAP_TRANSFER_RnW, &data);  /* RnW=1：必须走读引擎 */
 				} while (UNLIKELY((response_value == DAP_TRANSFER_WAIT) && retry-- && !DAP_Data.transfer_abort));
 				if (UNLIKELY(response_value != DAP_TRANSFER_OK))
 				{
@@ -1384,7 +1384,7 @@ ATTR_RAMFUNC static uint32_t DAP_JTAG_Transfer(const uint8_t *request, uint8_t *
 				retry = DAP_Data.transfer.retry_count;
 				do
 				{
-					response_value = JTAG_Write(DP_RDBUFF | DAP_TRANSFER_RnW, &data);
+					response_value = JTAG_Read(DP_RDBUFF | DAP_TRANSFER_RnW, &data);  /* RnW=1：必须走读引擎 */
 				} while ((response_value == DAP_TRANSFER_WAIT) && retry-- && !DAP_Data.transfer_abort);
 				if (response_value != DAP_TRANSFER_OK)
 				{
