@@ -44,6 +44,13 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
   比主机驱动 OpenOCD 快 **9 倍**；RTT 交付 **1385 KB/s 且字节级零丢包**（28.5 MB
   不丢不重），有效 TCK 20.7 MHz（目标规格上限 25 MHz）。
   详见 [HPM6800EVK（HPM6880，RISC-V）目标调试](#hpm6800evkhpm6880risc-v目标调试)。
+- **USB→SPI/QSPI 转发桥（HID `CMD_SPI` 0x35 + bulk `0x8B/0x0B`）**：把探针当"USB 转
+  SPI/QSPI 主机"用，专为驱动 LCD/QSPI 屏与各类 SPI 器件。硬件自带 cmd/addr/dummy/token
+  相位与单/双/**四线**，一次 CS 窗口跑完；面板档（`spi_dcx` / `qspi`）让网页把厂规初始化
+  表 `{cmd, params, delay_ms}` 一行编成一个 `STEP` 帧原样下发。实测（跳线回环）单线
+  **20/40/60/75 MHz 全部通过**，DMA 与轮询两条 TX 路径可配。详见
+  [USB→SPI/QSPI 转发桥](#usbspiqspi-转发桥) 与
+  [`docs/web-handoff-spi-bridge.md`](docs/web-handoff-spi-bridge.md)。
 - **DFU/MSC Bootloader**：长按 USER 键进 DFU，虚拟 U 盘 `AKALINKPRO` 拖入 `.bin` 即升级；
   APP 带签名 + 长度 + CRC32 校验，校验失败停在 DFU。
 - **配置持久化 + WebHID 上位机**：配置存 QSPI NOR（EasyFlash），`docs/index.html` 可直接改。
@@ -1005,6 +1012,59 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 > 例程的 F103ZE）：它的第 3 阶段会启动 RTT 桥并反复重扫，实测把探针主循环拖到不再应答
 > HID，只能**拔插一次**才能恢复。纯 SWD 块读那两阶段（3301 KB/s）是可以跑的。
 
+## USB→SPI/QSPI 转发桥
+
+> 分支 `feature/usb-spi-bridge`。方案与全部实测记录：`docs/usb-spi-bridge-plan.md`；
+> **网页侧实现说明**：`docs/web-handoff-spi-bridge.md`。协议真源：
+> `firmware/application_5301/src/spi_bridge/spi_bridge_proto.h`。
+
+把探针变成"USB 转 SPI/QSPI 主机"：主机通过 HID `0x35` 配置，通过 bulk `0x0B` 灌**有序帧流**
+（一次 SPI 事务、CS/DC 翻转、延时、面板初始化步……），bulk `0x8B` 收回读数据与应答。
+驱动 LCD/QSPI 屏时，网页把厂规初始化表一行编成一个 `STEP` 帧即可，屏的时序细节全在固件里。
+
+**只有 HPM5301EVKLite 有这套排针**（`BOARD_HAS_SPI_BRIDGE = 1`）；akaLinkPro 原板置 0，
+整个模块编成空实现，枚举与资源占用与改动前完全一致。
+
+### 接线（J3 排针，全部在板上引出）
+
+| 信号 | 引脚 | J3 脚 | | 信号 | 引脚 | J3 脚 |
+|---|---|---|---|---|---|---|
+| SPI1_CS0 | PA26 | 24 | | SPI1_MOSI / IO0 | PA29 | 19 |
+| SPI1_SCLK | PA27 | 23 | | SPI1_MISO / IO1 | PA28 | 21 |
+| **IO2**（quad） | PA30 | 37 | | **IO3**（quad） | PA31 | 11 |
+
+辅助脚默认：`DC=PB11(J3.13)`、`RST=PB12(J3.27)`、`BL=PB13(J3.28)`、`CS_AUX=PB10(J3.26)`、
+`TE`（输入）= `PB10`。**验收/自测只需一根跳线**：`J3[19] ↔ J3[21]`（MOSI↔MISO）。
+
+### 实测（2026-09-29，跳线回环）
+
+| 项目 | 结果 |
+|---|---|
+| 回环 1/2/32/99/100/101/256/492 B（单线） | **16/16 PASS**；边界 3/255/257/491/492/493 也过 |
+| SPI 模式 0/1/2/3（CPOL/CPHA 四组合） | 全部 PASS |
+| SCLK 档位 | 20 / 40 / 60 / **75** MHz PASS（80/100 MHz 受跳线物理限制，待真从器件/LA 判） |
+| 手动 CS + `CS_HOLD` 跨帧保持 | PASS（LA 实测三帧共用一个连续 CS 窗口） |
+| 面板档线上格式（LA 逐位解 MOSI） | `spi_dcx`：`CE 5A A5` ✓；`qspi`：`02 00 00 F0 28` ✓ |
+| 轮询 vs DMA | 都贴着 SPI 线速；DMA 固定开销 1~4.5 µs，40 MHz 约 200 B 交叉、75 MHz 约 128 B 交叉 |
+| 资源 | FLASH 127384 B (14.01%)、**DLM 106592 B 零增长**、AHB_SRAM 24880 B |
+
+### 用自检工具跑一遍
+
+```powershell
+cd script_test
+python spi_bridge_test.py info            # 读配置/面板档/状态
+python spi_bridge_test.py enable 1        # 使能（此时才配引脚）
+python spi_bridge_test.py frames          # PING/DELAY/AUX_IN/CS 冒烟
+python spi_bridge_test.py loop            # MOSI<->MISO 跳线回环全量验收
+python spi_bridge_test.py bench           # 轮询 vs DMA 耗时对照
+python spi_bridge_test.py pintest         # 回环失败时：先验跳线通不通
+python spi_bridge_test.py dbg             # SPI 寄存器现场快照（卡在哪一步）
+```
+
+> 改这块代码前请先读 `docs/usb-spi-bridge-plan.md` §5.5–§5.7：那里记着四条**只有硬件才
+> 暴露得出来**的硬约束（EP0 请求缓冲要装得下 MS OS 描述符集、SPI1 模块时钟不许顶到
+> 720 MHz、SCLK 焊盘必须带 `LOOP_BACK`、延时要有序帧流内生效）。
+
 ## 文档
 
 | 文档 | 内容 |
@@ -1014,6 +1074,8 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 | [`docs/HANDOVER-evklite-20260927.md`](docs/HANDOVER-evklite-20260927.md) | 移植过程交接记录（含 CDC 回环故障的根因与修复） |
 | [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议（0x31 RTT / 0x32 SCOPE / 0x33 RISCV / 0x34 BRIDGE） |
 | [`docs/web-handoff-riscv-scope.md`](docs/web-handoff-riscv-scope.md) | **给网页侧的最小改动说明**：波形页采 RISC-V 需要的三个新位、哪些 SWD 专属控件该藏、按后端分档的采样率提示 |
+| [`docs/web-handoff-spi-bridge.md`](docs/web-handoff-spi-bridge.md) | **USB→SPI/QSPI 桥的主机侧实现说明**：HID 0x35 全部动作、bulk 帧格式与流程、面板初始化表怎么搬、排坑清单、实测性能 |
+| [`docs/usb-spi-bridge-plan.md`](docs/usb-spi-bridge-plan.md) | USB→SPI/QSPI 桥方案 + P1~P4 上板实测记录（含四条硬件硬约束与四个真坑） |
 | [`script_test/stm32f103_scope/`](script_test/stm32f103_scope) | J-Scope 的靶子固件（F103C8/ZE，96 MHz，10 kHz 契约波形）+ `check.py` 客观验收 |
 | [`firmware/application_5301/Flash_Memory_Map.md`](firmware/application_5301/Flash_Memory_Map.md) | Flash 布局 |
 | [`firmware/application_5301/Firmware_Integrity_Plan.md`](firmware/application_5301/Firmware_Integrity_Plan.md) | 固件头/CRC 校验设计 |
