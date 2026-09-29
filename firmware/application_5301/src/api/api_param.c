@@ -6,6 +6,7 @@
 #include "rtt_bridge.h"
 #include "riscv_svc.h"
 #include "scope_sampler.h"
+#include "spi_bridge.h"
 #include "SW_DP.h"
 #include "led_state.h"
 #include "hpm_dfu_trigger.h"
@@ -90,6 +91,13 @@
 #define CMD_BRIDGE (0x34)
 #define BRIDGE_ACT_STATUS 0U
 #define BRIDGE_ACT_SET 1U
+
+/* ---- CMD 0x35 SPI：USB→SPI/QSPI 转发桥（src/spi_bridge/）----
+ * 控制面（配置/面板档/状态/使能/复位/中止）走这条 HID；数据面与一切与**线序**有关的
+ * 动作走新开的一对 bulk：OUT 0x0B / IN 0x8B。响应形状照抄 0x31/0x32/0x34：
+ * res_hid[3] = 动作号回显，res_hid[4..] = 状态字/计数器/配置块。
+ * 动作表与帧格式见 src/spi_bridge/spi_bridge_proto.h 与 docs/usb-spi-bridge-plan.md。 */
+#define CMD_SPI (0x35)
 
 #define PARAM_MAGIC_NUMBER (0x0D000721UL)
 /* EasyFlash ENV key that stores the whole api_param_t blob. */
@@ -591,6 +599,13 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
         res_hid[5] = (uint8_t)(st >> 8);
         res_hid[6] = (uint8_t)(st >> 16);
         res_hid[7] = (uint8_t)(st >> 24);
+        break;
+    }
+    case CMD_SPI:
+    {
+        /* USB→SPI/QSPI 转发桥的控制面（动作见 src/spi_bridge/spi_bridge_proto.h）。
+         * 数据面走新开的一对 bulk：OUT 0x0B / IN 0x8B。 */
+        spi_bridge_hid(req_hid, res_hid);
         break;
     }
     case CMD_RESET_DEVICE:

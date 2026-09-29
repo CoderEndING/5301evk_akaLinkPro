@@ -146,6 +146,10 @@
 #define BOARD_UART_DTR_PAD (IOC_PAD_PA06)
 #define BOARD_UART_RTS_PAD (IOC_PAD_PA07)
 
+/* 这块板没有 HPM5301EVKLite 那样的 J3 排针 SPI1 引出（SPI1 引脚另有用途），
+ * USB→SPI/QSPI 转发桥在这个构建里编成空实现。见 docs/usb-spi-bridge-plan.md §2.8。 */
+#define BOARD_HAS_SPI_BRIDGE (0)
+
 
 #if defined(__cplusplus)
 extern "C"

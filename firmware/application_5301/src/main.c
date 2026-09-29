@@ -18,6 +18,7 @@
 #include "usb_composite.h"
 #include "riscv_svc.h"
 #include "scope_sampler.h"
+#include "spi_bridge.h"
 #include "led_state.h"
 
 #if BOARD_HAS_USER_KEY_DFU
@@ -96,6 +97,9 @@ int main(void)
     /* Status LEDs, external reference ADC and the periodic LED tick. */
     led_state_init();
 
+    /* USB→SPI/QSPI 转发桥：只清状态（引脚/时钟在 ENABLE=1 时才动）。 */
+    spi_bridge_init();
+
     while (1)
     {
         chry_dap_handle();
@@ -115,6 +119,9 @@ int main(void)
         scope_sampler_poll();
         /* Probe-side RISC-V engine (JTAG): queued memory access / benchmarks. */
         riscv_svc_poll();
+        /* USB→SPI/QSPI 转发桥（HID 0x35 控制面 + bulk 0x0B/0x8B 数据面）。
+         * 未使能时只有一条分支的开销；使能后每轮按预算处理若干帧。 */
+        spi_bridge_poll();
     }
     return 0;
 }
