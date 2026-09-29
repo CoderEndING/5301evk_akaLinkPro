@@ -183,7 +183,7 @@ help:
 	@echo   make panel-red   solid red      make panel-green   solid green
 	@echo   make panel-blue  solid blue     make panel-gradient gradient
 	@echo   make panel-checker checkerboard make panel-le      bars, other byte order
-	@echo   make spi-loop    loopback sweep (jumper J3[19] ^<-> J3[21])
+	@echo   make spi-loop    loopback sweep (jumper J3[19] to J3[21])
 	@echo   make spi-frames  PING/DELAY/AUX_IN/CS smoke test
 	@echo   make spi-pintest jumper continuity check (run this first on failure)
 	@echo   make spi-dbg     SPI register snapshot
