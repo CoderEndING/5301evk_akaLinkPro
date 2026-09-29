@@ -825,6 +825,26 @@ P3 的功能（辅助 GPIO、DC、RESET、AUX_IN、手动 CS、非阻塞 DELAY�
 LA 物理波形（`captures/cshold.csv`）：565 µs 窗口内 **CH0(CS) 只有 1 个下降沿、全程不再抬起**，
 同窗口 CH4 上是 20.6 MHz 的 SCLK —— 三帧确实共用一个连续 CS 窗口。
 
+**LA 逐脚复验（CH0=DC/PB11、CH1=RST/PB12、CH2=BL/PB13、CH3=CS/PA26）**
+
+- **profile 1 的 STEP**（`cmd=0xCE` + `5A A5`）：`CS↓` → **DC 在窗口内翻高** → `CS↑`，
+  实测 `t=0 CS↓ / t=25.18 µs DC↑ / t=31.71 µs CS↑` —— 一个 CS 窗口内完成"命令→翻 DC→参数"，
+  正是 AXS15352 要的时序（也是默认走 GPIO CS 而不是硬件 CS 的原因）。
+- **`RESET` 帧**：请求 `low_ms=2 / post_ms=5`，实测 RST 低电平 **2009.2 µs** ✓
+  （修 bug 前只有 **9.75 µs**，见下）。
+- **`GPIO` 帧**：BL 开→关在 LA 上可见 ✓。
+
+**这里又抓到一个真 bug：`RESET` 的 `low_ms` 被当成微秒用了**
+
+```c
+s_rst_state = 1U;
+sb_delay_us(rd_u16(pl));        /* ← low_ms 直接喂给了"微秒"接口 */
+```
+协议里 `low_ms` 是**毫秒**（释放后的等待那行写对了：`sb_delay_us(post_ms * 1000U)`），
+所以请求 2 ms 实际只低了 **2 µs**（LA 实测 9.75 µs，含循环开销）。**差 1000 倍**，
+而症状是"面板复位不了、屏不亮"这种最难查的。修：`sb_delay_us((uint32_t)rd_u16(pl) * 1000U)`，
+复测 2009.2 µs ✓。
+
 **这次挖出的环形缓冲坑：复位会把"复位前收到的包"复活成新帧**
 
 症状：`enable` 之后的**第一帧**行为异常 —— 实测收到一条 `len=1 / data=01` 的应答，

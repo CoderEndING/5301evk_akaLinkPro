@@ -1455,11 +1455,14 @@ static uint8_t sb_exec_frame(const uint8_t *hdr, const uint8_t *pl, uint16_t ple
         {
             return SB_E_GPIO;
         }
-        /* 拉低保持 -> 释放 -> 等待，两段都由 poll 非阻塞推进 */
+        /* 拉低保持 -> 释放 -> 等待，两段都由 poll 非阻塞推进。
+         * ⚠️ low_ms 是**毫秒**，必须 ×1000 再交给 sb_delay_us()（那个接口吃微秒）。
+         * 少了这个 ×1000，请求 2 ms 的复位脉冲实际只有 2 µs —— LA 实测 9.75 µs，
+         * 面板根本复位不了（差 1000 倍，而且症状是"屏不亮"这种最难查的）。 */
         sb_pad_write(s_pad_rst, sb_line_active_low(1U) ? 0U : 1U);
         s_rst_post_ms = rd_u16(&pl[2]);
         s_rst_state = 1U;
-        sb_delay_us(rd_u16(pl));
+        sb_delay_us((uint32_t)rd_u16(pl) * 1000U);
         break;
 
     case SB_T_AUX_IN:
