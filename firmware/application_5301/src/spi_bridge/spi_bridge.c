@@ -1203,7 +1203,16 @@ static uint8_t sb_step_qspi(uint8_t cmd, uint8_t nparams, const uint8_t *params)
     x.cmd = opcode;
     x.tcfg = SB_TCFG_CMD_EN | SB_TCFG_ADDR_EN | SB_TCFG_LINES_1;
     x.addr_len = abytes;
-    x.addr = ((uint32_t)cmd) << 16;
+    /*
+     * ⚠️ 命令字放在**最低字节**，不要 `<< 16`。
+     * 硬件按 addr_len 发的是**低 addr_len 个字节、MSB 在前**：实测
+     * `addr = 0x00F00000, addr_len = 3` 线上是 `F0 00 00`（LA 解的 MOSI 位流）。
+     * QSPI 屏的命令帧线上必须是 `02 | 00 00 <cmd>`（32 bit = opcode + 24 bit 地址，
+     * 命令字在地址的低字节），所以这里给 `addr = cmd`，硬件就会发 `00 00 cmd`。
+     * 这个字节序错误是 P4 用 LA 逐位解 MOSI 才发现的：原来 `cmd << 16` 发出的是
+     * `02 F0 00 00 28`，屏只会看到地址 0xF00000 —— 一条命令都认不出来。
+     */
+    x.addr = (uint32_t)cmd;
     x.tx_len = nparams;
 
     if (cs_auto != 0U)

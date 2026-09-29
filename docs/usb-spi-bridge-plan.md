@@ -501,7 +501,7 @@ OUT: [XFER RSP] tcfg{cmd_en=1} cmd=0x80|reg tx_len=0 rx_len=1 dummy=1
 |---|---|---|---|
 | 0 | `raw` | 一次 `XFER`：`cmd` + `params`，均按 `def_lines`；DC 未用 | 普通 SPI 器件（传感器、NOR） |
 | 1 | `spi_dcx` | **同一个 CS 窗口内**：CS↓ → DC=命令电平 → 发 8 bit `cmd` → **翻 DC=数据电平** → 发 `params` → CS↑（`nparams = 0` 时只发命令） | **AXS15352 / 天马 2P01**（4 线 SPI + RS） |
-| 2 | `qspi` | 一次 `XFER`：`cmd = qspi_wr_opcode`（默认 `0x02`，1 线）→ 地址相位 24 bit = **`面板命令字 << 16`** → 数据相位 `params`（1 线） | **ST77916** 等 QSPI 屏的命令阶段 |
+| 2 | `qspi` | 一次 `XFER`：`cmd = qspi_wr_opcode`（默认 `0x02`，1 线）→ 地址相位 24 bit = **`面板命令字`（放在地址的最低字节）** → 数据相位 `params`（1 线） | **ST77916** 等 QSPI 屏的命令阶段 |
 
 档位参数（HID 配置里给）：
 
