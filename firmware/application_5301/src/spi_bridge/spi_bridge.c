@@ -870,6 +870,18 @@ static uint8_t sb_spi_xfer(const sb_xfer_t *x, uint8_t flags, const uint8_t *tx,
 
     sb_spi_apply_format(x->addr_len);
 
+    /*
+     * ⚠️ 必须先清零再取默认值：SDK 的 `spi_master_get_default_control_config()`
+     * **不初始化 `slave_config.slave_data_only`**（那是 `spi_slave_get_default_control_config()`
+     * 才管的字段），而 `spi_control_init()` 会无条件把它写进 `TRANSCTRL.SLVDATAONLY`。
+     * ctl 是栈上局部变量 ⇒ 那个字段是**栈垃圾**，偶尔为 1。
+     *
+     * 实测症状（2026-09-29 抓了一晚上）：回环**偶发**某笔事务读回全 00 / 全 FF，
+     * 而 `status` 仍然是 OK、计数器也不报错；dbg 快照里能看到
+     * `TRANSCTRL = 0x8001F81F`（bit31 被置上）而不是正常的 0x0001F81F。
+     * 频度取决于栈布局 —— 把一段复位代码挪出本函数后就从"几乎不出现"变成"每几十笔一次"。
+     */
+    memset(&ctl, 0, sizeof(ctl));
     spi_master_get_default_control_config(&ctl);
     ctl.master_config.cmd_enable = (cmd_en != 0U);
     ctl.master_config.addr_enable = (addr_en != 0U);
@@ -892,17 +904,6 @@ static uint8_t sb_spi_xfer(const sb_xfer_t *x, uint8_t flags, const uint8_t *tx,
     /* dbg[11] = bit0 调用前总线是否已经"在忙"，bit16.. wcnt */
     s_dbg[11] = (spi_is_active(SB_SPI) ? 1U : 0U) | ((wcnt & 0xFFFFU) << 16);
 
-    /*
-     * 上一笔事务失败后，控制器会**卡在 ACTIVE**（SPIACTIVE 恒 1）：之后每一笔
-     * spi_transfer() 都在 `spi_is_active()` 那道检查上直接返回 BUSY，长度扫描
-     * 从第二条起就全是 BUSY、什么也测不出来。所以失败后先复位控制器再继续。
-     */
-    if (s_spi_need_reset != 0U)
-    {
-        s_spi_need_reset = 0U;
-        spi_reset(SB_SPI);
-        (void)spi_poll_reset_complete(SB_SPI, spi_reset_all, 100000U);
-    }
     s_dbg[12] = 1U; /* stage: 已就绪，准备启动 */
 
     t0 = SB_MTIME;
@@ -1723,6 +1724,23 @@ void spi_bridge_poll(void)
     if (sb_delay_pending() != 0U)
     {
         return; /* 延时期间不推进帧（USB 环照收） */
+    }
+
+    /*
+     * 上一笔事务失败后控制器会**卡在 ACTIVE**（SPIACTIVE 恒 1）：之后每一笔
+     * spi_transfer() 都在 `spi_is_active()` 那道检查上直接返回 BUSY，长度扫描
+     * 从第二条起就全是 BUSY、什么也测不出来。所以失败后要复位控制器。
+     *
+     * 复位**放在主循环里做**（这时 CS 一定是释放的），而不是等下一笔事务进来再做：
+     * 后者会让这一次复位（实测 ~14 µs）落在**下一个 CS 窗口里**，把面板命令的
+     * 窗口无谓撑长（LA 实测过：1 字节只写事务的 CS 窗口 21.06 µs，其中 13.98 µs
+     * 就是这次复位，而它不出现在 last_ticks 里，很容易查错方向）。
+     */
+    if (s_spi_need_reset != 0U)
+    {
+        s_spi_need_reset = 0U;
+        spi_reset(SB_SPI);
+        (void)spi_poll_reset_complete(SB_SPI, spi_reset_all, 100000U);
     }
 
     sb_process_packets();
