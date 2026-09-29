@@ -28,6 +28,9 @@
 #include "hpm_gpio_drv.h"
 #include "hpm_gpiom_drv.h"
 #include "hpm_clock_drv.h"
+#include "hpm_dma_mgr.h"
+#include "hpm_dmav2_drv.h"
+#include "hpm_dmamux_src.h"
 #include "pinmux.h"
 #include "usb_composite.h"
 #include "spi_bridge.h"
@@ -158,6 +161,11 @@ typedef struct
     volatile uint32_t dbg[13];
     volatile uint8_t spi_need_reset; /* 上一笔失败/卡 ACTIVE：下一笔前先复位控制器 */
 
+    /* P2：TX 数据相位走 DMA（tx_len ≥ tx_dma_threshold）。RX 一律 CPU 轮询。 */
+    dma_resource_t dma;
+    uint8_t dma_ok;          /* 通道申请到了没有；没有就整体退回轮询 */
+    uint32_t last_ticks;     /* 上一笔事务耗时（mchtmr tick，24 MHz）——给阈值定档用 */
+
     volatile uint8_t reset_req;
     volatile uint8_t abort_req;
 
@@ -202,6 +210,9 @@ static sb_state_t s_st;
 #define s_last_err (s_st.last_err)
 #define s_dbg (s_st.dbg)
 #define s_spi_need_reset (s_st.spi_need_reset)
+#define s_dma (s_st.dma)
+#define s_dma_ok (s_st.dma_ok)
+#define s_last_ticks (s_st.last_ticks)
 #define s_reset_req (s_st.reset_req)
 #define s_abort_req (s_st.abort_req)
 #define s_cs_pad (s_st.cs_pad)
@@ -596,6 +607,12 @@ static uint32_t sb_pick_sclk(uint32_t want_hz)
     return best_sclk;
 }
 
+/* TX DMA 三件套（实现在下面的 TX DMA 段；这里先声明，因为 sb_spi_hw_init 要用） */
+static void sb_dma_init(void);
+static hpm_stat_t sb_dma_tx_start(const uint8_t *tx, uint32_t len);
+static hpm_stat_t sb_dma_tx_wait(void);
+static hpm_stat_t sb_spi_rx_poll(uint8_t *rx, uint32_t rlen);
+
 static void sb_spi_hw_init(void)
 {
     clock_add_to_group(SB_SPI_CLK_NAME, 0);
@@ -619,6 +636,7 @@ static void sb_spi_hw_init(void)
     s_fmt_addr_len = 1U;
 
     s_actual_sclk = sb_pick_sclk(s_cfg.sclk_hz);
+    sb_dma_init();
 
     /* CS 脚：0/2 = PA26 作 GPIO；1 = 辅助脚作 GPIO；3 = 硬件 CS0 */
     if (s_cfg.cs_policy == 1U)
@@ -661,11 +679,117 @@ static void sb_spi_hw_init(void)
     s_dbg[3] = s_actual_sclk;
 }
 
+/* ============================== TX DMA ============================== */
+
+/*
+ * TX 数据相位走 DMA：源是 OUT 环里的槽（AHB SRAM，HPM5301 没有 L1C，
+ * 不需要 cache 维护，也不需要 core_local_mem_to_sys_address 转换），
+ * 目的地固定是 SPI 的 DATA 寄存器，握手走 DMAMUX 的 HPM_DMA_SRC_SPI1_TX。
+ *
+ * 通道由 dma_mgr 动态申请（和 CDC 的 UART3 RX/TX 同一套，不会硬编码撞车）；
+ * 申请失败就 s_dma_ok=0，整条桥静默退回轮询，不影响功能。
+ */
+static void sb_dma_init(void)
+{
+    dma_mgr_chn_conf_t cfg;
+
+    s_dma_ok = 0U;
+    memset(&s_dma, 0, sizeof(s_dma));
+    if (dma_mgr_request_resource(&s_dma) != status_success)
+    {
+        s_dbg[12] = 0xF0U; /* 诊断：DMA 通道没申请到 */
+        return;
+    }
+
+    dma_mgr_get_default_chn_config(&cfg);
+    cfg.src_width = DMA_MGR_TRANSFER_WIDTH_BYTE;
+    cfg.dst_width = DMA_MGR_TRANSFER_WIDTH_BYTE;
+    cfg.src_mode = DMA_MGR_HANDSHAKE_MODE_NORMAL;
+    cfg.src_addr_ctrl = DMA_MGR_ADDRESS_CONTROL_INCREMENT;
+    cfg.dst_mode = DMA_MGR_HANDSHAKE_MODE_HANDSHAKE; /* 每要一个字节 SPI 拉一次请求 */
+    cfg.dst_addr_ctrl = DMA_MGR_ADDRESS_CONTROL_FIXED;
+    cfg.dst_addr = (uint32_t)&SB_SPI->DATA;
+    cfg.en_dmamux = true;
+    cfg.dmamux_src = HPM_DMA_SRC_SPI1_TX;
+    cfg.linked_ptr = (uint32_t)NULL;
+    cfg.en_infiniteloop = false;
+    cfg.interrupt_mask = DMA_MGR_INTERRUPT_MASK_ALL; /* 不用中断，纯轮询 TC */
+    if (dma_mgr_setup_channel(&s_dma, &cfg) != status_success)
+    {
+        (void)dma_mgr_release_resource(&s_dma);
+        s_dbg[12] = 0xF1U;
+        return;
+    }
+    s_dma_ok = 1U;
+}
+
+static hpm_stat_t sb_dma_tx_start(const uint8_t *tx, uint32_t len)
+{
+    if (dma_mgr_set_chn_src_addr(&s_dma, (uint32_t)tx) != status_success)
+    {
+        return status_fail;
+    }
+    if (dma_mgr_set_chn_transize(&s_dma, len) != status_success)
+    {
+        return status_fail;
+    }
+    return dma_mgr_enable_channel(&s_dma);
+}
+
+/* 等 DMA 搬完（TC）。带硬超时，绝不挂死主循环。 */
+static hpm_stat_t sb_dma_tx_wait(void)
+{
+    for (uint32_t i = 0U; i < 2000000U; i++)
+    {
+        uint32_t st = dma_check_transfer_status(s_dma.base, (uint8_t)s_dma.channel);
+        if ((st & DMA_CHANNEL_STATUS_TC) != 0U)
+        {
+            return status_success;
+        }
+        if ((st & (DMA_CHANNEL_STATUS_ERROR | DMA_CHANNEL_STATUS_ABORT)) != 0U)
+        {
+            return status_fail;
+        }
+    }
+    return status_timeout;
+}
+
+/* 收 RX FIFO（数据位宽固定 8 bit，一次一个字节）。DMA 喂 TX 的同时由 CPU 干这个。 */
+static hpm_stat_t sb_spi_rx_poll(uint8_t *rx, uint32_t rlen)
+{
+    uint32_t got = 0U;
+    uint32_t retry = 0U;
+
+    if (rx == NULL)
+    {
+        return status_invalid_argument;
+    }
+    while (got < rlen)
+    {
+        if ((SB_SPI->STATUS & SPI_STATUS_RXEMPTY_MASK) == 0U)
+        {
+            rx[got++] = (uint8_t)SB_SPI->DATA;
+            retry = 0U;
+        }
+        else if (++retry > 200000U)
+        {
+            return status_timeout;
+        }
+    }
+    return status_success;
+}
+
 /*
  * 一次 SPI 事务（一次 CS 窗口里的 cmd / addr / dummy / 数据相位）。
  * 返回 sb_status_t。
+ *
+ * TX 数据相位的两条路径由 flags 与 cfg.tx_dma_threshold 决定：
+ *   - 轮询：spi_transfer()（SDK 的整帧阻塞 API，内部逐字节灌 TX FIFO + 收 RX FIFO）
+ *   - DMA ：自己拼序列（spi_control_init → 武装并启动 DMA 通道 → 开 SPI 的 TX DMA 请求
+ *           → 写 ADDR/CMD 触发 → RX 侧仍由 CPU 轮询 → 等 DMA TC → 收尾）
+ * RX 一律轮询（方案 §6.2）：主机侧读长度已知，CPU 收 FIFO 最短路径。
  */
-static uint8_t sb_spi_xfer(const sb_xfer_t *x, const uint8_t *tx, uint8_t *rx)
+static uint8_t sb_spi_xfer(const sb_xfer_t *x, uint8_t flags, const uint8_t *tx, uint8_t *rx)
 {
     spi_control_config_t ctl;
     uint8_t cmd = x->cmd;
@@ -676,8 +800,10 @@ static uint8_t sb_spi_xfer(const sb_xfer_t *x, const uint8_t *tx, uint8_t *rx)
     uint8_t addr_en = (uint8_t)(((x->tcfg & SB_TCFG_ADDR_EN) && (x->addr_len > 0U)) ? 1U : 0U);
     uint8_t lines = (uint8_t)(x->tcfg & SB_TCFG_LINES_MASK);
     uint8_t trans_mode;
+    uint8_t use_dma = 0U;
     uint32_t wcnt;
     uint32_t rcnt;
+    uint32_t t0;
     hpm_stat_t stat;
 
     if ((cmd_en == 0U) && (addr_en == 0U) && (wlen == 0U) && (rlen == 0U))
@@ -705,6 +831,25 @@ static uint8_t sb_spi_xfer(const sb_xfer_t *x, const uint8_t *tx, uint8_t *rx)
     else
     {
         trans_mode = spi_trans_no_data; /* 只有 cmd/addr 相位（例如 0x11 / 0x29） */
+    }
+
+    /* 阈值判定（方案 §6.1）：看 tx_len，不看整帧长度。
+     *   0x00 = 全轮询；0xFF = 全 DMA；其余按 tx_len 比。
+     * 单帧可以用 NO_DMA / FORCE_DMA 覆盖；DMA 通道没申请到就整体退回轮询。 */
+    if ((s_dma_ok != 0U) && (wlen != 0U) && ((flags & SB_F_NO_DMA) == 0U))
+    {
+        if ((flags & SB_F_FORCE_DMA) != 0U)
+        {
+            use_dma = 1U;
+        }
+        else if (s_cfg.tx_dma_threshold == 0xFFU)
+        {
+            use_dma = 1U;
+        }
+        else if ((s_cfg.tx_dma_threshold != 0U) && (wlen >= (uint32_t)s_cfg.tx_dma_threshold))
+        {
+            use_dma = 1U;
+        }
     }
 
     sb_spi_apply_format(x->addr_len);
@@ -742,12 +887,70 @@ static uint8_t sb_spi_xfer(const sb_xfer_t *x, const uint8_t *tx, uint8_t *rx)
         spi_reset(SB_SPI);
         (void)spi_poll_reset_complete(SB_SPI, spi_reset_all, 100000U);
     }
-    s_dbg[12] = 1U; /* stage: 已就绪，准备调 spi_transfer */
+    s_dbg[12] = 1U; /* stage: 已就绪，准备启动 */
 
-    stat = spi_transfer(SB_SPI, &ctl,
-                        (cmd_en != 0U) ? &cmd : NULL,
-                        (addr_en != 0U) ? &addr : NULL,
-                        (uint8_t *)tx, wcnt, rx, rcnt);
+    t0 = SB_MTIME;
+
+    if (use_dma != 0U)
+    {
+        /*
+         * DMA 路径。顺序照 SDK 头文件的原话：
+         * "disable the SPI TX DMA request before configuring and enabling the DMA
+         *  channels, and then start the SPI transfer"。
+         * 也就是：关 TXDMAEN → 配通道/设地址与长度 → 使能通道 → 开 TXDMAEN → 写 CMD 触发。
+         */
+        SB_SPI->CTRL &= ~SPI_CTRL_TXDMAEN_MASK;
+
+        stat = spi_control_init(SB_SPI, &ctl, wcnt, rcnt);
+        s_dbg[12] = 3U;
+        if (stat == status_success)
+        {
+            stat = sb_dma_tx_start(tx, wlen);
+            s_dbg[12] = 4U;
+        }
+        if (stat == status_success)
+        {
+            SB_SPI->CTRL |= SPI_CTRL_TXDMAEN_MASK;
+            stat = spi_write_address(SB_SPI, spi_master_mode, &ctl, (addr_en != 0U) ? &addr : NULL);
+            s_dbg[12] = 5U;
+        }
+        if (stat == status_success)
+        {
+            stat = spi_write_command(SB_SPI, spi_master_mode, &ctl, (cmd_en != 0U) ? &cmd : NULL);
+            s_dbg[12] = 6U;
+        }
+        if ((stat == status_success) && (rlen != 0U))
+        {
+            /* RX 与 DMA 并行：CPU 收 FIFO */
+            stat = sb_spi_rx_poll(rx, rlen);
+            s_dbg[12] = 7U;
+        }
+        {
+            hpm_stat_t dstat = sb_dma_tx_wait();
+            if (stat == status_success)
+            {
+                stat = dstat;
+            }
+            s_dbg[12] = 8U;
+        }
+        SB_SPI->CTRL &= ~SPI_CTRL_TXDMAEN_MASK;
+        (void)dma_mgr_disable_channel(&s_dma);
+        if (stat == status_success)
+        {
+            stat = spi_wait_for_idle_status(SB_SPI);
+            s_dbg[12] = 9U;
+        }
+    }
+    else
+    {
+        stat = spi_transfer(SB_SPI, &ctl,
+                            (cmd_en != 0U) ? &cmd : NULL,
+                            (addr_en != 0U) ? &addr : NULL,
+                            (uint8_t *)tx, wcnt, rx, rcnt);
+        s_dbg[12] = 2U; /* stage: spi_transfer 已返回 */
+    }
+
+    s_last_ticks = SB_MTIME - t0;
 
     /* 现场快照：出错时把 SPI 的寄存器原样留着，主机用 HID action 10 取。
      * dbg[4]=STATUS dbg[5]=CTRL dbg[6]=TRANSCTRL dbg[7]=TRANSFMT dbg[8]=TIMING
@@ -759,7 +962,6 @@ static uint8_t sb_spi_xfer(const sb_xfer_t *x, const uint8_t *tx, uint8_t *rx)
     s_dbg[8] = SB_SPI->TIMING;
     s_dbg[9] = (SB_SPI->WR_TRANS_CNT & 0xFFFFU) | ((SB_SPI->RD_TRANS_CNT & 0xFFFFU) << 16);
     s_dbg[10] = (uint32_t)stat;
-    s_dbg[12] = 2U; /* stage: spi_transfer 已返回 */
     if (stat != status_success)
     {
         s_spi_need_reset = 1U;
@@ -774,7 +976,14 @@ static uint8_t sb_spi_xfer(const sb_xfer_t *x, const uint8_t *tx, uint8_t *rx)
     s_stats.bytes_rx += x->rx_len;
     if ((wlen != 0U) || (rlen != 0U))
     {
-        s_stats.tx_poll_cnt++; /* P1：全部走轮询；P2 起 DMA 路径计入 tx_dma_cnt */
+        if (use_dma != 0U)
+        {
+            s_stats.tx_dma_cnt++;
+        }
+        else
+        {
+            s_stats.tx_poll_cnt++;
+        }
     }
     return SB_OK;
 }
@@ -932,7 +1141,7 @@ static uint8_t sb_step_spi_dcx(uint8_t cmd, uint8_t nparams, const uint8_t *para
     memset(&x, 0, sizeof(x));
     x.tcfg = sb_def_lines_tcfg();
     x.tx_len = 1U;
-    st = sb_spi_xfer(&x, &cmd, NULL);
+    st = sb_spi_xfer(&x, 0U, &cmd, NULL);
 
     if ((st == SB_OK) && (nparams != 0U))
     {
@@ -940,7 +1149,7 @@ static uint8_t sb_step_spi_dcx(uint8_t cmd, uint8_t nparams, const uint8_t *para
         memset(&x, 0, sizeof(x));
         x.tcfg = sb_def_lines_tcfg();
         x.tx_len = nparams;
-        st = sb_spi_xfer(&x, params, NULL);
+        st = sb_spi_xfer(&x, 0U, params, NULL);
     }
 
     if (cs_auto != 0U)
@@ -970,7 +1179,7 @@ static uint8_t sb_step_qspi(uint8_t cmd, uint8_t nparams, const uint8_t *params)
     {
         sb_cs_assert();
     }
-    st = sb_spi_xfer(&x, params, NULL);
+    st = sb_spi_xfer(&x, 0U, params, NULL);
     if (cs_auto != 0U)
     {
         sb_cs_release();
@@ -994,7 +1203,7 @@ static uint8_t sb_step_raw(uint8_t cmd, uint8_t nparams, const uint8_t *params)
     {
         sb_cs_assert();
     }
-    st = sb_spi_xfer(&x, params, NULL);
+    st = sb_spi_xfer(&x, 0U, params, NULL);
     if (cs_auto != 0U)
     {
         sb_cs_release();
@@ -1079,7 +1288,7 @@ static uint8_t sb_exec_frame(const uint8_t *hdr, const uint8_t *pl, uint16_t ple
             sb_cs_assert();
         }
 
-        st = sb_spi_xfer(&x, &pl[12], (x.rx_len != 0U) ? rsp_payload : NULL);
+        st = sb_spi_xfer(&x, flags, &pl[12], (x.rx_len != 0U) ? rsp_payload : NULL);
 
         if ((manual_cs == 0U) && ((flags & SB_F_CS_HOLD) == 0U))
         {
@@ -1830,7 +2039,9 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         wr_u32(&res_hid[32], s_stats.in_ring_drop);
         wr_u32(&res_hid[36], s_actual_sclk);
         wr_u32(&res_hid[40], s_stats.frames_err);
-        res_hid[1] = 44U;
+        /* P2：上一笔事务耗时（mchtmr tick，24 MHz）——主机拿它对比轮询/DMA 两条路径 */
+        wr_u32(&res_hid[44], s_last_ticks);
+        res_hid[1] = 48U;
         break;
 
     case SB_ACT_ENABLE:

@@ -148,10 +148,10 @@ class Hid:
         r = self.xfer(CMD_SPI, [ACT_STATUS])
         if r is None:
             raise RuntimeError("STATUS timeout")
-        w = struct.unpack_from("<10I", bytes(r[4:44]))
+        w = struct.unpack_from("<11I", bytes(r[4:48]))
         return {"status": w[0], "frames_ok": w[1], "bytes_tx": w[2], "bytes_rx": w[3],
                 "tx_poll": w[4], "tx_dma": w[5], "out_overrun": w[6], "in_drop": w[7],
-                "sclk": w[8], "frames_err": w[9]}
+                "sclk": w[8], "frames_err": w[9], "last_ticks": w[10]}
 
     def reset(self):
         self.xfer(CMD_SPI, [ACT_RESET])
@@ -394,6 +394,53 @@ def cmd_wiggle(args):
     return 0
 
 
+def cmd_bench(args):
+    """轮询 vs DMA 两条路径的耗时对照（探针侧 mchtmr tick，24 MHz = 41.7 ns）。
+
+    每档跑 N 次取中位数（单次会被 USB 中断/主循环调度打散）。NO_DMA / FORCE_DMA
+    是单帧覆盖位，所以这里两种都发一遍，用探针报的 last_ticks 作判据 ——
+    它只量"一次事务从开始到收尾"，不含主机往返，比墙钟干净得多。
+    """
+    h = Hid()
+    h.enable(1)
+    b = Bulk()
+    b.drain()
+
+    lens = [int(x) for x in args.lens.split(",")]
+    reps = args.reps
+    print("%6s | %10s | %10s | %8s | %s" % ("len", "poll us", "dma us", "speedup", "verify"))
+    print("-" * 62)
+    for ln in lens:
+        tx = bytes(((i * 7 + ln) & 0xFF) for i in range(ln))
+        row = {}
+        for tag, force in (("poll", F_NO_DMA), ("dma", F_FORCE_DMA)):
+            times = []
+            ok = True
+            for _ in range(reps):
+                seq = b.next_seq()
+                b.send(frame(T_XFER, xfer_payload(TC_LINES_1, cmd=0, tx=tx, rx_len=ln),
+                             F_RSP | force, seq))
+                r = parse_rsp(b.recv(3000))
+                if r is None or r["status"] != 0 or r["data"] != tx:
+                    ok = False
+                    break
+                times.append(h.status()["last_ticks"])
+            times.sort()
+            row[tag] = (times[len(times) // 2] if times else 0, ok)
+        p_us = row["poll"][0] / 24.0
+        d_us = row["dma"][0] / 24.0
+        print("%6d | %10.2f | %10.2f | %7sx | %s" %
+              (ln, p_us, d_us,
+               ("%.2f" % (p_us / d_us)) if d_us else "-",
+               "ok" if (row["poll"][1] and row["dma"][1]) else "FAIL"))
+    st = h.status()
+    print()
+    print("counters: tx_poll=%d tx_dma=%d err=%d" % (st["tx_poll"], st["tx_dma"], st["frames_err"]))
+    b.drain()
+    h.close()
+    return 0
+
+
 def cmd_status(args):
     h = Hid()
     if args.reset_counters:
@@ -552,6 +599,11 @@ def main():
     sub.add_parser("dbg").set_defaults(func=cmd_dbg)
     sub.add_parser("pintest").set_defaults(func=cmd_pintest)
     sub.add_parser("wiggle").set_defaults(func=cmd_wiggle)
+
+    bn = sub.add_parser("bench")
+    bn.add_argument("--lens", default="8,16,32,64,99,128,256,492")
+    bn.add_argument("--reps", type=int, default=9)
+    bn.set_defaults(func=cmd_bench)
 
     l = sub.add_parser("loop")
     l.add_argument("--lens", default="1,2,32,99,100,101,256,492")

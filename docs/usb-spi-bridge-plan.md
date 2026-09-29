@@ -744,6 +744,65 @@ STEP 常挤在同一个包里）正好会踩。另外 `clock_get_frequency(clock
 DAT0/DAT1 都是推挽输出，短接等于两个输出对打（我们的脚还配了最大驱动 DS=4），
 多线相位要用 LA 看波形或接真从器件。
 
+---
+
+### 5.6 P2 实施记录：TX DMA + 阈值实测（2026-09-29）
+
+**实现**（`sb_spi_xfer()` 现在有两条路径）
+
+- **轮询**：还是 SDK 的 `spi_transfer()`。
+- **DMA**：自己拼序列 —— `spi_control_init` → 武装并启动 DMA 通道 → 开 SPI 的 TX DMA 请求
+  → 写 ADDR/CMD 触发 → **RX 侧仍由 CPU 轮询** → 等 DMA TC → 关请求、收尾。
+  顺序照 SDK 头文件的原话："disable the SPI TX DMA request before configuring and enabling
+  the DMA channels, and then start the SPI transfer"。
+- 通道由 `dma_mgr` 动态申请（`HPM_DMA_SRC_SPI1_TX`，与 CDC 的 UART3 RX/TX 同一套，
+  不硬编码）；**申请失败就 `s_dma_ok=0`，整条桥静默退回轮询**，不影响功能。
+- 源地址是 OUT 环的槽（AHB SRAM）：HPM5301 没有 L1C ⇒ 免 cache 维护、免地址转换。
+- 阈值：`cfg.tx_dma_threshold` 看 `tx_len`（0=全轮询、0xFF=全 DMA），
+  单帧可用 `NO_DMA`/`FORCE_DMA` 覆盖；`STATUS` 的 `tx_poll_cnt`/`tx_dma_cnt` 分开计数，
+  另外新增 `res[44..47] = last_ticks`（上一笔事务耗时，mchtmr 24 MHz tick），
+  给阈值定档用 —— 它只量"一次事务从开始到收尾"，不含主机往返，比墙钟干净。
+
+**实测（跳线回环，`bench` 与 `tools/spi_writeonly_bench.py`）**
+
+全双工（`write_read_together`，收发等长）：
+
+| SCLK | len | 轮询 µs | DMA µs | 倍率 |
+|---|---|---|---|---|
+| 20 MHz | 492 | 198.8 | 203.7 | 0.98× |
+| 40 MHz | 256 | 59.1 | 57.0 | 1.04× |
+| 40 MHz | 492 | 112.2 | 104.3 | 1.08× |
+| 75 MHz | 128 | 31.3 | 26.3 | 1.19× |
+| 75 MHz | 492 | 116.2 | 84.0 | 1.38× |
+
+只写（面板刷像素那条路，CPU 在 DMA 期间不插手）：
+
+| SCLK | len | 轮询 µs | DMA µs | 倍率 | 线速理论值 µs |
+|---|---|---|---|---|---|
+| 20 MHz | 492 | 200.8 | 201.8 | 1.00× | 196.8 |
+| 75 MHz | 256 | 37.6 | 35.0 | 1.08× | 27.3 |
+| 75 MHz | 492 | 69.0 | 61.9 | 1.12× | 52.5 |
+
+**结论与阈值定档**
+
+1. **两条路径都贴着 SPI 线速**（20 MHz 只写 492 B：200.8 µs vs 理论 196.8 µs，差 2%）。
+   瓶颈是线速 + 每笔事务的固定开销，**不是 CPU**——和 DAP 那条路的结论同源。
+2. DMA 的固定开销约 **1~4.5 µs**（配地址/长度/使能/等 TC/收尾）；边际成本和轮询一样。
+   所以它**低时钟下略亏（1~5%）、高时钟大帧下反超**：40 MHz 约 200 B 交叉，
+   75 MHz 约 128 B 交叉，75 MHz/492 B 时快 12%（只写）~38%（全双工）。
+3. **默认阈值保持 100**（用户最初的要求），代价是 20 MHz 下小帧多花几个百分点；
+   主机可以按 `GET_CFG` 回的**实际 SCLK** 自己调（`SET_CFG` 的 `tx_dma_threshold`）。
+4. 全双工下 DMA 收益更明显，是因为 RX 侧两条路都要 CPU 逐字节收 FIFO，
+   DMA 至少把 TX 那半边的逐字节开销省掉了。
+5. 想让 DMA 真正"把主循环让出来"，得把事务做成**异步**（启动后先返回、下一轮再收尾）——
+   现在 DMA 路径仍在 `sb_dma_tx_wait()` 里自旋等 TC。**列为 P2 之后的可选项**，
+   真要做得连 RX 一起上 DMA。
+
+**P2 验收**：101/256/492 B 在 `NO_DMA` 与 `FORCE_DMA` 两种覆盖下回环**全部通过**
+（`loop --lens 4,8,32,101,256,492` → 12/12），完整 `loop` 464 帧零错，
+`tx_poll=225 / tx_dma=239` 分开计数、`out_overrun=0`、`in_drop=0`。
+资源：FLASH 127120 B (13.98%)、**DLM 106592 B 仍为零增长**、AHB_SRAM 24872 B。
+
 
 ---
 
