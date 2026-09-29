@@ -169,6 +169,13 @@ void rtt_bridge_set_target(uint32_t kind)
     s_target = (kind != 0U) ? 1U : 0U;
 }
 
+/* 供 scope 采样器选择传输后端：目标类型是**全局**的（同一个开关既管 RTT 桥也管
+ * J-Scope），这样网页不做任何改动就能采 RISC-V 目标。 */
+uint8_t rtt_bridge_target_is_riscv(void)
+{
+    return (s_target == 1U) ? 1U : 0U;
+}
+
 /* 写目标内存里的一个字。返回 0 = 成功、-1 = 失败（与 rtt_read_bytes 同约定）。
  *
  * 两个后端底层的返回约定相反，必须在这里归一：

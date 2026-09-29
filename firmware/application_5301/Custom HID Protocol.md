@@ -341,10 +341,36 @@ Byte[0x03-0x3F] = Command data（可选）
     type：`0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=f32 7=f64`
     flags：bit0 允许 60 MHz；bit1 丢弃模式；bit2 触发；bit3 不让路（独占链路）；
            bit4 SWD 空闲拍压到 0（`DAP_Data.clock_delay=0`）；
-           bit5 采样期间自动暂停 CDC/串口桥（停采样自动恢复，见第 18 条）
+           bit5 采样期间自动暂停 CDC/串口桥（停采样自动恢复，见第 18 条）；
+           bit6 **目标是 RISC-V/JTAG**（不带这一位时跟随全局目标类型，见下）
+
+    **目标类型与 RISC-V/JTAG 后端**（HPM6800EVK 这类只有 JTAG 的 RISC-V 目标）：
+    采样器的传输后端 = 全局目标类型（第 15 条 action 10，与 RTT 桥同一个开关），
+    flags bit6 可以**强制**本会话走 RISC-V。DEF 包里回报的是**生效值**，所以主机看到
+    bit6 = 1 就说明这次确实走 JTAG 路径 —— 网页不改也能用（先切全局目标类型即可），
+    想做得干净就在配置里带上 bit6。
+
+    两条路的差别只在"怎么读目标内存"，计划/帧布局/组包/丢拍统计**完全一样**：
+
+    | | SWD/ARM | RISC-V/JTAG |
+    | --- | --- | --- |
+    | 单字快路径 | CSW 关自增 + 缓存 AP.TAR + posted DRW 流水（每拍 1 次传输） | SBA 抱在固定地址（`sbcs` 关自增）+ 每拍 1 次 DMI 扫描 |
+    | 多字 span | AHB-AP 块读（自增） | SBA 块读（`sbautoincrement`，DMI 流水同样一深） |
+    | 链路初始化 | JTAG→SWD 切换 + 斜坡换挡装 blob（action 3 选档） | `riscv_jtag_open()`：TAP 复位 + `IR=0x11` + 唤醒 DM |
+    | action 3（SWD Hz） | 有效 | **无效，忽略**（JTAG 时序由 DMI 汇编旋钮 + delay 决定） |
+    | flags bit4（压 clock_delay） | 有效 | **无效，忽略** |
+    | 状态字 `swdHz` | 当前 SWD 档 | 无意义（当成 0 看） |
+    | 让路（bit3 之外） | 看主机 DAP 活动 | 暂不参与让路（JTAG 无 DAP 主机通路） |
+
+    ⚠️ JTAG 只有一条 TAP：**采样期间主机不能同时用 OpenOCD/pyOCD 调同一块板**
+    （SWD 侧也一样互斥，只是 JTAG 上没有"让路一拍"这种折中）。
+    另外 RISC-V 每次采样都会占目标系统总线，高频采样可能影响目标实时性。
 
     响应：Byte[0x01] = 长度，Byte[0x02] = 0x32，**Byte[0x03] = 启动码**（网页读 `res[2]`，
     -100 = 排队中，0 = 正常，-1/-2/-3/-4 见 scopeRcText），Byte[0x04..0x33] = 12 个状态字。
+    ⚠️ 状态字 0 的 **bit1 = 生效后端是 RISC-V/JTAG**（丢弃模式下没有 DEF 包，就靠这一位
+    判断实际走的哪条路）；DEF 包里则看 flags bit6。两者都报**生效值**：后端不匹配时
+    采样器会换另一条路再试一次，所以"你设的"和"实际用的"可能不同。
 
     action=9 时前 3 个字换成标定结果：**Byte[0x04..07] = ticks（24 MHz）、
     Byte[0x08..0B] = iters、Byte[0x0C..0F] = err**（网页读 `res[3]` / `res[7]`）。

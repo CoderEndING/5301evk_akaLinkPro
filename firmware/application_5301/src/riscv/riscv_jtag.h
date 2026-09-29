@@ -49,6 +49,17 @@ uint32_t riscv_jtag_dmstatus(void); /* Debug Module status word */
 int riscv_jtag_read_word(uint32_t addr, uint32_t *val);
 int riscv_jtag_write_word(uint32_t addr, uint32_t val);
 
+/* 单字**流水**读：把 SBA 抱在同一个地址上（关掉自增），之后每拍只有一次 DMI 扫描
+ * —— 与 SWD 侧的 swd_read_word_hold_prepare()/swd_read_word_pipe() 完全同构
+ * （J-Scope 的单变量快路径就是这套语义）。延迟一拍：hold_read() 收的是**上一次**
+ * 投出去的读的结果，并同时投出下一次；所以第一次的结果要丢掉，最后一个值由调用方
+ * 补收。地址不 4 字节对齐会被向下取整。
+ *   hold_prepare(): 0 = ok；已经是"抱着这个地址"时空操作（每拍调也没关系）。
+ *   hold_read():    0 = ok（*val 已填）；负 = 链路/DM 出错（此时"抱住"状态作废）。
+ * 任何别的 SBA 操作（read/read_word/write）都会把"抱住"状态作废。 */
+int riscv_jtag_hold_prepare(uint32_t addr);
+int riscv_jtag_hold_read(uint32_t *val);
+
 /* Block access through the SBA. `addr` may be unaligned; returns 0 on success,
  * negative when the debug module reported an error. */
 int riscv_jtag_read(uint32_t addr, uint8_t *dst, uint32_t len);

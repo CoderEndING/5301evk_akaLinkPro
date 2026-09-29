@@ -64,6 +64,10 @@ uint32_t rtt_bridge_raw_result(uint8_t *out, uint32_t max);
 /* 目标类型：0 = SWD/ARM，1 = RISC-V（JTAG）。HID CMD_RTT action 10 调用。 */
 void rtt_bridge_set_target(uint32_t kind);
 
+/* 1 = 当前目标类型是 RISC-V/JTAG。scope 采样器用它选传输后端（见 scope_sampler.c
+ * 的 scope_be_* 分派）：类型是全局的，所以网页不做任何改动也能采 RISC-V 目标。 */
+uint8_t rtt_bridge_target_is_riscv(void);
+
 /* Stop bridging (the CDC keeps working as the UART bridge). */
 void rtt_bridge_stop(void);
 

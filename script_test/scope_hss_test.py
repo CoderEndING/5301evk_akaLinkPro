@@ -158,7 +158,8 @@ def status(dev):
         return None
     w = [int.from_bytes(bytes(r[3 + i * 4:7 + i * 4]), "little") for i in range(12)]
     return {
-        'startRc': s8(r[2]), 'running': w[0] & 1, 'spans': (w[0] >> 8) & 0xFF,
+        'startRc': s8(r[2]), 'running': w[0] & 1, 'riscv': (w[0] >> 1) & 1,
+        'spans': (w[0] >> 8) & 0xFF,
         'swdReady': (w[0] >> 16) & 1, 'nvars': (w[0] >> 24) & 0xFF,
         'swdHz': w[1], 'produced': w[2], 'dropped': w[3],
         'swdErr': w[5] & 0xFFFF, 'yield': w[5] >> 16, 'seq': w[6],
@@ -266,10 +267,39 @@ def main():
                          'pack 这种"每包只装 20 个样本"的高包率场景对这个数很敏感。')
     ap.add_argument('--bridge', choices=['on', 'off', 'keep'], default='keep',
                     help='HID 0x34：主循环 CDC/串口桥开关（off = 采样期间不用服务 COM 口，省几百周期/轮）')
+    ap.add_argument('--riscv', action='store_true',
+                    help='目标类型切 RISC-V/JTAG（HID CMD_RTT action 10）+ 配置里带 flags bit6。'
+                         '用于 HPM6800EVK 这类只有 JTAG 的 RISC-V 目标（见 Custom HID Protocol 第 16 条）')
+    ap.add_argument('--swd', action='store_true',
+                    help='把全局目标类型切回 SWD/ARM（它是粘的：采过 RISC-V 之后要显式切回来）')
+    ap.add_argument('--addr', type=lambda s: int(s, 0), default=0,
+                    help='覆盖 --set one 那个变量的地址（RISC-V 冒烟测试：随便给个会变的 RAM 地址）')
+    ap.add_argument('--base', type=lambda s: int(s, 0), default=0,
+                    help='用 8 个连续 u32（base+0..28）替掉整个变量表 —— 量多通道/一个多字 span 用')
     a = ap.parse_args()
 
     vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE, 'mixed': V_MIXED, 'two': V_TWO}[a.vset]
+    if a.addr and a.vset == 'one':
+        vars_ = [("probe_addr", a.addr, 4, 4)]
+    if a.base:
+        vars_ = [("w%d" % i, a.base + i * 4, 4, 4) for i in range(8)]
     dev = open_hid()
+
+    if a.riscv:
+        # CMD_RTT action 10：全局目标类型（RTT 桥与 J-Scope 共用），0=SWD/ARM，1=RISC-V/JTAG
+        r = hid_xfer_raw(dev, 0x31, [10, 1])
+        time.sleep(0.05)
+        if r is None:
+            print("⚠️ CMD_RTT action 10 无响应（固件太旧？）")
+        a.flags |= 0x40                     # SCOPE_FLAG_RISCV：强制本会话走 JTAG 后端
+        print("目标类型: RISC-V/JTAG（flags 加 bit6）")
+    elif a.swd:
+        # 把全局目标类型切回 SWD/ARM（它是**粘**的，采过 RISC-V 之后必须显式切回来）
+        r = hid_xfer_raw(dev, 0x31, [10, 0])
+        time.sleep(0.05)
+        if r is None:
+            print("⚠️ CMD_RTT action 10 无响应（固件太旧？）")
+        print("目标类型: SWD/ARM")
 
     if a.bridge != 'keep':
         got = bridge_set(dev, a.bridge == 'on')

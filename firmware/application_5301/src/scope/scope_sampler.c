@@ -32,6 +32,7 @@
 #include "swd_host.h"        /* swd_read_block4 / swd_read_word_hold_prepare / swd_read_word_pipe
                               * 的声明 —— 缺了它这三个调用是"隐式声明"（GCC 13 只是警告，
                               * GCC 14 起直接报错），编译产物的返回值约定全靠运气。 */
+#include "riscv_jtag.h"      /* RISC-V/JTAG 后端：riscv_jtag_read / hold_prepare / hold_read */
 #include "scope_sampler.h"
 
 /* ------------------------------------------------------------------ 常量 */
@@ -60,12 +61,17 @@
 #define SCOPE_YIELD_TICKS      (SCOPE_MCHTMR_HZ / 50U) /* 20 ms 内有 DAP 活动就让路一拍 */
 #define SCOPE_BENCH_MAX_ITERS  100000UL
 
+/* 传输后端（见文件后半的 scope_be_* 分派） */
+#define SCOPE_BE_SWD    0U
+#define SCOPE_BE_RISCV  1U
+
 /* ------------------------------------------------------------------ 状态 */
 
 static volatile uint8_t s_running;
 static volatile uint8_t s_start_req;
 static volatile int8_t  s_start_rc = -100;    /* -100 = 还没启动过（与 RTT 桥同一哨兵） */
 static uint8_t  s_swd_ready;
+static uint8_t  s_backend;                    /* 0 = SWD/ARM、1 = RISC-V/JTAG（见 scope_be_* 分派） */
 
 static scope_var_t s_var[SCOPE_MAX_VARS];     /* 按地址升序 */
 static uint8_t  s_nvars;
@@ -358,7 +364,8 @@ static void scope_push_def(void)
     uint8_t *q = p + SCOPE_HDR;
     put32(q, s_clock_hz);
     put32(q + 4U, s_period_us);
-    put16(q + 8U, s_flags);
+    put16(q + 8U, (uint16_t)(s_flags |
+                             ((s_backend == SCOPE_BE_RISCV) ? SCOPE_FLAG_RISCV : 0U)));
     q[10] = s_nvars;
     q[11] = s_nspans;                     /* 主机拿它跟自己的计划对账 */
     uint8_t *e = q + 12U;
@@ -453,6 +460,46 @@ static void scope_req_init(void)
     s_req_blk[4] = SCOPE_REQ_DRW_READ;
 }
 
+/* ---- 传输后端分派（SWD/ARM 与 RISC-V/JTAG）----------------------------------
+ *
+ * 采样逻辑（计划、帧布局、组包、丢拍统计）与目标无关，**只有这 4 个原语不同**：
+ *   link_ready   —— 把链路拉起来（SWD：斜坡换挡 + 一次验收读；RISC-V：开 TAP/DM）
+ *   block_read   —— 一段连续内存读进缓冲（两边都支持未对齐头尾）
+ *   hold_prepare —— 把读**抱在固定地址**上，幂等（每拍调也没关系）
+ *   pipe_read    —— 收上一拍投出去的读结果 + 投下一拍（两边都是一拍延迟）
+ * 热路径上每次调用多一个可预测的分支，实测 <1%（DISCARD 基准对照）。
+ *
+ * 后端选择：跟随**全局目标类型**（HID CMD_RTT action 10，与 RTT 桥同一个开关），
+ * 或者由 HID 0x32 配置报文里的 SCOPE_FLAG_RISCV 位强制指定。 */
+static uint8_t scope_be_block_read(uint32_t addr, uint8_t *dst, uint32_t len)
+{
+    if (s_backend == SCOPE_BE_RISCV)
+    {
+        return (uint8_t)(riscv_jtag_read(addr, dst, len) == 0);   /* 内含按块重试 */
+    }
+    return (uint8_t)(swd_read_block4(addr, dst, len) != 0U);
+}
+
+static uint8_t scope_be_hold_prepare(uint32_t addr)
+{
+    if (s_backend == SCOPE_BE_RISCV)
+    {
+        return (uint8_t)(riscv_jtag_hold_prepare(addr) == 0);
+    }
+    return swd_read_word_hold_prepare(addr);
+}
+
+static uint8_t scope_be_pipe_read(uint32_t *val)
+{
+    if (s_backend == SCOPE_BE_RISCV)
+    {
+        return (uint8_t)(riscv_jtag_hold_read(val) == 0);
+    }
+    return swd_read_word_pipe(val);
+}
+
+static int scope_be_link_ready(void);        /* 见文件后半（依赖 span/stage 的验收读） */
+
 /* 采一个 span，数据落在 s_stage。
  *
  * ⚠️ 这里**曾经**改成走 CMSIS-DAP 引擎的 `DAP_TransferBlock`（一次调用完成
@@ -469,7 +516,7 @@ static int scope_read_span(const scope_span_t *sp)
     /* 直接走对齐块读的快速路径：span 的起点/长度在 scope_make_plan() 里已经扩到
      * 4 字节对齐，也不会跨 1 KB 自增页（SCOPE_SPAN_MAX=64），所以能跳过
      * rtt_bridge_read → rtt_read_bytes 的分块循环和 swd_read_memory 的头尾/分页处理。 */
-    return (swd_read_block4(sp->start, s_stage, sp->len) != 0U) ? 0 : -1;
+    return scope_be_block_read(sp->start, s_stage, sp->len) ? 0 : -1;
 }
 
 /* 按变量宽度搬字节。
@@ -507,12 +554,12 @@ static int scope_sample_bytes(uint8_t *dst)
                  * —— 时间戳、帧布局、包边界全都不用动，只是写入晚了一拍。
                  * 包里最后一拍的值由 scope_pipe_flush() 在推包前收回来。 */
                 uint32_t v;
-                if (swd_read_word_hold_prepare(s->start) == 0U) { return -1; }
-                if (swd_read_word_pipe(&v) == 0U) { return -1; }
+                if (scope_be_hold_prepare(s->start) == 0U) { return -1; }
+                if (scope_be_pipe_read(&v) == 0U) { return -1; }
                 if (s_pipe_dst != NULL) { put32(s_pipe_dst, v); }
                 s_pipe_dst = fdst;
             }
-            else if (swd_read_block4(s->start, fdst, s->len) == 0U) { return -1; }
+            else if (scope_be_block_read(s->start, fdst, s->len) == 0U) { return -1; }
             continue;
         }
 
@@ -590,15 +637,35 @@ static int scope_pipe_flush(void)
     uint32_t v;
 
     if (s_pipe_dst == NULL) { return 0; }
-    if (swd_read_word_pipe(&v) == 0U) { s_pipe_dst = NULL; return -1; }
+    if (scope_be_pipe_read(&v) == 0U) { s_pipe_dst = NULL; return -1; }
     put32(s_pipe_dst, v);
     s_pipe_dst = NULL;
     return 0;
 }
 
-/* 把链路准备好（含批量路径需要的那一次 CSW 落地）。0 = ok，其它 = rtt_swd_init 的码。 */
-static int scope_link_ready(void)
+/* 用指定后端把链路拉起来。0 = ok，其它 = 后端初始化码。 */
+static int scope_link_try(uint8_t be)
 {
+    s_backend = be;
+
+    if (s_backend == SCOPE_BE_RISCV)
+    {
+        /* RISC-V：TAP + DM 打开一次就一直开着（同一个引擎 CMD_RISCV 与 RTT 桥也在用），
+         * 所以只有"没开"时才真的去开。**不动 delay**：它的默认 8 是实测出来的安全值
+         * （idle < 6 时 HPM6880 的 DTM 会不应答），要改走 CMD_RISCV 的 config。 */
+        if (s_swd_ready && riscv_jtag_is_open()) { return 0; }
+        s_swd_ready = 0U;
+
+        int rc = riscv_jtag_open();
+        if (rc != 0) { return -2; }
+
+        /* 验收读：链路真的读得动才算 ready（与 SWD 那条同一个约定） */
+        if (riscv_jtag_read(s_span[0].start, s_stage, 4U) != 0) { return -4; }
+
+        s_swd_ready = 1U;
+        return 0;
+    }
+
     /* 🚨 必须问桥那一侧的链路状态，不能只看自己这份 s_swd_ready：主机碰过 DAP
      * （rtt_bridge_note_dap_activity）、桥 stop 过、或换过 SWD 档位，都会把桥那份
      * 清掉，而这份还是 1 —— 于是既不重新初始化、也拿不到新装的时钟 blob，
@@ -609,7 +676,6 @@ static int scope_link_ready(void)
     int rc = rtt_bridge_swd_ensure_ready();      /* 复用桥的 SWD 初始化（含斜坡换挡） */
     if (rc != 0) { return rc; }
 
-    if (s_nspans == 0U) { scope_make_plan(); }
     scope_req_init();                            /* 批量路径的请求模板（当前作为对照保留） */
 
     /* 先做一次真实读：既是"链路真的读得动"的验收，也把目标 AP 的 CSW 落到硬件上
@@ -620,12 +686,32 @@ static int scope_link_ready(void)
     return 0;
 }
 
+/* 把链路准备好（含批量路径需要的那一次 CSW 落地）。0 = ok，其它 = 后端初始化码。
+ *
+ * 后端不匹配时**允许换一条路再试一次**：全局目标类型是"粘"的（上次采过 RISC-V 的板子，
+ * 这次采 ARM 就会撞上），而网页的波形页未必有目标类型开关。只有在主机用 flags bit6
+ * **明确强制**了 RISC-V 时才不换路（那时报错更诚实）。 */
+static int scope_be_link_ready(void)
+{
+    if (s_nspans == 0U) { scope_make_plan(); }
+
+    int rc = scope_link_try(s_backend);
+    if ((rc == 0) || ((s_flags & SCOPE_FLAG_RISCV) != 0U)) { return rc; }
+
+    int rc2 = scope_link_try((s_backend == SCOPE_BE_SWD) ? SCOPE_BE_RISCV : SCOPE_BE_SWD);
+    if (rc2 == 0) { return 0; }
+
+    /* 两条都不行：报**主机选的那条**的错（更贴近它的意图），但后端留在这条上。 */
+    s_backend = (uint8_t)((s_flags & SCOPE_FLAG_RISCV) ? SCOPE_BE_RISCV : SCOPE_BE_SWD);
+    return rc;
+}
+
 static int scope_start_now(void)
 {
     if ((s_nvars == 0U) || (s_frame_bytes == 0U)) { return -3; }
     scope_make_plan();
 
-    int rc = scope_link_ready();
+    int rc = scope_be_link_ready();
     if (rc != 0) { s_swd_ready = 0U; return rc; }
 
     s_seq = 0U; s_t_us = 0U; s_produced = 0U; s_dropped = 0U; s_usb_drop = 0U;
@@ -665,7 +751,7 @@ static void scope_run_bench(void)
     }
     if (!s_swd_ready)
     {
-        int rc = scope_link_ready();
+        int rc = scope_be_link_ready();
         if (rc != 0) { s_bench_err = rc; s_bench_valid = 1U; return; }
     }
 
@@ -806,20 +892,38 @@ void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, c
     s_nvars = nvars;
     for (uint8_t i = 0U; i < nvars; i++) { s_var[i] = vars[i]; }
 
+    /* 后端选择：强制位优先，否则**跟随全局目标类型**（HID CMD_RTT action 10，
+     * 与 RTT 桥同一个开关 —— 这样网页不做任何改动也能采 RISC-V）。
+     * 换后端必须把"链路已就绪"清掉，逼下一次重新初始化。 */
+    {
+        uint8_t be = ((flags & SCOPE_FLAG_RISCV) != 0U) ? SCOPE_BE_RISCV :
+                     (rtt_bridge_target_is_riscv() ? SCOPE_BE_RISCV : SCOPE_BE_SWD);
+        if (be != s_backend)
+        {
+            s_backend = be;
+            s_swd_ready = 0U;
+        }
+    }
+
     /* 计划要先排出来：标定（action 8）不启动也能跑，而且状态字里要报 span 数 */
     scope_make_plan();
 
     /* clock_delay 覆盖：SWD 空闲拍那一截（每条 AP 读约 52 个时钟里有 6 拍是它）。
      * 只在明确要求时改；否则走"请求档位"那条路（见 rtt_bridge_request_swd_clock）——
-     * 它保证下次用链路时会重新初始化并按新档装载 blob。 */
-    if (flags & SCOPE_FLAG_DELAY0)
+     * 它保证下次用链路时会重新初始化并按新档装载 blob。
+     * RISC-V 侧没有"时钟档"这回事（JTAG 时序由 DMI 汇编里的旋钮 + delay 决定），
+     * 所以这一整段只对 SWD 后端有意义。 */
+    if (s_backend == SCOPE_BE_SWD)
     {
-        DAP_Data.clock_delay = 0U;
-    }
-    else
-    {
-        rtt_bridge_request_swd_clock(s_clock_hz ? s_clock_hz : rtt_bridge_swd_clock_hz());
-        s_swd_ready = 0U;
+        if (flags & SCOPE_FLAG_DELAY0)
+        {
+            DAP_Data.clock_delay = 0U;
+        }
+        else
+        {
+            rtt_bridge_request_swd_clock(s_clock_hz ? s_clock_hz : rtt_bridge_swd_clock_hz());
+            s_swd_ready = 0U;
+        }
     }
 
     if (s_running)
@@ -929,6 +1033,7 @@ uint32_t scope_sampler_status(uint32_t *out, uint32_t words)
 {
     if (words < 12U) { return 0U; }
     out[0] = (uint32_t)(s_running ? 1U : 0U) |
+             ((uint32_t)((s_backend == SCOPE_BE_RISCV) ? 1U : 0U) << 1) |   /* bit1 = 生效后端是 RISC-V */
              ((uint32_t)s_nspans << 8) |
              ((uint32_t)(s_swd_ready ? 1U : 0U) << 16) |
              ((uint32_t)s_nvars << 24);

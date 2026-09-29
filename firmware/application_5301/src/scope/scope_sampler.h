@@ -43,6 +43,10 @@
                                      * 代价：采样期间 COM 口不通（数据走另一条 bulk IN 0x83，
                                      * 不受影响），RTT-over-USB 也会停 —— 但两者本来就互斥。
                                      * 手动总开关见 HID 0x34 CMD_BRIDGE。 */
+/* 目标类型：RISC-V/JTAG（HPM6800EVK 这类）。不带这一位时**跟随全局目标类型**
+ * （HID CMD_RTT action 10，与 RTT 桥同一个开关）；带上就强制本会话用 RISC-V 后端。
+ * DEF 包里回报的是**生效值**，所以主机能据此判断走的是哪条路。 */
+#define SCOPE_FLAG_RISCV     0x40U
 
 typedef struct
 {

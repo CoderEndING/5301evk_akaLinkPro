@@ -55,6 +55,12 @@ static uint32_t s_dmstatus;
 static uint32_t s_last_sbcs;
 static uint32_t s_last_dmstatus;
 
+/* 单字流水读的"抱住"状态：SBA 已按"不自增 + sbreadonaddr + sbreadondata"配好、
+ * sbaddress0 已指向 s_hold_addr、且已经投出去一读（响应在下一拍回来）。
+ * 任何重新配置 sbcs 的路径（sba_config）都会把它清掉。 */
+static uint32_t s_hold_addr;
+static uint8_t s_hold_ok;
+
 /* Run-Test/Idle TCK cycles inserted before every DR scan. This is not optional
  * on the HPM6880's DTM: dtmcs.idle reads 7, and without idle clocks the DTM
  * silently stops accepting requests - the response freezes at op = 3 (which
@@ -261,6 +267,9 @@ static int sba_config(uint32_t extra)
 {
     uint32_t sbcs = SBCS_SBACCESS32 | SBCS_SBAUTOINC | extra;
 
+    /* 重新配置 sbcs 会把"抱住固定地址"的状态一起作废（见 riscv_jtag_hold_prepare）。 */
+    s_hold_ok = 0U;
+
     (void)sba_clear_errors();
     if (dmi_write(DM_SBCS, sbcs) != 0)
     {
@@ -374,6 +383,76 @@ int riscv_jtag_read_word(uint32_t addr, uint32_t *val)
     if (dmi_read(DM_SBDATA0, val) != 0)
     {
         return -4;
+    }
+    return 0;
+}
+
+/* ---- 单字流水读（J-Scope 单变量快路径）------------------------------------
+ *
+ * 与块读共用同一套 DMI 流水（一次访问 = 一条 41 位 DR 扫描，响应在**下一拍**回来），
+ * 区别只在 sbcs：**关掉自增**，于是每拍读的都是同一个地址 —— 正好是"盯着一个变量
+ * 看它随时间变"要的语义。配置一次（prepare）之后，每拍只剩一次 dmi_post：
+ *     sbcs       = sbaccess32 | sbreadonaddr | sbreadondata    （不自增）
+ *     sbaddress0 = addr      -> 写地址即启动第一次读
+ *     读一次 sbdata0         -> 点火：收上一拍的值，同时启动下一拍
+ * 之后每次 hold_read 就是"收上一次 + 投下一次"，语义与 swd_read_word_pipe() 一致。 */
+int riscv_jtag_hold_prepare(uint32_t addr)
+{
+    addr &= ~0x3U;
+
+    if (s_open == 0U)
+    {
+        return -1;
+    }
+    if (s_hold_ok && (s_hold_addr == addr))
+    {
+        return 0;                     /* 已经抱着这个地址：空操作（每拍调也没关系） */
+    }
+
+    s_hold_ok = 0U;
+    (void)sba_clear_errors();
+    if (dmi_write(DM_SBCS, SBCS_SBACCESS32 | SBCS_SBREADONADDR | SBCS_SBREADONDATA) != 0)
+    {
+        return -2;
+    }
+    if (dmi_write(DM_SBADDRESS0, addr) != 0)
+    {
+        return -3;
+    }
+    (void)dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);   /* 点火：它的响应由第一次 hold_read 收 */
+
+    s_hold_addr = addr;
+    s_hold_ok = 1U;
+    return 0;
+}
+
+int riscv_jtag_hold_read(uint32_t *val)
+{
+    uint64_t resp;
+
+    if (!s_hold_ok)
+    {
+        return -1;
+    }
+
+    resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
+
+    /* 目标全速运行时 DM 偶发 BUSY：同一个地址重读是幂等的，重发几次再判死
+     * （与块读同一策略，见 riscv_jtag_read_once）。 */
+    for (uint32_t r = 0U; (r < 4U) && (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS); r++)
+    {
+        resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
+    }
+    if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
+    {
+        s_last_sbcs = sba_clear_errors();
+        s_hold_ok = 0U;              /* 出错后"抱住"不可信：下一次 prepare 重新配 */
+        return -1;
+    }
+
+    if (val != NULL)
+    {
+        *val = dmi_resp_data(resp);
     }
     return 0;
 }
