@@ -855,6 +855,67 @@ DMA 定位追平，不会灌一整圈陈旧字节给主机。
 > 🚨 **换板子要改链接脚本**：scope 例程原本只有 C8（64K/20K）的 ld。现在 `build.ps1` /
 > `flash.ps1` 都带 `-Board ze|c8`，**默认 ze**、产物固定落在 `build\`（check.py 认这个路径）。
 > ZE 与 C8 的变量地址**实测完全一致**（同一份链接布局），所以测试脚本里的地址不用改。
+### RISC-V / JTAG 目标（HPM6800EVK）：同一套 J-Scope，只换传输后端
+
+采样逻辑（计划、帧布局、组包、丢拍统计）与目标无关，**只有 4 个原语不同**（块读 /
+抱住准备 / 流水读 / 链路初始化），所以做成了传输后端分派。RISC-V 侧走 Debug Module 的
+**SBA**（系统总线访问），与 SWD 那边同构：
+
+| | SWD/ARM | RISC-V/JTAG |
+| --- | --- | --- |
+| 单字快路径 | CSW 关自增 + 缓存 AP.TAR + posted DRW 流水（每拍 1 次传输） | SBA 抱在固定地址（`sbcs` 关自增）+ 每拍 **1 次 DMI 扫描** |
+| 多字 span | AHB-AP 块读（自增） | SBA 块读（`sbautoincrement` + posted 扫描，一个词一次扫描） |
+
+实测（HPM6800EVK / HPM6880，目标 RAM 取 0x1240000；探针 HPM5301EVKLite）：
+
+| 配置 | 每样本 | 上限 | 对照（SWD @60M） |
+| --- | --- | --- | --- |
+| 单变量 u32 | **2.937 µs** | **340.5 kHz** | 1.588 µs / 629 kHz |
+| 8 通道连续 u32（32 B，一个 span） | 45.64 µs | 21.9 kHz | 11.19 µs / 89.3 kHz |
+
+> 单字那条已经**贴到 DMI 扫描的时序下限**（一次 54 TCK 扫描 ≈ 2.7 µs，等于块读里
+> 每个词的耗时），比"每拍 4 次扫描"的裸单字 SBA 路径（25.6 µs）快 **8.7 倍**。
+> 多通道那条还没优化：每拍 18 次扫描里只有 8 次在搬数据，其余是每次块读的
+> `sba_config`（4 次）+ 收尾清错（2 次）+ 地址/点火/排水 —— 去掉冗余约能到 ~32 µs（31 kHz）。
+> 再往上就要动 DMI 扫描汇编（现在约 18 指令/bit ≈ 20 MHz TCK；SWD blob 是 6 指令/bit），
+> 那是要过 `hpm6800_selfcheck.py` 门禁的深水区。
+
+**怎么用**：后端 = **全局目标类型**（HID `CMD_RTT` action 10，与 RTT 桥同一个开关 ⇒
+**网页不改也能采 RISC-V**），或配置报文里 `flags bit6` 强制。**生效**后端在 DEF 包的
+flags bit6 与状态字 0 的 bit1 里回报（丢弃模式没有 DEF 包，靠状态字那一位）。
+⚠️ 目标类型是**粘**的：采过 RISC-V 再采 ARM 必须切回来；忘了切也不会直接失败 ——
+后端拉不起来时采样器会换另一条路重试一次。
+
+端到端验收（100 µs 周期）：176 包 **0 重同步**、`dropped=0`、`swdErr=0`；值的正确性用
+靶子里现成的常量对（采 0x1240000 得到 `0x47474553` = 内存里的 `SEGG`）。
+
+**加这个功能对 SWD 有没有影响？** 实测没有 —— 分派只在每个原语外面多一个可预测分支：
+
+| SWD 复测（改动后 / 基线） | 本轮 | 基线 |
+| --- | --- | --- |
+| DISCARD 3 µs @60M（纯探针侧） | **351.5 kHz，丢 13 拍** | 348.4 kHz / 丢 19 拍 |
+| M0 单字 @60M | **1.583 µs** | 1.548~1.588 µs |
+| M0 pack（24 B span）@60M | **11.148 µs** | 11.193~11.234 µs |
+| M0 `two` / `mixed` / `cross` | **8.834 / 11.405 / 25.662 µs** | 8.780 / 11.372 / 25.6 µs |
+| 端到端 3 µs + CDC 关 | **320.7 kHz，丢 4.3%** | 319.4 kHz / 4.7% |
+
+全部落在 ±1% 的 run-to-run 噪声内 ⇒ **<1% 的说法成立**。内存代价：DLM **一个字节没涨**
+（127072 B / 130304，97.52%），FLASH +1.1 KB（11.96%）。
+
+```bat
+:: 探针：切 SWD+JTAG 输出模式（RAM-only，掉电即失），再确认 6800 在不在
+python script_test\hpm6800_probe.py set-mode 1
+python script_test\hpm6800_riscv.py open
+
+:: J-Scope over JTAG：单字 / 8 通道 / 端到端
+python script_test\scope_hss_test.py bench --riscv --set one --addr 0x1240000 --iters 2000
+python script_test\scope_hss_test.py bench --riscv --set one --base 0x1240000 --iters 1000
+python script_test\scope_hss_test.py run   --riscv --set one --addr 0x1240024 --period 100 --secs 2
+
+:: 切回 SWD/ARM（目标类型是粘的）
+python script_test\scope_hss_test.py status --swd
+```
+
 ### 复现
 
 ```bat

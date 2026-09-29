@@ -451,8 +451,9 @@ def main():
         print("DEF: swd=%d Hz period=%d us flags=0x%X nvars=%d spans=%d"
               % (int.from_bytes(d[0:4], 'little'), int.from_bytes(d[4:8], 'little'),
                  int.from_bytes(d[8:10], 'little'), d[10], d[11]))
-    print("probe: produced=%d dropped=%d swdErr=%d yield=%d seq=%d"
-          % (st['produced'], st['dropped'], st['swdErr'], st['yield'], st['seq']))
+    print("probe: produced=%d dropped=%d swdErr=%d yield=%d seq=%d 后端=%s"
+          % (st['produced'], st['dropped'], st['swdErr'], st['yield'], st['seq'],
+             'RISC-V/JTAG' if st.get('riscv') else 'SWD/ARM'))
 
     # seq 缺口
     gaps = 0
