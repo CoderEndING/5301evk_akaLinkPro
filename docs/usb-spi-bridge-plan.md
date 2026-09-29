@@ -1,7 +1,7 @@
 # USB → SPI/QSPI 转发功能方案（v1，待评审）
 
 > 分支：`feature/usb-spi-bridge`　目标板：HPM5301EVKLite（探针）
-> 状态：**方案阶段**，未写代码、未上板（用户当前在用探针）。评审通过后按 §8 分阶段实施。
+> 状态：**方案已评审**（2026-09-28 用户确认端点/引脚/SCLK 三项），代码未写、未上板（用户当前在用探针）。按 §8 分阶段实施。
 
 ---
 
@@ -9,16 +9,19 @@
 
 | 议题 | 结论 | 依据 |
 |---|---|---|
-| **端点** | **新开一对 bulk**：IN `0x8B` / OUT `0x0B`（物理 EP11，双向同名），挂在新增的 vendor-specific 接口上；**不复用 CDC** | §3 |
+| **端点**（已确认） | **新开一对 bulk**：IN `0x8B` / OUT `0x0B`（物理 EP11，双向同名），挂在新增的 vendor-specific 接口上；**不复用 CDC** | §3 |
 | 外设 | `SPI1`；引脚 PA26/27/28/29 + **PA30/PA31（quad IO2/IO3）**，全部在 J3 排针上 | §2.1 §2.3 |
 | 传输形态 | 单线 / 双线 / **四线**；硬件自带 cmd / addr / dummy / token 相位，一次 CS 内完成 | §2.2 |
+| SCLK（已确认） | 默认 20 MHz；`sclk_hz` 由 HID 配置，**面板协议直接指定 40 / 60 / 80 MHz**，逐档上板实测 | §4.5 §6.3 |
+| **目标屏** | 天马 2P01 / **AXS15352**（4 线 SPI + DC，240×296，RGB565）与 **ST77916**（**QSPI 四线**，360×360，RGB565 @40 MHz）——两套初始化序列都由网页逐条下发，探针逐条执行 | §2.10 |
 | TX 策略 | `len < 100` 轮询；`len ≥ 100` DMA；**阈值可配**，上板实测后再定 | §6 |
 | RX 策略 | 一律轮询（CPU 收 FIFO），与 TX 策略解耦 | §6 |
 | 缓冲 | 32 KB AHB SRAM（`0xF0400000`，当前完全空闲）：OUT 环 16 KB + IN 环 8 KB + 暂存 2 KB + 预留 6 KB；DLM 只多花约 0.3 KB 元数据 | §5.2 |
-| 控制面 | HID 新增 `CMD 0x35`（配置 / 状态 / 使能 / 复位 / 中止），沿用 0x31/0x32/0x34 的报文约定 | §4.4 |
+| 控制面 | HID 新增 `CMD 0x35`（配置 / 状态 / 使能 / 复位 / 中止 / 面板档），沿用 0x31/0x32/0x34 的报文约定 | §4.4 |
 | 数据面 | bulk OUT = **有序帧流**（数据 + CS/DC/延时等线序动作统一走这条）；bulk IN = 读数据 + 应答 | §4.2 §4.3 |
-| 与现有功能 | **引脚零冲突**；主循环挂一个 `spi_bridge_poll()`，未使能时一条分支直接返回 | §2.9 §5.1 |
-| 预期吞吐 | 单线 20 MHz ≈ 2.5 MB/s；四线 20 MHz ≈ 10 MB/s（USB HS 侧余量远大于此） | §6.3 |
+| 面板友好 | **面板档（profile）+ 紧凑步帧 `STEP`**：网页把 `{cmd, data, n, delay_ms}` 表原样下发，探针按档自动处理 DC / 0x02+24 bit 地址 / 四线数据 | §4.7 |
+| 与现有功能 | **引脚零冲突**；主循环挂一个 `spi_bridge_poll()`，未使能时一条分支直接返回 | §2.8 §5.1 |
+| 预期吞吐 | 单线 20 MHz ≈ 2.5 MB/s；四线 20 MHz ≈ 10 MB/s；**四线 40 MHz ≈ 20 MB/s**（USB HS 侧余量远大于此） | §6.3 |
 
 ---
 
@@ -185,6 +188,39 @@
 
 ---
 
+### 2.9 两块目标屏的实际接口需求（协议据此定型）
+
+参照物是用户已有的 ESP32-P4 工程（`E:\esp-idf-wsh\projects\`），它们把两块屏都跑通过：
+
+| 屏 | 接口 | DC/RS | 数据线 | 命令相位 | 像素相位 | 其他 |
+|---|---|---|---|---|---|---|
+| 天马 2P01 / **AXS15352**（240×296，RGB565） | 4 线 SPI | **有（高=数据）** | 1（只有 MOSI，**没接 MISO**） | 8 bit 命令 | 8 bit 参数（同一 CS 窗口内翻 DC） | RST、BL、**TE 输入** |
+| **ST77916**（圆屏 360×360，RGB565 @40 MHz） | **QSPI** | **无** | **4** | **32 bit = opcode `0x02` + 24 bit 地址**（地址高位放面板命令字） | 参数 1 线；**像素用 opcode `0x32` + 4 线** | RST、BL（20 kHz PWM 调光）、**TE 输入** |
+
+出处：
+
+- `spi_lcd_axs15352\main\app_main.c`：`dc_gpio_num = PIN_LCD_DC`、`lcd_cmd_bits = 8`、`lcd_param_bits = 8`、`quad_mode = 0`、`reset_gpio_num`、TE 作为输入 + ISR；`axs15352_init_cmds.h` = 30 条 `{cmd, data, nbytes, delay_ms}`。
+- `qspi_lcd_st77916\main\app_main.c` 注释与 `espressif__esp_lcd_st77916\include\esp_lcd_st77916.h`：`ST77916_PANEL_IO_QSPI_CONFIG` → `dc_gpio_num = -1`、`lcd_cmd_bits = 32`、`lcd_param_bits = 8`、`quad_mode = true`；工程注释写明「**0x02 命令帧 + 0x02/1 线参数 + 0x32/4 线像素**」；`st77916_init_cmds_ch32.h` = 192 条命令 / 215 参数字节 / 累计 120 ms 延时。
+- 初始化序列数据：`E:\esp-idf-wsh\资料\panel_init\`（`extra_parts\TianMa2p01+AXS15352_SPI_565_*.txt`、`dumps\st77916.json`、`parts\*.json`、`SPEC.md`），步骤类型为 `cmd / delay / delay_us / reset / comment`。
+
+**这三条结论直接决定了协议形状**（原方案已覆盖，此处做一次对账）：
+
+| 屏的需求 | 协议里的对应项 | 结论 |
+|---|---|---|
+| QSPI：8 bit opcode + 24 bit 地址 + 可变线数数据 | `XFER` 的 `cmd` + `addr_len/addr` + `tcfg.lines` | ✅ 原生支持，无需改 |
+| SPI+DC：同一 CS 窗口内「命令(8bit) → 翻 DC → 参数」 | `tcfg.dc_en/dc_level` + `CS_HOLD` + 面板档自动展开 | ✅ 用 `STEP` 步帧自动完成（§4.7） |
+| 参数 1 线 / 像素 4 线（同一屏两种相位） | 每帧独立 `tcfg.lines` | ✅ |
+| 192 + 30 条初始化步骤，网页逐条下发 | 紧凑 `STEP` 帧（12 B + 参数） | ✅ 新增，见 §4.7 |
+| 累计 120 ms 延时（含单条 100/120 ms） | `DELAY` 帧 + **非阻塞**调度 | ✅ 见 §5.3 |
+| 复位（低有效脉冲 + 上电等待） | `RESET` 帧（用辅助 RST 脚） | ✅ 新增，见 §4.2 |
+| TE 撕裂信号（输入） | `AUX_IN` 帧（带 RSP 回读电平） | ✅ 新增，见 §4.2 |
+| 背光（GPIO / 20 kHz PWM 调光） | v1：BL 脚开关；PWM 调光列为后续可选 | ⚠️ 见 §9.2 |
+| RGB565 高字节在前 | 与探针无关：探针做**字节透明**转发，字节序由主机负责 | ✅ |
+
+> 结论：**方案不需要推翻任何设计**，只需补两个便利帧（`STEP` / `RESET`）和一个输入帧（`AUX_IN`），以及面板档概念。
+
+---
+
 ## 3. 端点决策：新开一对 bulk（推荐），不复用 CDC
 
 | 维度 | 新开 bulk 对（0x8B/0x0B） | 复用 CDC（0x84/0x05） |
@@ -261,12 +297,17 @@
 
 | 值 | 名称 | payload |
 |---|---|---|
-| 0x01 | `XFER` | 12 B 传输头（见下）+ TX 数据 |
+| 0x01 | `XFER` | 12 B 传输头（见下）+ TX 数据；**通用帧**，一切时序都能表达 |
 | 0x02 | `CS` | `u8`：0 = 释放，1 = 拉低（手动 CS，配合 `CS_HOLD`） |
 | 0x03 | `GPIO` | `u8 line, u8 level`；line：0=DC，1=RESET，2=AUX_CS，3=BL |
-| 0x04 | `DELAY` | `u32` 微秒（屏初始化用） |
+| 0x04 | `DELAY` | `u32` 微秒（**非阻塞**，见 §5.3） |
 | 0x05 | `PING` | 空；用来测往返延迟 / 保活（配 `RSP`） |
 | 0x06 | `CFG` | 数据面内改运行参数（可选，v1 只支持改 `tx_dma_threshold`） |
+| **0x07** | **`STEP`** | **面板初始化步**：`u8 cmd, u8 nparams, u16 delay_ms, params[nparams]`；按当前**面板档**展开成实际时序（§4.7）——网页把 `{cmd,data,n,delay_ms}` 表原样下发 |
+| **0x08** | **`RESET`** | `u16 low_ms, u16 post_ms`：把辅助 RST 脚拉到有效电平并保持 `low_ms`，释放后再等 `post_ms`（典型 `10 / 120`）；两步都不阻塞主循环 |
+| **0x09** | **`AUX_IN`** | 空（配 `RSP`）：回读辅助**输入**脚（TE 等）电平，应答 payload = `u8` 位图 |
+
+> `STEP` / `RESET` / `AUX_IN` 三个是**便利帧**：用 `XFER`/`GPIO`/`DELAY` 组合也能拼出同样效果，但面板初始化序列动辄 200 条，紧凑帧能把网页侧的代码量和报文量都压下来（§4.7）。
 
 **XFER 的 12 B 传输头**
 
@@ -331,6 +372,8 @@ CS↓ ─ [cmd] ─ [addr] ─ [dummy] ─ [data(tx/rx, 1/2/4 线)] ─ CS↑
 | 4 | `GET_CFG` | — | `res[4..]` = 配置块 |
 | 5 | `PIN_CFG` | `req[4]`=line，`req[5]`=pad 索引，`req[6]`=有效电平 | 非法映射返回错误码（例如要 quad 却把 PA30 配成 GPIO） |
 | 6 | `ABORT` | — | 丢弃未处理帧与 IN 队列，回到干净状态 |
+| 7 | `SET_PROFILE` | `req[4..]` = 面板档块（§4.7） | `res[4..7]` = 状态；非法值夹取 |
+| 8 | `GET_PROFILE` | — | `res[4..]` = 面板档块 |
 
 > 说明：CS/GPIO 的**直接**操作**不放** HID，避免与 bulk 流产生顺序歧义；HID 只做配置与状态（§4.1）。
 
@@ -361,11 +404,13 @@ CS↓ ─ [cmd] ─ [addr] ─ [dummy] ─ [data(tx/rx, 1/2/4 线)] ─ CS↑
 10: u8  pad_cs_aux
 11: u8  pad_bl
 12: u8  pad_active_low   位图：bit0 DC、bit1 RST、bit2 CS、bit3 BL
-13: u8  flags            bit0 = 随 ENABLE 一起打开；bit1 = 使能时自动清环
-14: u16 out_ring_kb      请求的 OUT 环大小（受 32 KB 总预算夹取）
-16: u16 in_ring_kb
-18: u16 max_frame_bytes  v1 固定 504
-20: ...                  预留（配置块总长 32 B，留出余量）
+13: u8  pad_te           辅助**输入**脚（TE 撕裂信号，0 = 不用）
+14: u8  flags            bit0 = 随 ENABLE 一起打开；bit1 = 使能时自动清环
+15: u8  reserved0
+16: u16 out_ring_kb      请求的 OUT 环大小（受 32 KB 总预算夹取）
+18: u16 in_ring_kb
+20: u16 max_frame_bytes  v1 固定 504
+22: ...                  预留（配置块总长 32 B，留出余量）
 ```
 
 **pad 索引表**（协议内固定，避免主机猜 IOC 编号）：
@@ -378,6 +423,29 @@ CS↓ ─ [cmd] ─ [addr] ─ [dummy] ─ [data(tx/rx, 1/2/4 线)] ─ CS↑
 > - PA30/PA31 只有在**没开 quad**时才允许当辅助脚；固件在 `PIN_CFG`/`SET_CFG` 里校验并拒绝。
 > - PA09 是板载 TinyUF2 按键脚（按下 + 复位进 DFU），PA10 是板载 LED——两者列在表里只为完整性，**默认不选**。
 > - PA00/PA01 是 UART0（ROM ISP / log）——ISP 场景下会被外部串口驱动，作为辅助脚时需自行留意。
+> - `pad_te` 是**输入**（上拉/下拉按需配置），用同一张 pad 表；ST77916 与 2P01 都把 TE 引到了排针。
+
+### 4.5.1 面板档块（SET_PROFILE / GET_PROFILE）
+
+```
+ 0: u8  profile             0 = raw；1 = spi_dcx；2 = qspi（§4.7）
+ 1: u8  def_lines           档 0 数据相位线数（1/2/4）
+ 2: u8  dc_active_high      档 1：DC 高 = 数据（AXS15352 为 1）
+ 3: u8  cs_hold_in_step     档 1：翻 DC 时保持 CS（1 = 复刻 ESP-IDF 行为）
+ 4: u8  qspi_wr_opcode      档 2：命令写 opcode（默认 0x02）
+ 5: u8  qspi_color_opcode   像素写 opcode（默认 0x32）
+ 6: u8  qspi_addr_bytes     地址相位字节数（默认 3）
+ 7: u8  flags               预留
+ 8: ...                     预留（面板档块总长 16 B）
+```
+
+两块屏的推荐档位（网页侧照此配置即可）：
+
+| 屏 | profile | 关键参数 |
+|---|---|---|
+| AXS15352 / 天马 2P01 | 1 | `dc_active_high = 1`、`cs_hold_in_step = 1`、`sclk_hz = 20~40 MHz`、`pad_dc = PB11`、`pad_rst = PB12`、`pad_bl = PB13`、`pad_te = PB10` |
+| ST77916 | 2 | `qspi_wr_opcode = 0x02`、`qspi_color_opcode = 0x32`、`qspi_addr_bytes = 3`、`sclk_hz = 40 MHz`、`pad_rst`/`pad_bl`/`pad_te` 同上 |
+
 
 ### 4.6 典型时序示例
 
@@ -422,6 +490,51 @@ OUT: [XFER RSP] tcfg{cmd_en=1} cmd=0x80|reg tx_len=0 rx_len=1 dummy=1
 读： cmd=0x03 addr_len=3 addr=offset rx_len=N
 写： cmd=0x02 addr_len=3 addr=offset tx_len=N
 ```
+
+---
+
+### 4.7 面板档（profile）与紧凑步帧 `STEP`
+
+网页侧要下发的是**面板初始化表**（形如 `{cmd, data[n], n, delay_ms}`，见 §2.9），探针要「一条一条执行」。为了避免每条都手写 20 字节的 `XFER` 头，引入**面板档**：HID 配置里选一个档，`STEP` 帧就按该档自动展开。
+
+| 档 | 名称 | `STEP` 展开成什么 | 适用 |
+|---|---|---|---|
+| 0 | `raw` | 一次 `XFER`：`cmd` + `params`，均按 `def_lines`；DC 未用 | 普通 SPI 器件（传感器、NOR） |
+| 1 | `spi_dcx` | **同一个 CS 窗口内**：CS↓ → DC=命令电平 → 发 8 bit `cmd` → **翻 DC=数据电平** → 发 `params` → CS↑（`nparams = 0` 时只发命令） | **AXS15352 / 天马 2P01**（4 线 SPI + RS） |
+| 2 | `qspi` | 一次 `XFER`：`cmd = qspi_wr_opcode`（默认 `0x02`，1 线）→ 地址相位 24 bit = **`面板命令字 << 16`** → 数据相位 `params`（1 线） | **ST77916** 等 QSPI 屏的命令阶段 |
+
+档位参数（HID 配置里给）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `profile` | 0 | 0/1/2 见上 |
+| `def_lines` | 1 | 档 0 的数据相位线数（1/2/4） |
+| `dc_line` | 见 §2.8 默认表 | 档 1 用的 DC 辅助脚（0 = 未配，则档 1 退化为档 0） |
+| `dc_active_high` | 1 | DC 高=数据（AXS15352 就是如此） |
+| `qspi_wr_opcode` | `0x02` | 档 2 的命令写 opcode |
+| `qspi_color_opcode` | `0x32` | 像素写 opcode（主机写像素时直接用它发 `XFER`） |
+| `qspi_addr_bytes` | 3 | 地址相位字节数（QSPI 屏惯例 3） |
+| `cs_hold_in_step` | 1 | 档 1 是否在翻转 DC 时保持 CS（ESP-IDF 行为 = 保持） |
+
+**两屏的对应关系（验证协议够用）**
+
+```
+AXS15352（档 1）:
+  表行 {0xCE, [0x5A,0xA5], 2, 0}
+    → STEP{ cmd=0xCE, nparams=2, delay_ms=0, params=[5A A5] }
+    → 线上: CS↓ DC=0 发 CE DC=1 发 5A A5 CS↑                （一个 CS 窗口）
+  表行 {0x11, [], 0, 100}
+    → STEP{ cmd=0x11, nparams=0, delay_ms=100 }             （命令 + 100 ms 非阻塞延时）
+
+ST77916（档 2）:
+  表行 0xF0 + [0x28]
+    → STEP{ cmd=0xF0, nparams=1, delay_ms=0, params=[28] }
+    → 线上: CS↓ 02 | 00 00 F0 | 28 | CS↑                    （opcode + 24 bit 地址 + 1 线参数）
+  像素（整屏 360×360×2 = 259200 B，主机切片）:
+    → XFER{ cmd=0x32, addr_len=3, addr=0x002C00, tcfg.lines=4, tx_len=480 } × 540 片
+```
+
+**报文量核算**：AXS15352 的 30 条 ≈ 30×(8+4+参数) ≈ 0.8 KB；ST77916 的 192 条 ≈ 3 KB；两者合计不到 10 个 512 B 包，毫秒级下发完毕。
 
 ---
 
@@ -490,6 +603,9 @@ while (1) {
 6. **`data_merge`**：v1 用 0（与 SDK 阻塞 API 语义一致，字节精确）；若上板实测轮询路径成瓶颈，再考虑改用 DataMerge（8-bit 下每次 DATA 读写 4 字节，FIFO 一项抵 4 字节）配合自写 FIFO 循环。
 7. **超时**：每帧都有硬超时（`spi_wait_for_idle_status` 重试上限），超时 → 状态回 4、计数器 +1、必要时复位 SPI 控制器（`spi_reset_all`），绝不挂死主循环。
 8. **不做 cache 维护**（无 D-Cache），也不需要地址转换（AHB SRAM 是系统地址）。
+9. **延时非阻塞**：`DELAY` / `STEP.delay_ms` / `RESET` 都只登记「下一个允许执行时刻」（`mchtmr` 计时），`spi_bridge_poll()` 到点才继续处理后续帧。面板序列里有 100/120 ms 的等待，**绝不能在主循环里忙等**（那会让 DAP/RTT/Scope 停摆 100 ms）。等待期间 OUT 环继续被 USB 回调填充，不丢数据。
+10. **面板档执行**（§4.7）：档 1 的一次 `STEP` 内部是「同一个 CS 窗口里的两次 SPI 传输 + 一次 DC 翻转」，用 GPIO CS + `board_write_spi_cs` 风格的软件 CS 实现最稳（硬件 CS 无法在一次事务中间翻 DC）；档 2 直接映射到一次 `XFER`。
+11. **SCLK 配置**：`clock_set_source_divider(clock_spi1, src, div)` 显式选源（PLL0 三路 720/600/400 MHz 可用），再由 `spi_master_timing_init()` 分频到目标 `sclk_hz`；改频前先 `spi_wait_for_idle_status()`，改频后校验实际频率并回读给主机。
 
 ---
 
@@ -514,16 +630,18 @@ while (1) {
 
 ### 6.3 吞吐预估（不含主机与协议开销）
 
-| 配置 | 线速上限 | 150 KB 整屏（240×320×2 B）耗时 |
-|---|---|---|
-| 单线 20 MHz | 2.5 MB/s | ≈ 60 ms |
-| 单线 40 MHz | 5 MB/s | ≈ 30 ms |
-| **四线 20 MHz** | **10 MB/s** | **≈ 15 ms** |
-| 四线 40 MHz | 20 MB/s | ≈ 7.5 ms |
+| 配置 | 线速上限 | 240×296×2 B（142 KB）| 360×360×2 B（259 KB，ST77916 整屏）|
+|---|---|---|---|
+| 单线 20 MHz | 2.5 MB/s | ≈ 57 ms | ≈ 104 ms |
+| 单线 40 MHz | 5 MB/s | ≈ 28 ms | ≈ 52 ms |
+| **四线 20 MHz** | **10 MB/s** | ≈ 14 ms | ≈ 26 ms |
+| **四线 40 MHz** | **20 MB/s** | ≈ 7 ms | **≈ 13 ms**（面板规格值）|
+| 四线 60 MHz | 30 MB/s | ≈ 4.7 ms | ≈ 8.6 ms（待实测）|
+| 四线 80 MHz | 40 MB/s | ≈ 3.6 ms | ≈ 6.5 ms（待实测）|
 
 - USB 侧：HS bulk 512 B/包。探针已有两条 bulk 通道的实测：J-Scope 采样器的 bulk IN `0x83` 在满速测试里跑到 **26.1 kHz × 512 B ≈ 13 MB/s** 的包速率，RTT-over-CDC 跑到 **1.39 MB/s（且是被 SWD 侧限速的结果）**。而 SPI 转发没有 SWD 那样的逐包处理开销，**USB 侧余量远大于 SPI 线速**，瓶颈在 SPI。
-- 帧间空隙（协议解析 + 事务启动 ≈ 1~2 µs）相对 480 B/帧（四线 20 MHz ≈ 48 µs）只有几个百分点，**v1 不做流水线**；若以后需要，可让连续写帧在硬件 CS 自动控制下背靠背下发。
-- SCLK 上限待上板实测（与 SPI1 时钟源、排针走线、从器件能力有关）。协议里 `sclk_hz` 可调，先按 20 MHz 起步，逐步往上试。
+- 帧间空隙（协议解析 + 事务启动 ≈ 1~2 µs）相对 480 B/帧（四线 40 MHz ≈ 24 µs）只有几个百分点，**v1 不做流水线**；若以后需要，可让连续写帧在硬件 CS 自动控制下背靠背下发。
+- SCLK 40/60/80 MHz 由 HID `sclk_hz` 指定（用户要求）：40 MHz 是 ST77916 的厂规值，把握较大；60/80 MHz 受「SPI1 模块时钟 / SPI 外设上限 / 排针走线与从器件能力」三方约束，**逐档上板实测**，回环跑通才算数。`GET_CFG` 会回读**实际生效频率**（分频后可能落在 20/24/30/40/60/80 之类的离散点上，不是任意值）。
 
 ---
 
@@ -532,9 +650,11 @@ while (1) {
 1. 打开 `VID 0x0D28 / PID 0x0204` 的**新接口**（vendor specific，2 个 bulk 端点）。
 2. 控制面走现有自定义 HID：`req[2] = 0x35`，动作见 §4.4；响应形状与 0x31/0x32/0x34 一致。
 3. 数据面：bulk OUT 发帧（§4.2），bulk IN 收应答（§4.3）。
-4. 使用顺序建议：`GET_CFG` → `SET_CFG`（SCLK/线数/CS 策略/辅助脚/阈值）→ `ENABLE 1` → 灌帧 → 需要时 `ABORT`/`RESET` → `ENABLE 0`。
+4. 使用顺序建议：`GET_CFG` → `SET_CFG`（SCLK/线数/CS 策略/辅助脚/阈值）→ `SET_PROFILE`（选面板档）→ `ENABLE 1` → `RESET` 帧 + 灌初始化步帧 → 刷像素 → 需要时 `ABORT`/`RESET`(action 2) → `ENABLE 0`。
 5. 主机必须自己切片（单帧 ≤ 504 B），并自己维护 `seq` 配对。
 6. 批量写建议「只有最后一片带 `RSP`」，避免 IN 流量拖慢灌数据。
+7. **面板初始化表可以几乎原样搬过来**：把 `{cmd, data[n], n, delay_ms}` 一行编成一个 `STEP` 帧（§4.7），`{"type":"delay"}` 编成 `DELAY` 或并进 `STEP.delay_ms`，`{"type":"reset"}` 编成 `RESET` 帧。AXS15352 与 ST77916 两套序列都已经按此核对过（§2.9）。
+8. 像素数据字节序（RGB565 高字节在前）由**主机**负责交换，探针做字节透明转发。
 
 ---
 
@@ -544,42 +664,45 @@ while (1) {
 |---|---|---|
 | **P1** | 协议头文件 + HID 0x35（配置/状态/使能/复位）+ SPI1 引脚与初始化 + 帧解析 + **轮询 TX/RX** + AHB SRAM 环 + 端点描述符 | 枚举后能看到新接口；`GET_CFG` 回读正确；**MISO↔MOSI 跳线回环**：1/2/32/99/100 B 收发逐字节一致 |
 | **P2** | **DMA TX**（≥ 阈值）+ 阈值可配 + 统计计数 | 同上回环在 101/256/504/484 B 通过；对比 `NO_DMA`/`FORCE_DMA` 两种路径的耗时，定阈值默认值 |
-| **P3** | 辅助 GPIO（DC/RESET/CS/BL）+ 手动 CS（`CS_HOLD`/`CS_OFF`/`CS` 帧）+ `DELAY` + 多器件（辅助 CS） | 万用表/逻辑分析仪看 DC/RESET 电平与 CS 波形；两块 SPI 从机（或屏 + 传感器）分别选中互不干扰 |
-| **P4** | 真器件：QSPI 屏（或 SPI NOR 作对照）+ 四线读回（如 `0x03`/`RDDID`） | 四线读到的 ID 与器件手册一致；整屏刷图时间与 §6.3 预估同量级 |
+| **P3** | 辅助 GPIO（DC/RESET/CS/BL）+ 辅助输入（TE）+ 手动 CS（`CS_HOLD`/`CS_OFF`/`CS` 帧）+ **非阻塞 `DELAY`** + `RESET` 帧 | 万用表/逻辑分析仪看 DC/RESET 电平与 CS 波形；`RESET` 帧后 `AUX_IN` 能读到 TE 电平变化；120 ms 延时期间 DAP/RTT 仍可用 |
+| **P4** | **面板档 + `STEP` 帧** + 两块实屏：AXS15352（档 1）与 ST77916（档 2） | 逐条下发厂规初始化序列后屏能亮；ST77916 整屏刷图（259 KB）时间与 §6.3 同量级；`sclk_hz` 20→40 MHz（→60/80）逐档无错 |
 | **P5** | 文档：`docs/web-handoff-spi-bridge.md`（给网页组的实现说明）+ README 更新 + DLM/Flash 占用复核 | 文档自洽；DLM 与 Flash 数字更新 |
 
 **P1/P2 的关键验收手段是回环**（J3[19] MOSI ↔ J3[21] MISO 一根跳线）：
-- 不依赖任何外部器件，能覆盖「轮询 vs DMA」「单线/双线」「CS/DC 时序」和协议解析；
+- 不依赖任何外部器件，能覆盖「轮询 vs DMA」「单线/双线」和协议解析；
 - 与之前 UART 回环（`script_test/uart_loopback.py`）同一套路，便于回归；
-- 新脚本：`script_test/spi_bridge_test.py`（WebUSB/裸 HID 均可），跑长度扫描 + 阈值对照 + 统计校验。
+- 新脚本：`script_test/spi_bridge_test.py`（WebUSB/裸 HID 均可），跑长度扫描 + 阈值对照 + 统计校验；再加 `--panel` 模式的 DC/CS 波形自检。
 
 ---
 
 ## 9. 风险与待确认
 
-### 9.1 需要用户拍板
+### 9.1 已确认（2026-09-28）
 
-1. **端点方案**：按 §3 新开一对 bulk（0x8B/0x0B）——是否同意？
-2. **辅助脚默认值**：DC=PB11(J3[13])、RESET=PB12(J3[27])、BL=PB13(J3[28])、备用 CS=PB10(J3[26])——是否按这个默认？（协议里可改，改默认只是省事。）
-3. **SCLK 起步值**：默认 20 MHz（板级既有值），上板后往上试；有没有指定目标（例如 40/60/80 MHz）？
-4. **显示屏型号**：有没有已经确定的屏（型号/接口线数/DC 有无）？会影响 P4 的验证顺序（但**不影响协议**）。若屏是「无 DC、纯 QSPI 命令序列」型，示例 C 可以完全不用。
+| # | 事项 | 结论 |
+|---|---|---|
+| 1 | 端点方案 | ✅ 同意：新开一对 bulk `0x8B/0x0B` |
+| 2 | 辅助脚默认值 | ✅ 可以：DC=PB11(J3[13])、RST=PB12(J3[27])、BL=PB13(J3[28])、备用 CS=PB10(J3[26])（TE 输入默认 PB10/PB11 类脚，配置里可改） |
+| 3 | SCLK | ✅ 默认 20 MHz；**由 HID 面板协议指定 40 / 60 / 80 MHz** |
+| 4 | 目标屏 | ✅ 天马 2P01/AXS15352（SPI+DC）与 ST77916（QSPI）；初始化序列由网页逐条下发，探针逐条执行（§2.9 §4.7） |
 
 ### 9.2 技术风险
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
 | 描述符改动导致枚举回归（接口号顺移） | DAP/CDC/HID/WebUSB/DFU 全部要复测 | 接口追加在 HID 之后、宏统一顺移；改动后跑一遍现有 `script_test/` 全套 |
-| 主循环被长帧拖住 | DAP/Scope 时序抖动 | 每轮帧数/字节上限；DMA 处理大帧；未使能时零开销 |
+| 主循环被长帧拖住 | DAP/Scope 时序抖动 | 每轮帧数/字节上限；DMA 处理大帧；延时非阻塞；未使能时零开销 |
 | 四线时序与从器件不匹配（dummy/CS 时序） | QSPI 屏读不到数据 | `cpol/cpha/cs2sclk/csht/dummy/addr_quad` 全部可配；先用 SPI NOR 或回环验证四线链路 |
 | IN 环被未取走的数据填满 | 卡住帧处理 | 流控暂停 + 硬超时 + 计数器上报；文档里强调主机要取走 IN |
 | 辅助脚与排针上其它用户（J3 共用）冲突 | 误驱动外部电路 | pad 表白名单 + 使能时才配置 + `PIN_CFG` 校验 |
-| SCLK 提升后信号完整性 | 数据错误 | 起步 20 MHz；提升靠实测；必要时降 `cs2sclk` 或加串阻 |
+| SCLK 60/80 MHz 上不去或误码 | 屏花屏 | 逐档实测；失败就回落 40 MHz；必要时降 `cs2sclk` 或加串阻；`GET_CFG` 回读实际频率 |
+| 背光 PWM 调光（20 kHz） | v1 只有开关，无调光 | 列为后续可选：HPM5301 的 PWM 需占用相应 pad 的 PWM 复用，与辅助脚表存在耦合；先用 GPIO 开关，屏点亮后再评估 |
 | 探针暂不可用 | 无法即时验证 | 本阶段只写代码与文档；所有数值（阈值、SCLK 上限）标注为待实测 |
 
 ---
 
 ## 10. 下一步
 
-1. 用户确认 §9.1 的四个点（端点方案最关键）。
-2. 我按 P1 → P4 顺序实现，每个阶段在分支上独立提交（中文 commit）。
-3. 有板子后：构建（`cmd /c build_dfu_evklite.bat`）→ DFU 烧写（`hpm6800_flash_probe.py --no-build`）→ 跑 `script_test/spi_bridge_test.py` → 出验收数据 → 更新文档与 README。
+1. ✅ 用户已确认 §9.1 四项；方案定稿（本文档）。
+2. 按 P1 → P5 顺序实现，每个阶段在分支上独立提交（中文 commit）。
+3. 有板子后：构建（`cmd /c build_dfu_evklite.bat`）→ DFU 烧写（`hpm6800_flash_probe.py --no-build`）→ 跑 `script_test/spi_bridge_test.py` → 接屏跑 P4 → 出验收数据 → 更新文档与 README。
