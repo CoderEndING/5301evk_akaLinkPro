@@ -71,6 +71,12 @@ int riscv_jtag_write(uint32_t addr, const uint8_t *src, uint32_t len);
 void riscv_jtag_set_delay(uint32_t delay);
 uint32_t riscv_jtag_get_delay(void);
 
+/* 作废内部缓存（SBCS 配置 + 单字流水的"抱住"状态）。
+ * 主机碰过 DAP 之后必须调：OpenOCD/DFU 的复位会把 DM 的 SBCS 清零，而缓存看不出来，
+ * 后果是 SBA 读**静默返回 0**（见 rtt_bridge_note_dap_activity 的调用点）。
+ * 另外 riscv_jtag 自己也会在"距离上次 DMI 活动超过 50 ms"时强制重写配置兜底。 */
+void riscv_jtag_invalidate_cache(void);
+
 /* Last error detail: dmstatus / sbcs observed by the failed transfer. */
 uint32_t riscv_jtag_last_sbcs(void);
 uint32_t riscv_jtag_last_dmstatus(void);

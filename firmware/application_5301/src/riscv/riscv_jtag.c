@@ -71,6 +71,47 @@ static uint32_t s_sbcs_cfg;
 static uint8_t s_sbcs_valid;
 static uint8_t s_sba_failed;
 
+/* 🚨 外部同样可能把 DM 的 SBCS 清掉（OpenOCD 烧录/复位、目标板断电重上电），而
+ * "配置缓存"看不出来 —— 后果是 SBA 读**静默返回 0**（实测踩过：靶子刚用 ndmreset
+ * 烧完，探针读回全 0，而 OpenOCD 读同一地址完全正常）。两道保险：
+ *   ① DAP 通路一动就作废缓存（rtt_bridge_note_dap_activity → riscv_jtag_invalidate_cache）
+ *      —— 覆盖 OpenOCD/DFU 复位；
+ *   ② 距离上一次 DMI 活动超过 SBA_CFG_GAP 就强制重写配置 —— 覆盖目标断电/未知复位。
+ * 🚨 只靠 ② 是不够的：采样期间探针自己在连续做 DMI 扫描，**永远没有空档**，脏缓存
+ * 会一直骗下去（实测：靶子被复位后，整段采样读回同一个陈旧值）。所以再加
+ *   ③ 每 SBA_CFG_RECHECK 次操作强制重配一次 —— 把"被骗窗口"压到有界。 */
+#define SBA_CFG_GAP_TICKS (24U * 1000U * 50U)     /* 50 ms（MCHTMR 24 MHz） */
+#define SBA_CFG_RECHECK   4096U                   /* 每这么多次操作强制重配一次 */
+static uint32_t s_dmi_stamp;
+static uint32_t s_cfg_ops;
+
+static uint32_t mchtmr_now(void)
+{
+    return *(volatile uint32_t *)(HPM_MCHTMR_BASE + 0x00);
+}
+
+void riscv_jtag_invalidate_cache(void)
+{
+    s_sbcs_valid = 0U;
+    s_hold_ok = 0U;
+    s_cfg_ops = 0U;
+}
+
+/* 距离上一次 DMI 活动太久 ⇒ 认为中间可能有外部复位，把缓存作废。 */
+static uint8_t sba_cfg_stale(void)
+{
+    if ((uint32_t)(mchtmr_now() - s_dmi_stamp) > SBA_CFG_GAP_TICKS)
+    {
+        return 1U;
+    }
+    if (++s_cfg_ops >= SBA_CFG_RECHECK)
+    {
+        s_cfg_ops = 0U;
+        return 1U;                    /* 定期免检：不管中间发生过什么，强制重配一次 */
+    }
+    return 0U;
+}
+
 /* Run-Test/Idle TCK cycles inserted before every DR scan. This is not optional
  * on the HPM6880's DTM: dtmcs.idle reads 7, and without idle clocks the DTM
  * silently stops accepting requests - the response freezes at op = 3 (which
@@ -192,6 +233,7 @@ static uint64_t dmi_post(uint32_t op, uint32_t addr, uint32_t data)
 
     s_dbg[s_dbg_n & 3U] = resp;
     s_dbg_n++;
+    s_dmi_stamp = mchtmr_now();      /* 供"太久没动过就重写配置"用（见 sba_cfg_stale） */
 
     return resp;
 }
@@ -293,6 +335,13 @@ static int sba_config(uint32_t extra)
 
     /* 重新配置 sbcs 会把"抱住固定地址"的状态一起作废（见 riscv_jtag_hold_prepare）。 */
     s_hold_ok = 0U;
+
+    /* 🚨 先看是不是"太久没碰过链路"（可能有外部复位把 SBCS 清了）：是就强制重写，
+     * 否则下面的缓存命中会跳过写入，而硬件里其实还是 0 —— 读回来静默全 0。 */
+    if (sba_cfg_stale())
+    {
+        s_sbcs_valid = 0U;
+    }
 
     /* 🚨 只在**上一次操作失败过**时清 sticky 错误（理由见上面缓存那段注释）。
      * 安全性：各失败路径自己会清，块读外面还有 riscv_jtag_read() 的整块重试兜底。 */
@@ -440,6 +489,11 @@ int riscv_jtag_hold_prepare(uint32_t addr)
     if (s_open == 0U)
     {
         return -1;
+    }
+    if (sba_cfg_stale())
+    {
+        s_sbcs_valid = 0U;           /* 同上：太久没动过 ⇒ 不信缓存，重新配 */
+        s_hold_ok = 0U;
     }
     if (s_hold_ok && (s_hold_addr == addr))
     {

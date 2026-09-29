@@ -35,7 +35,9 @@ def main():
     image = argv[0] if argv else DEFAULT_IMAGE
     if not os.path.exists(image):
         raise SystemExit("image not found: %s" % image)
-    img = image.replace("\\", "/")
+    # 必须绝对化：OpenOCD 的 flash write_image 按**它自己的 cwd** 解析相对路径，
+    # 传相对路径会找不到文件（或误伤别的同名文件）。
+    img = os.path.abspath(image).replace("\\", "/")
 
     cmds = [
         "-c", "init",
@@ -49,6 +51,9 @@ def main():
         # 用 DM 的 ndmreset（cfg 里 reset_config none），绝不碰 SRST 引脚 ——
         # 20 针排线第 15 脚是探针自己的 RESET_N。
         cmds += ["-c", "reset halt", "-c", "reg pc", "-c", "resume"]
+    # 🚨 必须显式 shutdown：不加的话 OpenOCD 烧完还当服务器跑着，
+    #    subprocess 只能等到 timeout（180 s）才收场 —— 看起来像"烧录卡死"。
+    cmds += ["-c", "shutdown"]
 
     args = [OPENOCD, "-s", SCRIPTS, "-s", SDK_BOARDS, "-f", CFG] + cmds
     print("flashing %s -> %s" % (os.path.basename(image), addr))

@@ -685,6 +685,10 @@ void rtt_bridge_note_dap_activity(void)
      * 主机那条路走 SWD_Read/SWD_Write，完全绕过 swd_host。不清掉的话，
      * scope 采样器可能拿着"CSW 还是自增"的旧认知去读**别的地址**。 */
     swd_invalidate_ap_cache();
+    /* RISC-V 那边同理，而且更狠：主机用 DAP 复位/烧录会把 DM 的 SBCS 清零，而
+     * riscv_jtag 的"配置已写好"缓存看不出来 —— 不清掉的话 SBA 读会**静默返回 0**
+     * （实测：靶子刚被 ndmreset 烧完，探针读回全 0，OpenOCD 读同一地址却正常）。 */
+    riscv_jtag_invalidate_cache();
 }
 
 /* Bring-up debugging: keep the last host DAP request/response so the exact

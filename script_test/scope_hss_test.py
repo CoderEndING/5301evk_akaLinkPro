@@ -85,6 +85,26 @@ V_TWO = [   # 🚨 两个**远离**的单字 span：都是"4 字节直读"，但
     ("g_tick",     0x20001044, 4, 4),
 ]
 
+# HPM6800EVK（HPM6880，RISC-V/JTAG）靶子 script_test/hpm6800evk_scope：
+# 8 × u32 = 32 B，**偏移**在这里，基址用 --base 给（构建后用 nm 查 g_v）。
+# 靶子侧波形全部由 g_tick 算出来，所以能逐字段精确反算核对（见 verify_rv()）。
+V_RV = [
+    ("g_tick",  0, 4, 4),   # 10 kHz 计数（100 µs 一拍）
+    ("u_hi",    4, 4, 4),   # 0x10000000 | (t & 0xFFFF)
+    ("f_sin",   8, 4, 6),   # 500 Hz 正弦（20 点表）
+    ("f_tri",  12, 4, 6),   # 500 Hz 三角
+    ("i_sq1k", 16, 4, 5),   # 1 kHz 方波 ±1000
+    ("i_sq5k", 20, 4, 5),   # 5 kHz 方波 ±1000（NYQUIST 陷阱）
+    ("u_ramp", 24, 4, 4),   # t % 1000
+    ("lfsr",   28, 4, 4),   # 32 位 LFSR，每拍一步
+]
+
+# 与靶子 src/main.c 里的 kSin20 同一张表（契约的一部分）
+RV_SIN20 = [0.0, 0.309017, 0.587785, 0.809017, 0.951057,
+            1.0, 0.951057, 0.809017, 0.587785, 0.309017,
+            0.0, -0.309017, -0.587785, -0.809017, -0.951057,
+            -1.0, -0.951057, -0.809017, -0.587785, -0.309017]
+
 
 def watchdog(sec):
     def _f():
@@ -252,10 +272,66 @@ class PktStream:
         return out
 
 
+def verify_rv(samples):
+    """逐字段精确核对 HPM6800EVK scope 靶子的契约。
+
+    靶子的每个字段都是由 `g_tick` 算出来的（见 hpm6800evk_scope/src/main.c），
+    而 `g_tick` 与它们**在同一拍**被采到 —— 所以能反算核对，而不是"看着像波形"。
+    顺带证明帧内各字段来自同一瞬间（不是拼出来的）。"""
+    print("—— 靶子契约核对（每字段都由同一拍的 g_tick 反算）——")
+    n = len(samples)
+    if n == 0:
+        print("  没有样本")
+        return False
+
+    # 🚨 先确认靶子真的在动：全 0 的帧会让"f_sin == 表[0] == 0.0"和"u_ramp == 0 % 1000"
+    #    这两项**假通过**（实测踩过：探针读回全 0 时它们照样报 100% 正确）。
+    ticks = [s['g_tick'] for s in samples]
+    if max(ticks) == 0 or len(set(ticks)) == 1:
+        print("  靶子数据没在动（g_tick 恒为 %d）—— 先查靶子在不在跑 / 探针读路径（SBCS 配置）"
+              % ticks[0])
+        return False
+
+    bad = dict.fromkeys(('u_hi', 'f_sin', 'f_tri', 'i_sq1k', 'i_sq5k', 'u_ramp', 'lfsr'), 0)
+    lfsr_changes = 0
+    prev = None
+
+    for s in samples:
+        t = s['g_tick']
+        p20 = t % 20
+        if s['u_hi'] != (0x10000000 | (t & 0xFFFF)):
+            bad['u_hi'] += 1
+        if abs(s['f_sin'] - RV_SIN20[p20]) > 1e-6:
+            bad['f_sin'] += 1
+        if abs(s['f_tri'] - (((p20 if p20 < 10 else 20 - p20) / 10.0) - 1.0)) > 1e-6:
+            bad['f_tri'] += 1
+        if s['i_sq1k'] != (1000 if (t % 10) < 5 else -1000):
+            bad['i_sq1k'] += 1
+        if s['i_sq5k'] != (1000 if (t & 1) else -1000):
+            bad['i_sq5k'] += 1
+        if s['u_ramp'] != (t % 1000):
+            bad['u_ramp'] += 1
+        if s['lfsr'] == 0:
+            bad['lfsr'] += 1
+        if prev is not None and s['lfsr'] != prev:
+            lfsr_changes += 1
+        prev = s['lfsr']
+
+    ok = True
+    for k in ('u_hi', 'f_sin', 'f_tri', 'i_sq1k', 'i_sq5k', 'u_ramp', 'lfsr'):
+        good = n - bad[k]
+        print("  %-7s %6d/%d 正确%s" % (k, good, n, "" if bad[k] == 0 else "   ← %d 个不符" % bad[k]))
+        ok = ok and (bad[k] == 0)
+    print("  %-7s %6d/%d 逐拍变化%s" % ("lfsr动", lfsr_changes, max(n - 1, 0),
+                                     "" if lfsr_changes == max(n - 1, 0) else "   ← 有拍没变"))
+    print("  契约核对：%s" % ("PASS" if ok else "FAIL"))
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cmd', choices=['status', 'bench', 'run'])
-    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one', 'mixed', 'two'])
+    ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one', 'mixed', 'two', 'rv'])
     ap.add_argument('--clock', type=int, default=0, help='SWD Hz，0=不动')
     ap.add_argument('--period', type=int, default=100, help='采样周期 us')
     ap.add_argument('--iters', type=int, default=2000)
@@ -280,10 +356,16 @@ def main():
                     help='用 8 个连续 u32（base+0..28）替掉整个变量表 —— 量多通道/一个多字 span 用')
     a = ap.parse_args()
 
-    vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE, 'mixed': V_MIXED, 'two': V_TWO}[a.vset]
+    vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE, 'mixed': V_MIXED, 'two': V_TWO,
+             'rv': V_RV}[a.vset]
+    if a.vset == 'rv':
+        if not a.base:
+            print("--set rv 需要 --base <g_v 地址>（构建后 nm 查 g_v，见 hpm6800evk_scope/README.md）")
+            return 1
+        vars_ = [(n, a.base + off, sz, ty) for (n, off, sz, ty) in V_RV]
     if a.addr and a.vset == 'one':
         vars_ = [("probe_addr", a.addr, 4, 4)]
-    if a.base:
+    if a.base and a.vset != 'rv':
         vars_ = [("w%d" % i, a.base + i * 4, 4, 4) for i in range(8)]
     dev = open_hid()
 
@@ -321,9 +403,10 @@ def main():
 
     do_config(dev, a.period, vars_, a.flags)
     st = status(dev)
+    expect = {'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2, 'two': 2, 'rv': 1}[a.vset]
     print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
-          % (len(vars_), a.period, st['spans'], {'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2, 'two': 2}[a.vset]))
-    if st['spans'] != ({'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2, 'two': 2}[a.vset]):
+          % (len(vars_), a.period, st['spans'], expect))
+    if st['spans'] != expect:
         print("⚠️ span 数与本地计划不一致 —— 检查合并规则/地址")
 
     if a.cmd == 'bench':
@@ -486,7 +569,10 @@ def main():
         # 值的正确性只能靠"拿已知内容的地址采"来验（例如靶子里一段常量）：
         #   scope_hss_test.py run --riscv --set one --addr 0x1240000 --dump 6
         for i, s in enumerate(samples[:a.dump]):
-            print("  样本[%d] = %s" % (i, " ".join("%s=0x%X" % (k, v) for k, v in s.items())))
+            cells = []
+            for k, v in s.items():
+                cells.append("%s=%d" % (k, v) if isinstance(v, int) else "%s=%.6f" % (k, v))
+            print("  样本[%d] = %s" % (i, " ".join(cells)))
 
     # ★ 端到端速率：窗口内**主机实收**的样本数 ÷ 窗口时长。探针侧的 produced 增量
     #   用来把「探针自己跳拍」和「USB 没送到」分开 —— 两者看着都是掉数据，成因差很远。
@@ -501,6 +587,8 @@ def main():
               % (dprod, dprod / dt / 1000.0, ddrop, 100.0 * ddrop / max(dprod + ddrop, 1),
                  dusb, 100.0 * dusb / max(ddrop, 1)))
     # 校验按"这组里实际有哪些变量"自适应 —— 单选一个 g_tick 时没有 i_tick/u_hi
+    if a.vset == 'rv' and samples and not verify_rv(samples):
+        return 1
     if len(samples) >= 2:
         tkey = next((k for k in ('i_tick', 'g_tick', 'g_far_cnt') if k in samples[0]), None)
         if tkey is None:
