@@ -417,3 +417,15 @@ SWD 链路在 60 MHz 档就有 3431 KB/s，而 64/72 MHz 的目标只能吐出 2
 > 2026-09-27 实测记录（`script_test/evk_diag.py` 诊断固件）：
 > UART3 内部回环自测 8/8、主机 27 字节经 CDC→UART TX 全部发出（TX DMA 完成
 > 中断触发）、引脚直连自测确认 J3.8/J3.10 已短接；全速率回环 PASS。
+
+
+---
+
+## ⚠️ 2026-09-30 更新：CDC VCOM 从 UART3 换到 UART2
+
+- **CDC VCOM = UART2：PB08(TXD, J3.5) / PB09(RXD, J3.3)**（板上丝印 I2C_SCL/SDA，
+  只有 R21/R22 两颗 10 k 上拉，对 UART 无害）；
+- **log_printf / console 仍是 UART0：PA00/PA01**（J3.36/J3.38，丝印 UART_LOG_TX/RX）；
+- 原因：PB15/PB14（原 UART3 的 TXD/RXD）要让给 **SPI2 的 IO3/IO2**（USB→SPI/QSPI 桥
+  从 SPI1 搬到 SPI2，见 `docs/spi-bridge-wiring.md` §6）。UART3 在 QFN48 上没有第二组
+  可引出脚（只有未键合的 PA14/PA15），所以只能换实例。

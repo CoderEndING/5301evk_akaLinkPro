@@ -1024,3 +1024,25 @@ sb_delay_us(rd_u16(pl));        /* ← low_ms 直接喂给了"微秒"接口 */
 1. ✅ 用户已确认 §9.1 四项；方案定稿（本文档）。
 2. 按 P1 → P5 顺序实现，每个阶段在分支上独立提交（中文 commit）。
 3. 有板子后：构建（`cmd /c build_dfu_evklite.bat`）→ DFU 烧写（`hpm6800_flash_probe.py --no-build`）→ 跑 `script_test/spi_bridge_test.py` → 接屏跑 P4 → 出验收数据 → 更新文档与 README。
+
+
+---
+
+## ⚠️ 2026-09-30 更新：桥已从 SPI1 迁到 SPI2
+
+本文正文里的引脚表是 **SPI1 时代**（CS=PA26 / SCLK=PA27 / MISO=PA28 / MOSI=PA29 /
+IO2=PA30 / IO3=PA31，都在 J3 上）。因为 **PA30（USB0_PWR）被板上 Q1 常态短到地**，
+四线 QSPI 的 IO2 在这块板上无解（实测把 PA30 配成 GPIO 也拉不动），桥整体搬到了 SPI2：
+
+| 信号 | 现在 | J3 |
+|---|---|---|
+| CS | PB10 | 26 |
+| SCLK | PB11 | 13 |
+| D0/MOSI | PB13 | 28 |
+| D1/MISO | PB12 | 27 |
+| D2/IO2 | PB14 | 10 |
+| D3/IO3 | PB15 | 8 |
+
+固件侧：`SB_SPI=HPM_SPI2`、`clock_spi2`、`HPM_DMA_SRC_SPI2_TX`、CS 默认脚 PB10、
+`reserved[]={PB10..PB15}`；CDC VCOM 从 UART3(PB15/PB14) 换到 UART2(PB08/PB09)，
+console 仍是 UART0(PA00/PA01)。接线速查见 `docs/spi-bridge-wiring.md`（已按新引脚重写）。
