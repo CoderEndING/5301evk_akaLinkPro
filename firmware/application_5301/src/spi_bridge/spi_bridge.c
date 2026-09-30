@@ -2281,9 +2281,24 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
     }
 
     case SB_ACT_GET_CFG:
-        memcpy(&res_hid[4], &s_cfg, sizeof(s_cfg));
-        res_hid[1] = (uint8_t)(4U + sizeof(s_cfg));
+    {
+        /*
+         * 回报前先"消毒"：参数区（EasyFlash）里可能还留着上一版固件的辅助脚索引
+         * （SPI1 时代默认 DC=PB11 / RST=PB12 / BL=PB13 / TE=PB10），而那几根现在
+         * 是 SPI2 的 SCLK/MISO/MOSI/CS。旧值照样回报出去，主机侧的引脚图就会把
+         * DC/RST 画到 SCLK/MISO 上 —— 看着"乱套"，实际是没生效的废值。
+         * 这里统一按"现在还能不能当辅助脚"过滤，废值一律报 0（不用）。
+         */
+        sb_cfg_t out = s_cfg;
+        if (!sb_pad_usable(sb_pad_of(out.pad_dc)))    { out.pad_dc = 0U; }
+        if (!sb_pad_usable(sb_pad_of(out.pad_rst)))   { out.pad_rst = 0U; }
+        if (!sb_pad_usable(sb_pad_of(out.pad_cs_aux))){ out.pad_cs_aux = 0U; }
+        if (!sb_pad_usable(sb_pad_of(out.pad_bl)))    { out.pad_bl = 0U; }
+        if (!sb_pad_usable(sb_pad_of(out.pad_te)))    { out.pad_te = 0U; }
+        memcpy(&res_hid[4], &out, sizeof(out));
+        res_hid[1] = (uint8_t)(4U + sizeof(out));
         break;
+    }
 
     case SB_ACT_PIN_CFG:
     {
