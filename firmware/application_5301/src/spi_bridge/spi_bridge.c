@@ -1885,12 +1885,39 @@ static uint8_t sb_cfg_validate(const sb_cfg_t *c)
     return 1U;
 }
 
+/* 辅助脚索引在这套固件里还能不能用（PB10~PB15 是 SPI2 的信号线，PA30 被板上 Q1 短到地）*/
+static uint8_t sb_pad_usable(uint16_t pad)
+{
+    if (pad == 0U)
+    {
+        return 0U;
+    }
+    static const uint16_t reserved[] = {IOC_PAD_PB10, IOC_PAD_PB11, IOC_PAD_PB12,
+                                        IOC_PAD_PB13, IOC_PAD_PB14, IOC_PAD_PB15,
+                                        IOC_PAD_PA30};
+    for (uint32_t i = 0U; i < (sizeof(reserved) / sizeof(reserved[0])); i++)
+    {
+        if (pad == reserved[i])
+        {
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
 static void sb_apply_aux_pins(void)
 {
-    s_pad_dc = sb_pad_of(s_cfg.pad_dc);
-    s_pad_rst = sb_pad_of(s_cfg.pad_rst);
-    s_pad_bl = sb_pad_of(s_cfg.pad_bl);
-    s_pad_te = sb_pad_of(s_cfg.pad_te);
+    /*
+     * ⚠️ 参数区（EasyFlash）里可能还留着**上一版固件的配置**：SPI1 时代辅助脚默认是
+     * PB11/PB12/PB13（DC/RST/BL）、PB10（TE），而那几根现在已经是 SPI2 的
+     * SCLK/MISO/MOSI/CS。旧配置里 sb_cfg_validate() 会拒，但"读回来的旧配置"这条路
+     * 没人拦 —— 直接照它把脚配成 GPIO 就会把桥自己的信号线接管掉。
+     * 所以这里按"这根 pad 现在还能不能当辅助脚"过滤一遍：不能用的一律当"不用"。
+     */
+    s_pad_dc = sb_pad_usable(sb_pad_of(s_cfg.pad_dc)) ? sb_pad_of(s_cfg.pad_dc) : 0U;
+    s_pad_rst = sb_pad_usable(sb_pad_of(s_cfg.pad_rst)) ? sb_pad_of(s_cfg.pad_rst) : 0U;
+    s_pad_bl = sb_pad_usable(sb_pad_of(s_cfg.pad_bl)) ? sb_pad_of(s_cfg.pad_bl) : 0U;
+    s_pad_te = sb_pad_usable(sb_pad_of(s_cfg.pad_te)) ? sb_pad_of(s_cfg.pad_te) : 0U;
 
     if (s_pad_dc != 0U)
     {
