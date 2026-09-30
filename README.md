@@ -1151,7 +1151,7 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 | SPI 模式 0/1/2/3（CPOL/CPHA 四组合） | 全部 PASS |
 | SCLK 档位 | 20 / 40 / 60 / **75** MHz PASS（80/100 MHz 受跳线物理限制，待真从器件/LA 判） |
 | 手动 CS + `CS_HOLD` 跨帧保持 | PASS（LA 实测三帧共用一个连续 CS 窗口） |
-| 面板档线上格式（LA 逐位解 MOSI） | `spi_dcx`：`CE 5A A5` ✓；`qspi`：`02 00 00 F0 28` ✓ |
+| 面板档线上格式（LA 逐位解 MOSI） | `spi_dcx`：`CE 5A A5` ✓；`qspi` 命令字位置 09-30 订正为 `02 00 F0 00 28`（原先 `00 00 F0` 只验了实现符合预期、未验面板要求，真屏未接） |
 | 轮询 vs DMA | 都贴着 SPI 线速；DMA 固定开销 1~4.5 µs，40 MHz 约 200 B 交叉、75 MHz 约 128 B 交叉 |
 | 资源 | FLASH 127384 B (14.01%)、**DLM 106592 B 零增长**、AHB_SRAM 24880 B |
 

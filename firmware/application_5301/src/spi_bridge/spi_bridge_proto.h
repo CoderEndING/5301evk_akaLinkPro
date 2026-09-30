@@ -232,7 +232,7 @@ typedef enum
     SB_PROFILE_RAW = 0,     /* 一次 XFER：cmd + params 同线数 */
     SB_PROFILE_SPI_DCX = 1, /* 一个 CS 窗口内：命令(8bit) -> 翻 DC -> 参数 */
     SB_PROFILE_QSPI = 2,    /* opcode(默认 0x02) + 24bit 地址 + 1 线参数；
-                             * 线上是 `02 | 00 00 <面板命令字>`（命令字在地址低字节） */
+                             * 线上是 `02 | 00 <面板命令字> 00`（命令字在地址 bits[23:16]，2026-09-30 订正） */
 } sb_profile_kind_t;
 
 /* ---- pad 索引表（协议内固定，避免主机猜 IOC 编号） ---- */

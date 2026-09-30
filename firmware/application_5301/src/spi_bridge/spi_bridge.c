@@ -1221,7 +1221,8 @@ static uint8_t sb_step_spi_dcx(uint8_t cmd, uint8_t nparams, const uint8_t *para
     return st;
 }
 
-/* 档 2（qspi）：opcode + 24 bit 地址(= 面板命令字 << 16) + 1 线参数 */
+/* 档 2（qspi）：opcode + 24 bit 地址（命令字在 bits[23:16]）+ 1 线参数，
+ * 线上 = `02 | 00 <cmd> 00 | params`（ST77916 类 QSPI 屏的通行帧型） */
 static uint8_t sb_step_qspi(uint8_t cmd, uint8_t nparams, const uint8_t *params)
 {
     sb_xfer_t x;
@@ -1235,15 +1236,22 @@ static uint8_t sb_step_qspi(uint8_t cmd, uint8_t nparams, const uint8_t *params)
     x.tcfg = SB_TCFG_CMD_EN | SB_TCFG_ADDR_EN | SB_TCFG_LINES_1;
     x.addr_len = abytes;
     /*
-     * ⚠️ 命令字放在**最低字节**，不要 `<< 16`。
-     * 硬件按 addr_len 发的是**低 addr_len 个字节、MSB 在前**：实测
-     * `addr = 0x00F00000, addr_len = 3` 线上是 `F0 00 00`（LA 解的 MOSI 位流）。
-     * QSPI 屏的命令帧线上必须是 `02 | 00 00 <cmd>`（32 bit = opcode + 24 bit 地址，
-     * 命令字在地址的低字节），所以这里给 `addr = cmd`，硬件就会发 `00 00 cmd`。
-     * 这个字节序错误是 P4 用 LA 逐位解 MOSI 才发现的：原来 `cmd << 16` 发出的是
-     * `02 F0 00 00 28`，屏只会看到地址 0xF00000 —— 一条命令都认不出来。
+     * ⚠️ 命令字放在地址的 bits[23:16]（线上第二个字节）：addr = cmd << 8，
+     * 线上 = `02 | 00 <cmd> 00 | params`。历史上这里错过两版：
+     *   第一版 `cmd << 16`（LA 实测发出 `02 F0 00 00 28`，屏只看到地址 0xF00000）；
+     *   第二版改成 `addr = cmd` —— 依据是"硬件按 addr_len 发低 addr_len 个字节、
+     *   MSB 在前"（这一点 LA 验过、至今成立），但**推错了面板要的命令字位置**，
+     *   发成 `02 | 00 00 cmd`。LA 当时只验了地址字段的字节序，没验"哪个字节
+     *   装命令"——真屏从未在 QSPI 档接过，这个错误一直没暴露。
+     * 订正依据（2026-09-30，web 侧对账提出，见其 docs/spi-bridge-page.md §11.12）：
+     *   1. 本固件自己的像素写约定就是 addr=0x002C00（RAMWR 0x2C << 8）——
+     *      命令与像素走同一条线，编码位置必须一致，此前自相矛盾；
+     *   2. ST77916 类 QSPI 屏的通行帧型（ESP-IDF esp_lcd 等生态）均为
+     *      `00 <cmd> 00`：写命令 0x02、写像素 0x32@0x002C00、读 0x0B@0x002E00。
+     * 网页侧已先用直接 XFER（addr=0x002A00/0x002B00 开窗）绕开本函数；
+     * 本修复让 STEP 与之逐字节一致。真屏（ST77916）尚未接上，上板终验待做。
      */
-    x.addr = (uint32_t)cmd;
+    x.addr = ((uint32_t)cmd << 8);
     x.tx_len = nparams;
 
     if (cs_auto != 0U)

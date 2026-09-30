@@ -51,7 +51,7 @@ print("  profile block: profile=%d def_lines=%d qspi_wr=0x%02X qspi_color=0x%02X
 for cmd, params in ((0xF0, b"\x28"), (0x11, b""), (0x3A, b"\x55")):
     r = step(cmd, params)
     print("  STEP cmd=0x%02X nparams=%d -> status=%s" % (cmd, len(params), r and r["status"]))
-print("  (wire: 02 | 00 00 <cmd> | params, all 1-line)")
+print("  (wire: 02 | 00 <cmd> 00 | params, all 1-line)")
 
 print()
 print("=== profile 0 (raw): plain cmd phase + params ===")

@@ -1,4 +1,5 @@
-"""One profile-2 (QSPI) STEP frame, for LA decoding: expect 02 00 00 F0 28 on MOSI."""
+"""One profile-2 (QSPI) STEP frame, for LA decoding: expect 02 00 F0 00 28 on MOSI
+(command byte is the 2nd address byte; corrected 2026-09-30, see spi_bridge.c sb_step_qspi)."""
 import struct
 import sys
 
@@ -19,7 +20,7 @@ seq = b.next_seq()
 b.send(T.frame(T.T_STEP, payload, T.F_RSP, seq))
 r = T.parse_rsp(b.recv(2000))
 print("QSPI STEP cmd=0xF0 params=[0x28] -> status=%s" % (r and r["status"]))
-print("expect on MOSI: 02 00 00 F0 28")
+print("expect on MOSI: 02 00 F0 00 28")
 
 b.drain()
 h.close()
