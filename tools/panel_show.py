@@ -83,7 +83,7 @@ b = T.Bulk()
 cfg = bytearray(h.cfg_get())
 struct.pack_into("<I", cfg, 0, a.sclk)
 cfg[6] = 0
-cfg[8], cfg[9], cfg[11], cfg[13] = T.PADS["PB11"], T.PADS["PB12"], T.PADS["PB13"], T.PADS["PB10"]
+cfg[8], cfg[9], cfg[11], cfg[13] = T.PADS["PA02"], T.PADS["PA31"], T.PADS["PA10"], T.PADS["none"]
 cfg[12] = 0x06
 h.cfg_set(bytes(cfg))
 prof = bytearray(h.profile_get())
@@ -94,7 +94,7 @@ h.enable(0)
 h.enable(1)
 
 sclk = h.status()["sclk"]
-print("probe: sclk=%d Hz  profile=spi_dcx  dc=PB11 rst=PB12 bl=PB13 te=PB10" % sclk)
+print("probe: sclk=%d Hz  profile=spi_dcx  dc=PA02(J3[7]) rst=PA31(J3[11]) bl=PA10(J3[33]) te=none" % sclk)
 b.drain()
 
 

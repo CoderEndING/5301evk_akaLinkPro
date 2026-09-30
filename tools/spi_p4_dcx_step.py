@@ -15,9 +15,9 @@ prof[0] = T.PROFILES["spi_dcx"]
 prof[2] = 1  # dc_active_high
 h.profile_set(bytes(prof))
 cfg = bytearray(h.cfg_get())
-cfg[8] = T.PADS["PB11"]   # pad_dc
-cfg[9] = T.PADS["PB12"]   # pad_rst
-cfg[11] = T.PADS["PB13"]  # pad_bl
+cfg[8] = T.PADS["PA02"]   # pad_dc
+cfg[9] = T.PADS["PA31"]   # pad_rst
+cfg[11] = T.PADS["PA10"]  # pad_bl
 h.cfg_set(bytes(cfg))
 h.enable(0)
 h.enable(1)

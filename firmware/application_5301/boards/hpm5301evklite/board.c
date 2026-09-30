@@ -93,7 +93,8 @@ void board_init_console(void)
      */
     init_uart_pins((UART_Type *) BOARD_CONSOLE_UART_BASE);
 
-    init_uart0_clock();
+    /* 时钟跟着 BOARD_CONSOLE_UART_BASE 走：console 现在是 UART2（PB08/PB09） */
+    board_init_uart_clock((UART_Type *) BOARD_CONSOLE_UART_BASE);
 
     cfg.type = BOARD_CONSOLE_TYPE;
     cfg.base = (uint32_t)BOARD_CONSOLE_UART_BASE;
@@ -241,7 +242,7 @@ void board_init_gpio_pins(void)
 {
     init_button_pins();
     init_unused_pin_as_input();
-    init_uart3_pin_as_gpio_low();
+    init_uart2_pin_as_gpio_low();
     /* No 5V level-shifter supply on this board (no-op). */
     init_power_pins();
     /* Status LED (PA10, active low). */
@@ -287,9 +288,9 @@ uint32_t board_init_uart_clock(UART_Type *ptr)
     if (ptr == HPM_UART0) {
         init_uart0_clock();
         freq = clock_get_frequency(clock_uart0);
-    } else if (ptr == HPM_UART3) {
-        init_uart3_clock();
-        freq = clock_get_frequency(clock_uart3);
+    } else if (ptr == HPM_UART2) {
+        init_uart2_clock();
+        freq = clock_get_frequency(clock_uart2);
     }
 
     return freq;
@@ -298,8 +299,8 @@ void init_uart_pins(UART_Type *ptr)
 {
     if (ptr == HPM_UART0) {
         init_uart0_pins();
-    } else if (ptr == HPM_UART3) {
-        init_uart3_pins_as_uart();
+    } else if (ptr == HPM_UART2) {
+        init_uart2_pins_as_uart();
     } else {
         ;
     }

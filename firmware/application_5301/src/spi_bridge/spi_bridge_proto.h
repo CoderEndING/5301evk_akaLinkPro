@@ -205,7 +205,7 @@ typedef struct
     uint16_t in_ring_kb;
     uint16_t max_frame_bytes; /* v1 固定 504 */
     uint16_t reserved1;
-    /* SPI1 模块时钟目标（Hz），0 = 自动。
+    /* SPI2 模块时钟目标（Hz），0 = 自动。
      * 自动规则：模块时钟 ≤ 240 MHz，且取能**整除出目标 SCLK 的最小型号**。
      * 上板实测：模块时钟给到 PLL0 原频 720 MHz 时 SPI 一次都不移位（SCLK 全程不动、
      * TX FIFO 只进不出），所以绝不能再用 720。这个字段留作在线扫频用。 */
@@ -239,19 +239,19 @@ typedef enum
 typedef enum
 {
     SB_PAD_NONE = 0,
-    SB_PAD_PB11 = 1, /* J3[13] */
-    SB_PAD_PB12 = 2, /* J3[27] */
-    SB_PAD_PB13 = 3, /* J3[28] */
-    SB_PAD_PB10 = 4, /* J3[26]（板上标注 SPI_CS1） */
+    SB_PAD_PB11 = 1, /* J3[13]，**2026-09-30 起是 SPI2_SCLK，不能当辅助脚** */
+    SB_PAD_PB12 = 2, /* J3[27]，同上：SPI2_MISO */
+    SB_PAD_PB13 = 3, /* J3[28]，同上：SPI2_MOSI */
+    SB_PAD_PB10 = 4, /* J3[26]（板上标注 SPI_CS1），同上：SPI2_CS0 */
     SB_PAD_PA02 = 5, /* J3[7]  */
     SB_PAD_PA09 = 6, /* J3[32]（TinyUF2 按键脚，慎用） */
-    SB_PAD_PA00 = 7, /* J3[36]（UART0 TX） */
-    SB_PAD_PA01 = 8, /* J3[38]（UART0 RX） */
+    SB_PAD_PA00 = 7, /* J3[36]（UART0 TX / log 口） */
+    SB_PAD_PA01 = 8, /* J3[38]（UART0 RX / log 口） */
     SB_PAD_PY00 = 9, /* J3[29] */
     SB_PAD_PY01 = 10,/* J3[31] */
     SB_PAD_PA10 = 11,/* J3[33]（板载 LED，慎用） */
-    SB_PAD_PA30 = 12,/* J3[37]，仅在**未开 quad** 时可用作辅助脚 */
-    SB_PAD_PA31 = 13,/* J3[11]，同上 */
+    SB_PAD_PA30 = 12,/* J3[37]（USB0_PWR）：被板上 Q1 常态短到地，实测拉不动，别用 */
+    SB_PAD_PA31 = 13,/* J3[11]（USB0_ID 网络，可当慢速输出） */
     SB_PAD_MAX = 14,
 } sb_pad_t;
 

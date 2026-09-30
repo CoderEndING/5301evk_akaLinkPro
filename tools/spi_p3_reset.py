@@ -9,10 +9,10 @@ import spi_bridge_test as T  # noqa: E402
 h = T.Hid()
 b = T.Bulk()
 cfg = bytearray(h.cfg_get())
-cfg[8] = T.PADS["PB11"]   # DC
-cfg[9] = T.PADS["PB12"]   # RST
-cfg[11] = T.PADS["PB13"]  # BL
-cfg[13] = T.PADS["PB10"]  # TE
+cfg[8] = T.PADS["PA02"]   # DC
+cfg[9] = T.PADS["PA31"]   # RST
+cfg[11] = T.PADS["PA10"]  # BL
+cfg[13] = T.PADS["none"]  # TE
 cfg[12] = 0x06            # RST/CS active low
 h.cfg_set(bytes(cfg))
 h.enable(0)

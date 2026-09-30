@@ -131,20 +131,25 @@ void init_usb0_pins(void)
 }
 
 /**
- * @brief Init UART3 (PB15 TXD / PB14 RXD on J3.8/J3.10) as UART
+ * @brief Init UART2 (PB08 TXD / PB09 RXD on J3.5/J3.3) as UART
+ *
+ * 2026-09-30 迁移：CDC VCOM 原来走 UART3(PB15/PB14)，但那两根脚要腾给 SPI2 的
+ * IO2/IO3（四线 QSPI）。UART3 在 HPM5301 上只有 PB14/PB15 与 PA14/PA15 两组脚，
+ * 后者在 QFN48 上没键合（数据手册表 45：SPI3 未引出），所以必须换实例 ——
+ * UART2 的 PB08/PB09 正好在 J3 上且空闲（板上只有 R21/R22 两颗 10 k 上拉）。
  * @param None
  */
-void init_uart3_pins_as_uart(void)
+void init_uart2_pins_as_uart(void)
 {
-    HPM_IOC->PAD[IOC_PAD_PB15].FUNC_CTL = IOC_PB15_FUNC_CTL_UART3_TXD;
-    HPM_IOC->PAD[IOC_PAD_PB14].FUNC_CTL = IOC_PB14_FUNC_CTL_UART3_RXD;
+    HPM_IOC->PAD[IOC_PAD_PB08].FUNC_CTL = IOC_PB08_FUNC_CTL_UART2_TXD;
+    HPM_IOC->PAD[IOC_PAD_PB09].FUNC_CTL = IOC_PB09_FUNC_CTL_UART2_RXD;
 }
 
 /*
  * for uart_lin case, need to configure pin as gpio to sent break signal
  * pull-up
  */
-void init_uart3_pin_as_gpio_low(void)
+void init_uart2_pin_as_gpio_low(void)
 {
 }
 
@@ -165,25 +170,33 @@ void init_jtag_swd_pin(void)
 }
 
 /**
- * @brief USB→SPI/QSPI 桥的 SPI1 引脚（J3 排针）
+ * @brief USB→SPI/QSPI 桥的 **SPI2** 引脚（J3 排针）
  *
- *   SCLK = PA27 (J3[23])       MOSI/IO0 = PA29 (J3[19])
- *   MISO/IO1 = PA28 (J3[21])   CS = PA26 (J3[24]，见 hw_cs)
- *   quad 时：IO2 = PA30 (J3[37])、IO3 = PA31 (J3[11])
+ *   CS = PB10 (J3[26]，见 hw_cs)     SCLK = PB11 (J3[13])
+ *   D0/MOSI = PB13 (J3[28])          D1/MISO = PB12 (J3[27])
+ *   quad 时：D2/IO2 = PB14 (J3[10])、D3/IO3 = PB15 (J3[8])
  *
- * @param quad   1 = 把 PA30/PA31 复用成 SPI1_DAT2/DAT3（四线 QSPI）
- * @param hw_cs  1 = PA26 作硬件 CS0（每帧自动时序）；0 = 留给软件 GPIO CS
+ * 为什么从 SPI1 搬过来（2026-09-30 实测结论）：
+ *   EVKLite 的 J3 上 SPI1 的 IO2 = PA30（丝印 USB0_PWR），而那根网络经 0Ω 的 R5
+ *   直接连到 AP2151(USB0 电源开关) 的 EN 节点，节点上还挂着 2N7002(Q1) 的漏极；
+ *   Q1 的栅极由 CC1/CC2 → BAT54A 那套 ID 检测常态拉高 ⇒ Q1 常态导通，把整根网络
+ *   （含 PA30、含 J3[37]）低阻拉到地。实测把 PA30 配成 GPIO 也拉不动、LA 上全程 0 跳变，
+ *   所以 SPI1 的四线 IO2 在这块板上不可用。SPI2 的六根线在 J3 上全引出，且
+ *   PB14/PB15 上原本接的板载 CH340 是 NC（原理图 U6 = NC/CH340E），正好空着。
  *
- * 注意：**不要**照抄 SDK init_spi1_pins() 里的 LOOP_BACK 位（那是 SPI 自环测试用的，
- * 正常通信会把输出环回进输入）。
+ * @param quad   1 = 把 PB14/PB15 复用成 SPI2_DAT2/DAT3（四线 QSPI）
+ * @param hw_cs  1 = PB10 作硬件 CS0（每帧自动时序）；0 = 留给软件 GPIO CS
+ *
+ * 注意：**不要**照抄 SDK init_spi1_pins() 里除 SCLK 之外的 LOOP_BACK 位（见下）。
  */
-void init_spi1_bridge_pins(uint8_t quad, uint8_t hw_cs)
+void init_spi2_bridge_pins(uint8_t quad, uint8_t hw_cs)
 {
-    HPM_IOC->PAD[IOC_PAD_PA26].FUNC_CTL =
-        hw_cs ? IOC_PA26_FUNC_CTL_SPI1_CS_0 : IOC_PA26_FUNC_CTL_GPIO_A_26;
+    HPM_IOC->PAD[IOC_PAD_PB10].FUNC_CTL =
+        hw_cs ? IOC_PB10_FUNC_CTL_SPI2_CS_0 : IOC_PB10_FUNC_CTL_GPIO_B_10;
     /*
-     * ⚠️ PA27(SCLK) 上的 `LOOP_BACK` 位**必须留着**，这是 SDK 的
-     * hpm5301evklite/init_spi1_pins() 的原样做法（只加在 SCLK 上，MISO/MOSI 都不加）。
+     * ⚠️ PB11(SCLK) 上的 `LOOP_BACK` 位**必须留着**，这是 SDK 的
+     * hpm5301evklite/init_spi1_pins() 的原样做法（只加在 SCLK 上，MISO/MOSI 都不加），
+     * 换实例后结论不变。
      *
      * 它是"force input on"：把该 pad 的输入通路强制打开。SPI 主机发完时钟后，
      * **接收移位是靠 SCLK 这条输入通路回来打拍的** —— 少了它，波形看起来完全正常
@@ -192,26 +205,26 @@ void init_spi1_bridge_pins(uint8_t quad, uint8_t hw_cs)
      * 也就是"一个 bit 都没移进来"。
      *
      * P1 当初"特意不抄 LOOP_BACK"（以为是自环测试用的）就是这个坑的源头。
-     * 反过来也不要乱加：实测加在 PA28/PA29 上会把波形搞坏（len=4 只发 8 拍、
+     * 反过来也不要乱加：SPI1 时代实测加在 PA28/PA29 上会把波形搞坏（len=4 只发 8 拍、
      * MOSI 几乎不动），所以只在 SCLK 上按 SDK 的原样加。
      */
-    HPM_IOC->PAD[IOC_PAD_PA27].FUNC_CTL = IOC_PA27_FUNC_CTL_SPI1_SCLK | IOC_PAD_FUNC_CTL_LOOP_BACK_MASK;
-    HPM_IOC->PAD[IOC_PAD_PA28].FUNC_CTL = IOC_PA28_FUNC_CTL_SPI1_MISO;
-    HPM_IOC->PAD[IOC_PAD_PA29].FUNC_CTL = IOC_PA29_FUNC_CTL_SPI1_MOSI;
+    HPM_IOC->PAD[IOC_PAD_PB11].FUNC_CTL = IOC_PB11_FUNC_CTL_SPI2_SCLK | IOC_PAD_FUNC_CTL_LOOP_BACK_MASK;
+    HPM_IOC->PAD[IOC_PAD_PB12].FUNC_CTL = IOC_PB12_FUNC_CTL_SPI2_MISO;
+    HPM_IOC->PAD[IOC_PAD_PB13].FUNC_CTL = IOC_PB13_FUNC_CTL_SPI2_MOSI;
 
     /* 40~80 MHz 目标：这四根走 fast slew + 最大驱动 */
     const uint32_t pad_ctl = IOC_PAD_PAD_CTL_PE_SET(0) | IOC_PAD_PAD_CTL_PS_SET(0) |
                              IOC_PAD_PAD_CTL_OD_SET(0) | IOC_PAD_PAD_CTL_SR_SET(1) |
                              IOC_PAD_PAD_CTL_SPD_SET(3) | IOC_PAD_PAD_CTL_DS_SET(4);
-    HPM_IOC->PAD[IOC_PAD_PA27].PAD_CTL = pad_ctl;
-    HPM_IOC->PAD[IOC_PAD_PA28].PAD_CTL = pad_ctl;
-    HPM_IOC->PAD[IOC_PAD_PA29].PAD_CTL = pad_ctl;
+    HPM_IOC->PAD[IOC_PAD_PB11].PAD_CTL = pad_ctl;
+    HPM_IOC->PAD[IOC_PAD_PB12].PAD_CTL = pad_ctl;
+    HPM_IOC->PAD[IOC_PAD_PB13].PAD_CTL = pad_ctl;
 
     if (quad)
     {
-        HPM_IOC->PAD[IOC_PAD_PA30].FUNC_CTL = IOC_PA30_FUNC_CTL_SPI1_DAT2;
-        HPM_IOC->PAD[IOC_PAD_PA31].FUNC_CTL = IOC_PA31_FUNC_CTL_SPI1_DAT3;
-        HPM_IOC->PAD[IOC_PAD_PA30].PAD_CTL = pad_ctl;
-        HPM_IOC->PAD[IOC_PAD_PA31].PAD_CTL = pad_ctl;
+        HPM_IOC->PAD[IOC_PAD_PB14].FUNC_CTL = IOC_PB14_FUNC_CTL_SPI2_DAT2;
+        HPM_IOC->PAD[IOC_PAD_PB15].FUNC_CTL = IOC_PB15_FUNC_CTL_SPI2_DAT3;
+        HPM_IOC->PAD[IOC_PAD_PB14].PAD_CTL = pad_ctl;
+        HPM_IOC->PAD[IOC_PAD_PB15].PAD_CTL = pad_ctl;
     }
 }

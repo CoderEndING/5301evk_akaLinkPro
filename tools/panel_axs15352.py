@@ -50,10 +50,10 @@ h.profile_set(bytes(prof))
 cfg = bytearray(h.cfg_get())
 struct.pack_into("<I", cfg, 0, 40000000)   # 40 MHz：跑通工程用的就是这个档
 cfg[6] = 0                                  # cs_policy = auto GPIO CS (PA26)
-cfg[8] = T.PADS["PB11"]                     # DC
-cfg[9] = T.PADS["PB12"]                     # RST
-cfg[11] = T.PADS["PB13"]                    # BL
-cfg[13] = T.PADS["PB10"]                    # TE
+cfg[8] = T.PADS["PA02"]                     # DC
+cfg[9] = T.PADS["PA31"]                     # RST
+cfg[11] = T.PADS["PA10"]                    # BL
+cfg[13] = T.PADS["none"]                    # TE
 cfg[12] = 0x06                              # RST/CS active low
 h.cfg_set(bytes(cfg))
 h.enable(0)

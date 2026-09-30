@@ -12,7 +12,8 @@
 #define CMSIS_DAP_INTERFACE_SIZE (9 + 7 + 7 + 7)
 #define CUSTOM_HID_LEN (9 + 9 + 7 + 7)
 /* USB→SPI/QSPI 桥：vendor specific 接口 + 一对 bulk 端点（见 docs/usb-spi-bridge-plan.md）。
- * 只有引出 SPI1 排针的板子（HPM5301EVKLite）才挂上去，其他板子的枚举结果保持原样。 */
+ * 只有引出 SPI2 排针的板子（HPM5301EVKLite，2026-09-30 从 SPI1 迁到 SPI2）才挂上去，
+ * 其他板子的枚举结果保持原样。 */
 #ifndef BOARD_HAS_SPI_BRIDGE
 #define BOARD_HAS_SPI_BRIDGE (0)
 #endif

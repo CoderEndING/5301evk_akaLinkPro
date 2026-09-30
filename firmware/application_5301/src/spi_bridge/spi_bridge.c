@@ -14,7 +14,7 @@
  *     完成回调里再推下一包。OUT 同理（busy 端点重复 start_read 也会被丢）。
  *   - 延时 / RESET 脉冲都是**非阻塞**调度：到点才继续处理后续帧，主循环照常跑
  *     DAP / RTT / Scope。
- *   - CS 默认走 GPIO（PA26）而不是硬件 CS0：面板初始化需要「一个 CS 窗口内
+ *   - CS 默认走 GPIO（PB10）而不是硬件 CS0：面板初始化需要「一个 CS 窗口内
  *     命令 → 翻 DC → 参数」，硬件 CS 做不到这件事。
  */
 
@@ -38,7 +38,7 @@
 #if !defined(BOARD_HAS_SPI_BRIDGE) || (BOARD_HAS_SPI_BRIDGE == 0)
 
 /* ---------------------------------------------------------------------------
- * 本板没有 SPI1 排针引出（例如 akaLinkPro）：整个模块编成空实现，上层
+ * 本板没有 SPI 排针引出（例如 akaLinkPro）：整个模块编成空实现，上层
  * （main / api_param / usb_composite）照旧可链接，HID 0x35 回"不支持"。
  * ------------------------------------------------------------------------- */
 
@@ -84,8 +84,12 @@ uint8_t spi_bridge_is_enabled(void)
 
 /* ============================== 参数 ============================== */
 
-#define SB_SPI HPM_SPI1
-#define SB_SPI_CLK_NAME clock_spi1
+/* 2026-09-30：桥从 SPI1 搬到 SPI2。原因见 boards/hpm5301evklite/pinmux.c ——
+ * SPI1 的四线 IO2=PA30 是 USB0_PWR 网络，被板上 Q1(2N7002) 常态短到地，实测拉不动。
+ * SPI2 的六根线（PB10 CS / PB11 SCLK / PB12 MISO / PB13 MOSI / PB14 DAT2 / PB15 DAT3）
+ * 在 EVKLite 的 J3 上全引出，且 PB14/PB15 上的板载 CH340 是 NC。 */
+#define SB_SPI HPM_SPI2
+#define SB_SPI_CLK_NAME clock_spi2
 
 /* 环：OUT 32×512 B = 16 KB，IN 16×512 B = 8 KB（都在 AHB SRAM） */
 #define SB_OUT_SLOTS 32U
@@ -135,7 +139,7 @@ typedef struct
     sb_profile_t prof;
     sb_stats_t stats;
     uint32_t actual_sclk;
-    uint32_t module_clk; /* 实际生效的 SPI1 模块时钟（诊断用） */
+    uint32_t module_clk; /* 实际生效的 SPI2 模块时钟（诊断用） */
 
     volatile uint16_t out_w;
     volatile uint16_t out_r;
@@ -405,7 +409,7 @@ static inline uint8_t sb_delay_pending(void)
 
 /* ============================== CS ============================== */
 
-/* 主 CS（PA26）与辅助 CS 都按 pad_active_low bit2 决定有效电平。
+/* 主 CS（PB10）与辅助 CS 都按 pad_active_low bit2 决定有效电平。
  * 默认配置里 bit2 = 1（CS 低有效），这是所有 SPI 从器件的惯例。 */
 static void sb_cs_assert(void)
 {
@@ -440,7 +444,7 @@ static void sb_spi_apply_format(uint8_t addr_len_bytes)
 }
 
 /*
- * 选 SPI1 的模块时钟与分频，使 SCLK 尽量贴近 want_hz，返回**实际**得到的 SCLK。
+ * 选 SPI2 的模块时钟与分频，使 SCLK 尽量贴近 want_hz，返回**实际**得到的 SCLK。
  *
  * 两条硬约束（drivers/src/hpm_spi_drv.c:348）：SCLK = 模块时钟 / N，N 必须整除且为
  * **偶数**，N ≤ 510。
@@ -656,7 +660,7 @@ static void sb_spi_hw_init(void)
 
     uint8_t quad = (s_prof.profile == SB_PROFILE_QSPI) ? 1U : 0U;
     uint8_t hw_cs = (s_cfg.cs_policy == 3U) ? 1U : 0U;
-    init_spi1_bridge_pins(quad, hw_cs);
+    init_spi2_bridge_pins(quad, hw_cs);
 
     memset(&s_format, 0, sizeof(s_format));
     spi_master_get_default_format_config(&s_format);
@@ -675,7 +679,7 @@ static void sb_spi_hw_init(void)
     s_actual_sclk = sb_pick_sclk(s_cfg.sclk_hz);
     sb_dma_init();
 
-    /* CS 脚：0/2 = PA26 作 GPIO；1 = 辅助脚作 GPIO；3 = 硬件 CS0 */
+    /* CS 脚：0/2 = PB10 作 GPIO；1 = 辅助脚作 GPIO；3 = 硬件 CS0（SPI2 的 CS0 也是 PB10） */
     if (s_cfg.cs_policy == 1U)
     {
         s_cs_pad = sb_pad_of(s_cfg.pad_cs_aux);
@@ -686,7 +690,7 @@ static void sb_spi_hw_init(void)
     }
     else
     {
-        s_cs_pad = IOC_PAD_PA26;
+        s_cs_pad = IOC_PAD_PB10;
     }
     if (s_cs_pad != 0U)
     {
@@ -696,7 +700,7 @@ static void sb_spi_hw_init(void)
 
     /*
      * 自检：把三个复位位写下去，看它们能不能自清。
-     * 清不掉 = SPI1 的寄存器时钟没打开（或 IP 被挂在复位上），这时后面每一次
+     * 清不掉 = SPI2 的寄存器时钟没打开（或 IP 被挂在复位上），这时后面每一次
      * spi_control_init() 都会超时、`spi_is_active()` 又永远为真，表现就是
      * "第一帧 TIMEOUT、之后一路 BUSY"。dbg[0] = 轮询次数（0xFFFFFFFF = 清不掉），
      * dbg[1] = 自检后的 CTRL。
@@ -721,7 +725,7 @@ static void sb_spi_hw_init(void)
 /*
  * TX 数据相位走 DMA：源是 OUT 环里的槽（AHB SRAM，HPM5301 没有 L1C，
  * 不需要 cache 维护，也不需要 core_local_mem_to_sys_address 转换），
- * 目的地固定是 SPI 的 DATA 寄存器，握手走 DMAMUX 的 HPM_DMA_SRC_SPI1_TX。
+ * 目的地固定是 SPI 的 DATA 寄存器，握手走 DMAMUX 的 HPM_DMA_SRC_SPI2_TX。
  *
  * 通道由 dma_mgr 动态申请（和 CDC 的 UART3 RX/TX 同一套，不会硬编码撞车）；
  * 申请失败就 s_dma_ok=0，整条桥静默退回轮询，不影响功能。
@@ -756,7 +760,7 @@ static void sb_dma_init(void)
     cfg.dst_addr_ctrl = DMA_MGR_ADDRESS_CONTROL_FIXED;
     cfg.dst_addr = (uint32_t)&SB_SPI->DATA;
     cfg.en_dmamux = true;
-    cfg.dmamux_src = HPM_DMA_SRC_SPI1_TX;
+    cfg.dmamux_src = HPM_DMA_SRC_SPI2_TX;
     cfg.linked_ptr = (uint32_t)NULL;
     cfg.en_infiniteloop = false;
     cfg.interrupt_mask = DMA_MGR_INTERRUPT_MASK_ALL; /* 不用中断，纯轮询 TC */
@@ -1814,6 +1818,8 @@ void spi_bridge_poll(void)
 
 static uint8_t sb_pad_ok(uint8_t idx, uint8_t quad_on)
 {
+    (void)quad_on; /* SPI2 时代：quad 与否都不再占用 PA30/PA31，脚位限制看 reserved[] */
+
     if (idx == SB_PAD_NONE)
     {
         return 1U;
@@ -1826,10 +1832,12 @@ static uint8_t sb_pad_ok(uint8_t idx, uint8_t quad_on)
     {
         return 0U; /* PY00/PY01：v1 不支持 */
     }
-    if ((quad_on != 0U) && ((idx == SB_PAD_PA30) || (idx == SB_PAD_PA31)))
-    {
-        return 0U; /* quad 模式下这两脚是 IO2/IO3 */
-    }
+    /*
+     * 2026-09-30：桥搬到 SPI2 之后，quad 档占的是 PB10~PB15，与辅助脚表不再冲突
+     * （PB10~PB13 那四项由 sb_cfg_validate 的 reserved[] 兜底拒绝）。
+     * 旧的"quad 下 PA30/PA31 是 IO2/IO3"规则必须去掉，否则 PA31 当 RST 会被拒（RANGE），
+     * 而 PA30 现在也不该被推荐 —— 它是 USB0_PWR 网络，被板上 Q1 常态短到地。
+     */
     return 1U;
 }
 
@@ -1855,8 +1863,9 @@ static uint8_t sb_cfg_validate(const sb_cfg_t *c)
     {
         return 0U;
     }
-    /* 辅助脚不能撞 SPI1 的固定脚 */
-    static const uint16_t reserved[] = {IOC_PAD_PA26, IOC_PAD_PA27, IOC_PAD_PA28, IOC_PAD_PA29};
+    /* 辅助脚不能撞 SPI2 的固定脚（PB10~PB15 全是桥的信号线） */
+    static const uint16_t reserved[] = {IOC_PAD_PB10, IOC_PAD_PB11, IOC_PAD_PB12,
+                                        IOC_PAD_PB13, IOC_PAD_PB14, IOC_PAD_PB15};
     const uint8_t aux[5] = {c->pad_dc, c->pad_rst, c->pad_cs_aux, c->pad_bl, c->pad_te};
     for (uint32_t i = 0U; i < 5U; i++)
     {
@@ -2030,9 +2039,9 @@ static uint8_t sb_gpio_read(uint16_t pad)
 }
 
 /*
- * 把 MOSI(PA29)/MISO(PA28) 从 SPI 复用上摘下来当普通 GPIO，直接验三件事：
+ * 把 MOSI(PB13)/MISO(PB12) 从 SPI 复用上摘下来当普通 GPIO，直接验三件事：
  *   1) 悬空 + 下拉 / 上拉 → 读回来的电平跟得上（pad 输入通路 + 内部上下拉都好）
- *   2) 驱动 MOSI=0/1 → 读 MISO（**J3[19]↔J3[21] 那根跳线到底在不在**）
+ *   2) 驱动 MOSI=0/1 → 读 MISO（**J3[28]↔J3[27] 那根跳线到底在不在**）
  *   3) 反向驱动 MISO → 读 MOSI（双向都验，排除只坏一个 pad）
  * 跑完把 SPI 复用装回去并复位控制器，免得影响后续事务。
  *
@@ -2044,57 +2053,57 @@ static uint32_t sb_pin_test(void)
 {
     uint32_t r = 0U;
 
-    HPM_IOC->PAD[IOC_PAD_PA28].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
-    HPM_IOC->PAD[IOC_PAD_PA29].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
-    sb_gpiom_to_gpio0(IOC_PAD_PA28);
-    sb_gpiom_to_gpio0(IOC_PAD_PA29);
+    HPM_IOC->PAD[IOC_PAD_PB12].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+    HPM_IOC->PAD[IOC_PAD_PB13].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+    sb_gpiom_to_gpio0(IOC_PAD_PB12);
+    sb_gpiom_to_gpio0(IOC_PAD_PB13);
 
-    gpio_set_pin_input(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA28), GPIO_GET_PIN_INDEX(IOC_PAD_PA28));
-    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA29), GPIO_GET_PIN_INDEX(IOC_PAD_PA29));
-    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA29), GPIO_GET_PIN_INDEX(IOC_PAD_PA29), 0U);
+    gpio_set_pin_input(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB12), GPIO_GET_PIN_INDEX(IOC_PAD_PB12));
+    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB13), GPIO_GET_PIN_INDEX(IOC_PAD_PB13));
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB13), GPIO_GET_PIN_INDEX(IOC_PAD_PB13), 0U);
 
     /* 悬空 + 下拉：应读到 0 */
-    HPM_IOC->PAD[IOC_PAD_PA28].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+    HPM_IOC->PAD[IOC_PAD_PB12].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
     sb_pin_settle();
-    if (sb_gpio_read(IOC_PAD_PA28) == 0U)
+    if (sb_gpio_read(IOC_PAD_PB12) == 0U)
     {
         r |= SB_PIN_FLOAT_PD;
     }
     /* 悬空 + 上拉：应读到 1 */
-    HPM_IOC->PAD[IOC_PAD_PA28].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(1);
+    HPM_IOC->PAD[IOC_PAD_PB12].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(1);
     sb_pin_settle();
-    if (sb_gpio_read(IOC_PAD_PA28) != 0U)
+    if (sb_gpio_read(IOC_PAD_PB12) != 0U)
     {
         r |= SB_PIN_FLOAT_PU;
     }
 
     /* 跳线通断：MOSI 驱动 0/1，MISO 侧用下拉（悬空读 0，只有真通了才会读到 1） */
-    HPM_IOC->PAD[IOC_PAD_PA28].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+    HPM_IOC->PAD[IOC_PAD_PB12].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
     sb_pin_settle();
-    if (sb_gpio_read(IOC_PAD_PA28) == 0U)
+    if (sb_gpio_read(IOC_PAD_PB12) == 0U)
     {
         r |= SB_PIN_MOSI_LOW;
     }
-    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA29), GPIO_GET_PIN_INDEX(IOC_PAD_PA29), 1U);
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB13), GPIO_GET_PIN_INDEX(IOC_PAD_PB13), 1U);
     sb_pin_settle();
-    if (sb_gpio_read(IOC_PAD_PA28) != 0U)
+    if (sb_gpio_read(IOC_PAD_PB12) != 0U)
     {
         r |= SB_PIN_MOSI_HIGH;
     }
 
     /* 反向：驱动 MISO，MOSI 侧下拉读 */
-    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA28), GPIO_GET_PIN_INDEX(IOC_PAD_PA28));
-    gpio_set_pin_input(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA29), GPIO_GET_PIN_INDEX(IOC_PAD_PA29));
-    HPM_IOC->PAD[IOC_PAD_PA29].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
-    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA28), GPIO_GET_PIN_INDEX(IOC_PAD_PA28), 1U);
+    gpio_set_pin_output(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB12), GPIO_GET_PIN_INDEX(IOC_PAD_PB12));
+    gpio_set_pin_input(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB13), GPIO_GET_PIN_INDEX(IOC_PAD_PB13));
+    HPM_IOC->PAD[IOC_PAD_PB13].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+    gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB12), GPIO_GET_PIN_INDEX(IOC_PAD_PB12), 1U);
     sb_pin_settle();
-    if (sb_gpio_read(IOC_PAD_PA29) != 0U)
+    if (sb_gpio_read(IOC_PAD_PB13) != 0U)
     {
         r |= SB_PIN_MISO_DRV;
     }
 
     /* 装回 SPI 复用 + 复位控制器 */
-    init_spi1_bridge_pins((uint8_t)((s_prof.profile == SB_PROFILE_QSPI) ? 1U : 0U),
+    init_spi2_bridge_pins((uint8_t)((s_prof.profile == SB_PROFILE_QSPI) ? 1U : 0U),
                           (uint8_t)((s_cfg.cs_policy == 3U) ? 1U : 0U));
     if (s_cs_pad != 0U)
     {
@@ -2107,13 +2116,13 @@ static uint32_t sb_pin_test(void)
 }
 
 /*
- * 在 SCLK(PA27) / CS(PA26) / MOSI(PA29) 三根脚上发**慢方波**（频率各不相同、便于分辨），
+ * 在 SCLK(PB11) / CS(PB10) / MOSI(PB13) 三根脚上发**慢方波**（频率各不相同、便于分辨），
  * 纯粹验"这几根脚的焊盘和外部接线能不能动"。给 LA 用：SPI 事务看不到 SCLK 时，
  * 先用它把"控制器没出时钟"和"脚/夹子有问题"分开。
  */
 static uint32_t sb_wiggle_test(void)
 {
-    const uint16_t pads[3] = {IOC_PAD_PA27, IOC_PAD_PA26, IOC_PAD_PA29};
+    const uint16_t pads[3] = {IOC_PAD_PB11, IOC_PAD_PB10, IOC_PAD_PB13};
 
     for (uint32_t i = 0U; i < 3U; i++)
     {
@@ -2128,10 +2137,10 @@ static uint32_t sb_wiggle_test(void)
 
     for (uint32_t n = 0U; n < 100U; n++)
     {
-        gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA27), GPIO_GET_PIN_INDEX(IOC_PAD_PA27), n & 1U);
-        gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA26), GPIO_GET_PIN_INDEX(IOC_PAD_PA26),
+        gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB11), GPIO_GET_PIN_INDEX(IOC_PAD_PB11), n & 1U);
+        gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB10), GPIO_GET_PIN_INDEX(IOC_PAD_PB10),
                        (n >> 2) & 1U);
-        gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PA29), GPIO_GET_PIN_INDEX(IOC_PAD_PA29),
+        gpio_write_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(IOC_PAD_PB13), GPIO_GET_PIN_INDEX(IOC_PAD_PB13),
                        (n >> 4) & 1U);
         for (volatile uint32_t d = 0U; d < 800U; d++)
         {
@@ -2144,7 +2153,7 @@ static uint32_t sb_wiggle_test(void)
     }
 
     /* 装回 SPI 复用 */
-    init_spi1_bridge_pins((uint8_t)((s_prof.profile == SB_PROFILE_QSPI) ? 1U : 0U),
+    init_spi2_bridge_pins((uint8_t)((s_prof.profile == SB_PROFILE_QSPI) ? 1U : 0U),
                           (uint8_t)((s_cfg.cs_policy == 3U) ? 1U : 0U));
     if (s_cs_pad != 0U)
     {

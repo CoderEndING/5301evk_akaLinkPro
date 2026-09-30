@@ -42,16 +42,20 @@
 #endif
 
 /* uart section */
+/* 2026-09-30：四线 QSPI 桥从 SPI1 搬到 SPI2，PB15/PB14（原 CDC 的 UART_TXD/RXD）
+ * 要让给 SPI2 的 IO3/IO2，所以 **CDC VCOM 从 UART3(PB15/PB14) 换到 UART2(PB08/PB09)**；
+ * log_printf/console 维持原样留在 UART0(PA00/PA01)。
+ * （UART3 换不了别的脚：它在 QFN48 上只有 PB14/PB15 与未键合的 PA14/PA15。） */
 #ifndef BOARD_APP_UART_BASE
-#define BOARD_APP_UART_BASE HPM_UART3
-#define BOARD_APP_UART_IRQ IRQn_UART3
+#define BOARD_APP_UART_BASE HPM_UART2
+#define BOARD_APP_UART_IRQ IRQn_UART2
 #define BOARD_APP_UART_BAUDRATE (115200UL)
-#define BOARD_APP_UART_CLK_NAME clock_uart3
-#define BOARD_APP_UART_RX_DMA_REQ HPM_DMA_SRC_UART3_RX
-#define BOARD_APP_UART_TX_DMA_REQ HPM_DMA_SRC_UART3_TX
+#define BOARD_APP_UART_CLK_NAME clock_uart2
+#define BOARD_APP_UART_RX_DMA_REQ HPM_DMA_SRC_UART2_RX
+#define BOARD_APP_UART_TX_DMA_REQ HPM_DMA_SRC_UART2_TX
 #endif
 
-#define BOARD_APP_UART_BREAK_SIGNAL_PIN IOC_PAD_PA26
+#define BOARD_APP_UART_BREAK_SIGNAL_PIN IOC_PAD_PB08
 
 #if !defined(CONFIG_NDEBUG_CONSOLE) || !CONFIG_NDEBUG_CONSOLE
 #ifndef BOARD_CONSOLE_TYPE
@@ -115,18 +119,19 @@
 #define BOARD_PIN_JTDO          IOC_PAD_PA04
 #define BOARD_PIN_nRESET        IOC_PAD_PA08
 
-/* CDC VCOM bridge: UART3 on PB15 (TXD, J3.8) / PB14 (RXD, J3.10) - the pins
- * labelled UART_TXD/UART_RXD on the EVKLite J3 header. Independent from the
- * JTAG pins - no UART/JTAG pin muxing needed. */
-#define BOARD_PIN_UART_TXD      IOC_PAD_PB15
-#define BOARD_PIN_UART_RXD      IOC_PAD_PB14
-#define BOARD_UART_TX_FUNC      IOC_PB15_FUNC_CTL_UART3_TXD
-#define BOARD_UART_RX_FUNC      IOC_PB14_FUNC_CTL_UART3_RXD
-#define BOARD_CDC_UART_BASE     HPM_UART3
-#define BOARD_CDC_UART_IRQ      IRQn_UART3
-#define BOARD_CDC_UART_CLK_NAME clock_uart3
-#define BOARD_CDC_UART_RX_DMA   HPM_DMA_SRC_UART3_RX
-#define BOARD_CDC_UART_TX_DMA   HPM_DMA_SRC_UART3_TX
+/* CDC VCOM bridge: UART2 on PB08 (TXD, J3.5) / PB09 (RXD, J3.3) - the pins
+ * labelled I2C_SCL/I2C_SDA on the EVKLite J3 header (only R21/R22 10k pull-ups
+ * sit on them, harmless for UART). Moved here from UART3/PB15+PB14 because the
+ * SPI bridge now owns PB14/PB15 as QSPI IO2/IO3. */
+#define BOARD_PIN_UART_TXD      IOC_PAD_PB08
+#define BOARD_PIN_UART_RXD      IOC_PAD_PB09
+#define BOARD_UART_TX_FUNC      IOC_PB08_FUNC_CTL_UART2_TXD
+#define BOARD_UART_RX_FUNC      IOC_PB09_FUNC_CTL_UART2_RXD
+#define BOARD_CDC_UART_BASE     HPM_UART2
+#define BOARD_CDC_UART_IRQ      IRQn_UART2
+#define BOARD_CDC_UART_CLK_NAME clock_uart2
+#define BOARD_CDC_UART_RX_DMA   HPM_DMA_SRC_UART2_RX
+#define BOARD_CDC_UART_TX_DMA   HPM_DMA_SRC_UART2_TX
 
 /* Status LED: single board LED on PA10, active low. */
 #define BOARD_LED1_PIN          IOC_PAD_PA10
@@ -163,8 +168,10 @@
 #define BOARD_UART_DTR_PAD (0U)
 #define BOARD_UART_RTS_PAD (0U)
 
-/* USB→SPI/QSPI 转发桥：J3 排针上引出完整 SPI1（含 quad 的 PA30/PA31），见
- * docs/usb-spi-bridge-plan.md。其他板子（akaLinkPro）没这套排针定义，置 0。 */
+/* USB→SPI/QSPI 转发桥：J3 排针上引出完整 **SPI2**（PB10~PB15，含 quad 的 IO2/IO3），
+ * 见 docs/usb-spi-bridge-plan.md 与 docs/spi-bridge-wiring.md。
+ * 2026-09-30 从 SPI1 搬来：SPI1 的 IO2=PA30(USB0_PWR) 被板上 Q1 常态短到地，四线不可用。
+ * 其他板子（akaLinkPro）没这套排针定义，置 0。 */
 #define BOARD_HAS_SPI_BRIDGE (1)
 
 #if defined(__cplusplus)

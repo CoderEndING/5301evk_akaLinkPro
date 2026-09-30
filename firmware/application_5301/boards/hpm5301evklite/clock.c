@@ -60,9 +60,9 @@ void init_uart0_clock(void)
     clock_add_to_group(clock_uart0, 0);
 }
 
-void init_uart3_clock(void)
+void init_uart2_clock(void)
 {
-    clock_add_to_group(clock_uart3, 0);
+    clock_add_to_group(clock_uart2, 0);
 }
 
 void init_i2c0_clock(void)
@@ -88,6 +88,11 @@ void init_i2c3_clock(void)
 void init_spi1_clock(void)
 {
     clock_add_to_group(clock_spi1, 0);
+}
+
+void init_spi2_clock(void)
+{
+    clock_add_to_group(clock_spi2, 0);
 }
 
 void init_adc0_bus_clock(void)
