@@ -49,8 +49,7 @@ TC_LINES_1, TC_LINES_2, TC_LINES_4 = 0, 1, 2
 TC_CMD_EN, TC_ADDR_EN, TC_ADDR_QUAD, TC_DC_EN, TC_DC_LEVEL, TC_TOKEN_EN = 4, 8, 16, 32, 64, 128
 
 # ---- pad table (sb_pad_t) ----
-PADS = {"none": 0, "PB11": 1, "PB12": 2, "PB13": 3, "PB10": 4, "PA02": 5, "PA09": 6,
-        # 2026-09-30 起 PB10~PB13(1~4) 是 SPI2 的 SCLK/MISO/MOSI/CS，PA30(12) 被 Q1 短到地，都别选
+# 2026-09-30 起 PB10~PB13（索引 1~4）是 SPI2 的 SCLK/MISO/MOSI/CS，PA30(12) 被板上 Q1 短到地，都别选
 PADS = {"none": 0, "PB11": 1, "PB12": 2, "PB13": 3, "PB10": 4, "PA02": 5, "PA09": 6,
         "PA00": 7, "PA01": 8, "PY00": 9, "PY01": 10, "PA10": 11, "PA30": 12, "PA31": 13}
 PAD_NAMES = {v: k for k, v in PADS.items()}
