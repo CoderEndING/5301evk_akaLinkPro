@@ -686,6 +686,18 @@ static int scope_link_try(uint8_t be)
     return 0;
 }
 
+/* RISC-V 后端的"就绪"必须交叉校验引擎还在不在：s_swd_ready 是采样器自己记的，
+ * 引擎可能已经被主机关掉（CMD_RISCV stop、selfcheck 的收尾清理）—— 只看自己
+ * 这份会拿着死链路直接进采样循环（实测：stop 之后 bench 稳定 -4，且不会自愈）。
+ * SWD 侧对应的是 scope_link_try 里 rtt_bridge_swd_is_ready() 那道交叉检查。 */
+static void scope_be_recheck(void)
+{
+    if ((s_backend == SCOPE_BE_RISCV) && s_swd_ready && (riscv_jtag_is_open() == 0))
+    {
+        s_swd_ready = 0U;
+    }
+}
+
 /* 把链路准备好（含批量路径需要的那一次 CSW 落地）。0 = ok，其它 = 后端初始化码。
  *
  * 后端不匹配时**允许换一条路再试一次**：全局目标类型是"粘"的（上次采过 RISC-V 的板子，
@@ -694,6 +706,7 @@ static int scope_link_try(uint8_t be)
 static int scope_be_link_ready(void)
 {
     if (s_nspans == 0U) { scope_make_plan(); }
+    scope_be_recheck();
 
     int rc = scope_link_try(s_backend);
     if ((rc == 0) || ((s_flags & SCOPE_FLAG_RISCV) != 0U)) { return rc; }
@@ -749,10 +762,23 @@ static void scope_run_bench(void)
         s_bench_valid = 1U;
         return;
     }
+    /* s_swd_ready 可能是引擎被主机关掉之前的陈旧值（见 scope_be_recheck）——
+     * 不校验的话这里会直接跳过链路初始化、拿死链路采样，稳定 -4。 */
+    scope_be_recheck();
     if (!s_swd_ready)
     {
         int rc = scope_be_link_ready();
         if (rc != 0) { s_bench_err = rc; s_bench_valid = 1U; return; }
+    }
+
+    /* 采样进行中不接受标定：标定样本会写进**正在填的包缓冲**，把在飞的数据流
+     * 污染掉（bench 只测时间不验值，恰恰没人会发现）。先 STOP 再标定 —— 这本来
+     * 就是文档口径（网页的「标定真实速率」在启动推流**之前**点）。 */
+    if (s_running)
+    {
+        s_bench_err = -5;
+        s_bench_valid = 1U;
+        return;
     }
 
     /* 落点必须是**真实存在**的包缓冲：s_fill_buf 的合法值里有 0xFF 这个"没有缓冲"
@@ -761,7 +787,6 @@ static void scope_run_bench(void)
      * 先要到缓冲再取址；要不到就如实报错，绝不写越界地址。 */
     if (s_fill_buf >= SCOPE_TX_BUFS)
     {
-        if (s_running) { s_bench_err = -5; s_bench_valid = 1U; return; }
         s_fill_buf = scope_alloc_buf();
         s_fill_n = 0U;
     }
@@ -861,6 +886,13 @@ void scope_sampler_poll(void)
     {
         s_swd_err++;
         s_next_tick = now + s_period_ticks;
+        /* RISC-V 引擎被主机关掉时自愈重连（recheck 只在引擎确实关了时才清标志，
+         * SWD 的瞬态读错误不受影响）；不这么做的话每个 tick 都空转报错。 */
+        scope_be_recheck();
+        if (!s_swd_ready)
+        {
+            (void)scope_be_link_ready();
+        }
         return;
     }
 
