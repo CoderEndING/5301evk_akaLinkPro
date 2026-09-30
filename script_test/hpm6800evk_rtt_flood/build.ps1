@@ -1,4 +1,4 @@
-# Build the HPM6800EVK RTT flood firmware (HPM6880, RISC-V) with the HPM SDK env.
+﻿# Build the HPM6800EVK RTT flood firmware (HPM6880, RISC-V) with the HPM SDK env.
 #
 #   powershell -File script_test\hpm6800evk_rtt_flood\build.ps1 [-BuildType flash_xip]
 #

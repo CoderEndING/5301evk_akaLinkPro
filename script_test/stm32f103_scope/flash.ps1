@@ -1,4 +1,4 @@
-<#
+﻿<#
   用 OpenOCD + CMSIS-DAP 把 scope 测试固件烧进 STM32F103
     pwsh -File flash.ps1              # 烧录 + 校验 + 复位运行
     pwsh -File flash.ps1 -Erase       # 先整片擦除
@@ -52,8 +52,12 @@ $cmds += "program `"$elfTcl`" verify reset exit"
 Write-Output "openocd : $OpenOcd"
 Write-Output "scripts : $Scripts"
 Write-Output ("命令    : " + ($cmds -join '; '))
+# 🚨 PS 5.1 坑：EAP=Stop 时 `2>&1` 会把 native 程序写到 stderr 的**第一行**
+#    （OpenOCD 的 banner 就走 stderr）变成终止错误（pwsh 7 无此行为）。
+$ErrorActionPreference = 'Continue'
 & $OpenOcd -s $Scripts -f "$Scripts\interface\cmsis-dap.cfg" -c "cmsis-dap backend usb_bulk" `
   -f "$Scripts\target\stm32f1x.cfg" -c ($cmds -join '; ') 2>&1 |
-  ForEach-Object { $_ }
+  ForEach-Object { "$_" }
+$ErrorActionPreference = 'Stop'
 if ($LASTEXITCODE -ne 0){ throw "烧录失败 (exit $LASTEXITCODE)" }
 Write-Output "烧录完成"

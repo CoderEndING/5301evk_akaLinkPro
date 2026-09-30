@@ -169,9 +169,11 @@ def phase_scope(reg, args):
     fit = rc.linfit([1.0 / c for c, _ in pts], [t for _, t in pts])
     if fit:
         a, b, r2 = fit
-        fitm = {"fit": "T(µs) = %.3f + %.1f×(MHz/f_swd)" % (a, b * 1000.0), "r2": round(r2, 4)}
+        # x = 1/f（f 以 MHz 计）⇒ b 的单位是 µs·MHz：T(60MHz) = a + b/60
+        fitm = {"fit": "T(µs) = %.3f + %.1f×(MHz/f_swd)" % (a, b), "r2": round(r2, 4)}
         reg.emit("P3.fit", "INFO", fitm,
-                 note="单变量 M0：每 SWD MHz 的位翻转贡献 %.1f µs·MHz，固定开销 %.3f µs" % (b * 1000.0, a))
+                 note="单变量 M0：位翻转贡献 %.1f µs·MHz，固定开销 %.3f µs（例：%.1f MHz → %.2f µs）"
+                      % (b, a, pts[0][0], a + b / pts[0][0]))
         for clk, t_us in pts:
             pred = a + b / clk
             if abs(t_us - pred) > 0.25 * pred:
@@ -202,7 +204,7 @@ def phase_scope(reg, args):
     text = "\n".join(tail)
     m = {"rc": rcv}
     m["e2e"] = rc.grab(r"★ 端到端 ([\d.]+) kHz", text)
-    m["drop_pct"] = (lambda mm: float(mm.group(1)) if mm else None)(re.search(r"丢 \d+ 拍 = [\d.]+%", text))
+    m["drop_pct"] = (lambda mm: float(mm.group(1)) if mm else None)(re.search(r"丢 \d+ 拍 = ([\d.]+)%", text))
     m["jumps"] = rc.grab(r"跳变丢样本合计 (\d+)", text, cast=int, default=-1)
     start_rc = rc.grab(r"启动 rc=(-?\d+)", text, cast=int, default=-99)
     if rcv != 0 or start_rc != 0 or m["e2e"] is None:
@@ -223,7 +225,7 @@ def phase_scope(reg, args):
     text = "\n".join(tail)
     m = {"rc": rcv}
     m["e2e"] = rc.grab(r"★ 端到端 ([\d.]+) kHz", text)
-    m["drop_pct"] = (lambda mm: float(mm.group(1)) if mm else None)(re.search(r"丢 \d+ 拍 = [\d.]+%", text))
+    m["drop_pct"] = (lambda mm: float(mm.group(1)) if mm else None)(re.search(r"丢 \d+ 拍 = ([\d.]+)%", text))
     start_rc = rc.grab(r"启动 rc=(-?\d+)", text, cast=int, default=-99)
     if rcv != 0 or start_rc != 0 or m["e2e"] is None:
         reg.emit(tag, "FAIL", m, note="启动 rc=%s" % start_rc)
@@ -254,6 +256,12 @@ def main():
     ap.add_argument("--list", action="store_true", help="只打印阶段计划与基线，不跑")
     args = ap.parse_args()
 
+    # argparse 进来的是字符串：不拆分的话迭代得到的是**单个字符**，
+    # "%d" % "2" 直接把整个回归进程炸掉（实测踩过，且死在两阶段之间连
+    # RESULT 都来不及写）。
+    args.rtt_clks = [int(x) for x in str(args.rtt_clks).split(",") if x.strip()]
+    args.bench_clks = [int(x) for x in str(args.bench_clks).split(",") if x.strip()]
+
     if args.list:
         print("P1.sram    sram_speed_test.py 1~60MHz 逐字节校验；60M 基线 wall %s xfer %s"
               % (BL_SRAM_WALL["60 MHz"], BL_SRAM_XFER["60 MHz"]))
@@ -282,7 +290,14 @@ def main():
               ("P2.rtt", lambda: phase_rtt(reg, args)),
               ("P3.scope", lambda: phase_scope(reg, args))]
     for name, fn in phases:
-        ok = fn()
+        try:
+            ok = fn()
+        except Exception as exc:
+            # 阶段内的意外异常也要落一条结果（后台跑时 stdout 丢了就只剩 jsonl）
+            import traceback
+            reg.emit(name, "FAIL", {"exception": "%s: %s" % (type(exc).__name__, exc)},
+                     note=traceback.format_exc(limit=3).replace("\n", " | "))
+            ok = False
         if not ok and not args.keep_going:
             return reg.finish(name)
     return reg.finish()

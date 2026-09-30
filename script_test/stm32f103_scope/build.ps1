@@ -1,4 +1,4 @@
-<#
+﻿<#
   STM32F103 scope 测试固件编译脚本（不需要 make，也不需要 Keil）
     pwsh -File build.ps1                 # 默认 ZE（512KB flash / 64KB RAM）
     pwsh -File build.ps1 -Board c8       # 中等密度 64KB flash / 20KB RAM

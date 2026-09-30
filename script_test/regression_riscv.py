@@ -221,7 +221,7 @@ def phase_scope(reg, args):
                            300, tag)
     text = "\n".join(tail)
     m = {"rc": rcv, "e2e": rc.grab(r"★ 端到端 ([\d.]+) kHz", text),
-         "drop_pct": (lambda mm: float(mm.group(1)) if mm else None)(re.search(r"丢 \d+ 拍 = [\d.]+%", text))}
+         "drop_pct": (lambda mm: float(mm.group(1)) if mm else None)(re.search(r"丢 \d+ 拍 = ([\d.]+)%", text))}
     start_rc = rc.grab(r"启动 rc=(-?\d+)", text, cast=int, default=-99)
     if rcv != 0 or start_rc != 0 or m["e2e"] is None:
         reg.emit(tag, "FAIL", m, note="启动 rc=%s" % start_rc)

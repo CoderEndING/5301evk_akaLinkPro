@@ -1,4 +1,4 @@
-<#
+﻿<#
   STM32F103 测试固件编译脚本（不需要 make，也不需要 Keil）
 
     pwsh -File build.ps1                 # 默认 CB（128KB flash / 20KB RAM）

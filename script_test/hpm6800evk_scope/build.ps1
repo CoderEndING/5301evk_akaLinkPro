@@ -1,4 +1,4 @@
-# Build the HPM6800EVK J-Scope fixture firmware (HPM6880, RISC-V) with the HPM SDK env.
+﻿# Build the HPM6800EVK J-Scope fixture firmware (HPM6880, RISC-V) with the HPM SDK env.
 #
 #   powershell -File script_test\hpm6800evk_scope\build.ps1 [-BuildType flash_xip]
 #
