@@ -50,8 +50,10 @@ TC_CMD_EN, TC_ADDR_EN, TC_ADDR_QUAD, TC_DC_EN, TC_DC_LEVEL, TC_TOKEN_EN = 4, 8, 
 
 # ---- pad table (sb_pad_t) ----
 # 2026-09-30 起 PB10~PB13（索引 1~4）是 SPI2 的 SCLK/MISO/MOSI/CS，PA30(12) 被板上 Q1 短到地，都别选
+# 2026-09-30 新增 14~17 = PA26/PA27/PA28/PA29（SPI1 时代显示接口那四根，SPI2 迁移后固件里零引用，实测释放）
 PADS = {"none": 0, "PB11": 1, "PB12": 2, "PB13": 3, "PB10": 4, "PA02": 5, "PA09": 6,
-        "PA00": 7, "PA01": 8, "PY00": 9, "PY01": 10, "PA10": 11, "PA30": 12, "PA31": 13}
+        "PA00": 7, "PA01": 8, "PY00": 9, "PY01": 10, "PA10": 11, "PA30": 12, "PA31": 13,
+        "PA26": 14, "PA27": 15, "PA28": 16, "PA29": 17}
 PAD_NAMES = {v: k for k, v in PADS.items()}
 
 PROFILES = {"raw": 0, "spi_dcx": 1, "qspi": 2}

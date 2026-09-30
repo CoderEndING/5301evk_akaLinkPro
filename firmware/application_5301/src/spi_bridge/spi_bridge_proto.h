@@ -252,7 +252,16 @@ typedef enum
     SB_PAD_PA10 = 11,/* J3[33]（板载 LED，慎用） */
     SB_PAD_PA30 = 12,/* J3[37]（USB0_PWR）：被板上 Q1 常态短到地，实测拉不动，别用 */
     SB_PAD_PA31 = 13,/* J3[11]（USB0_ID 网络，可当慢速输出） */
-    SB_PAD_MAX = 14,
+    /* 2026-09-30 新增：J3 上原本留给 **SPI1** 显示接口的四根。桥搬到 SPI2 之后，
+     * 这份固件里它们**零引用**（SWD 走 PA06/PA07、nRESET=PA08、CDC=PB08/PB09、
+     * 控制台=PA00/PA01），板上丝印还停在 SPI1 时代 —— 实测可用，故释放成普通辅助脚。
+     * ⚠️ 若将来切到 boards/akaLinkPro 板级构建，PA26(nRESET/break)/PA27(SWCLK)/
+     * PA28(SWDIO) 会被板级定义占走，届时这三项必须重新限制。 */
+    SB_PAD_PA26 = 14,/* J3[24]（板上丝印 SPI_CS0） */
+    SB_PAD_PA27 = 15,/* J3[23]（板上丝印 SCLK） */
+    SB_PAD_PA28 = 16,/* J3[21]（板上丝印 MISO / IO1） */
+    SB_PAD_PA29 = 17,/* J3[19]（板上丝印 MOSI / IO0） */
+    SB_PAD_MAX = 18,
 } sb_pad_t;
 
 /* 内部计数器累加结构。⚠️ 它**不是** STATUS 的线序布局：STATUS（res[8..47)，10 × u32）

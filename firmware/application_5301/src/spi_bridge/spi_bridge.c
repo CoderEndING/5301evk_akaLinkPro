@@ -308,6 +308,11 @@ static inline void sb_irq_restore(uint32_t level)
     IOC_PAD_PA10,
     IOC_PAD_PA30,
     IOC_PAD_PA31,
+    /* 2026-09-30 释放：SPI1 时代显示接口用的四根，SPI2 迁移后固件里零引用（见 proto.h 说明） */
+    IOC_PAD_PA26,
+    IOC_PAD_PA27,
+    IOC_PAD_PA28,
+    IOC_PAD_PA29,
 };
 
 static uint16_t sb_pad_of(uint8_t idx)
