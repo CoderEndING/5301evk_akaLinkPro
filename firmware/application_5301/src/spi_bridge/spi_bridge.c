@@ -671,8 +671,12 @@ static void sb_spi_hw_init(void)
     s_format.common_config.lsb = false;
     s_format.common_config.mode = spi_master_mode;
     s_format.common_config.cpol = (s_cfg.mode & 0x02U) ? spi_sclk_high_idle : spi_sclk_low_idle;
-    s_format.common_config.cpha = (s_cfg.mode & 0x01U) ? spi_sclk_sampling_odd_clk_edges
-                                                       : spi_sclk_sampling_even_clk_edges;
+    /* 标准 SPI mode = CPOL<<1 | CPHA，CPHA=1 在**后沿**采样（even）、CPHA=0 在
+     * **前沿**（odd）。这里曾经把两个枚举写反（mode&1 选了 odd），回环测试发现
+     * 不了 —— 跳线短接时主机的驱动与采样用同一个 cpha，自洽就回得来；只有接上
+     * 固定 CPHA 的真器件才暴露。2026-09-30 由 web 侧 + LA + 真屏三方对账定位。 */
+    s_format.common_config.cpha = (s_cfg.mode & 0x01U) ? spi_sclk_sampling_even_clk_edges
+                                                       : spi_sclk_sampling_odd_clk_edges;
     spi_format_init(SB_SPI, &s_format);
     s_fmt_addr_len = 1U;
 
