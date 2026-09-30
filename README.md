@@ -153,9 +153,27 @@ make uart-loop   :: EVKLite CDC 全速率回环扫描
 
 ```bat
 python script_test\rtt_probe_bridge.py COM52 10       :: 桥测速 + 全流零丢包校验（最常用）
+python script_test\rtt_probe_bridge.py COM52 10 0 60  :: 同上，第 4 参指定 SWD 档（MHz，0=默认阶梯）
 python script_test\rtt_rate_matrix.py COM52           :: 逐档对照：SWD 读速 / 交付率 / 占比 / 谁主导
 python script_test\rtt_bridge_sweep.py COM52 --clk=60 :: 调优扫描：时钟 x 块大小 x 丢弃模式
 ```
+
+### 一键回归（2026-09-30）
+
+两个编排器把上面的单项测试串成回归，**每阶段/每频率档实时出结果**（控制台 +
+`build/regression/<family>.log` 人读 + `.jsonl` 机读）：
+
+| 命令 | 目标 | 内容 |
+| --- | --- | --- |
+| `make regression-swd` | F103ZE @96MHz | SRAM 1~60M 逐字节校验 + RTT 交付率/零丢（20/45/60M）+ HSS 单·多变量 bench（多档 + 拟合 `T=a+b·MHz/f`）与 run（端到端 + u_hi 误码） |
+| `make regression-riscv` | HPM6800EVK | selfcheck + 块读/写基准 + sbastat + RTT 交付/零丢（烧 flood 固件）+ HSS 单字流水完整性/契约/bench（自动换烧 scope 固件） |
+| `make regression-swd-bg` / `-riscv-bg` | 同上 | 后台执行，`make regression-swd-log` / `-riscv-log`（或 `-jsonl`）随时看进度 |
+
+判定规则：吞吐 ≥ 基线 × **80%**（`--floor` 可调，基线表在两个脚本头部、全部注明
+README 出处）；丢失/误码（RTT lost/dup、HSS u_hi 违例、SBA sticky）**必须为 0**；
+任一阶段 FAIL ⇒ 立即停止退出码 2；全程预算 `--budget` 硬超时防卡死。探针 CDC 口
+自动探测（VID/PID 匹配），要强制指定用 `make regression-swd COMREG=COM7`。
+靶子固件由编排器自动构建/烧录（`--skip-flash` 跳过）。
 
 ### SRAM 吞吐：主机驱动 vs 纯 SWD 链路
 

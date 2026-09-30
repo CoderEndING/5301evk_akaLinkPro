@@ -37,9 +37,18 @@ BOOT_DIR = firmware\bootloader_dfu
 
 PYTHON ?= python
 COM    ?= COM52
+# 回归目标默认**不传串口**：脚本按 VID/PID 自动探测探针的 CDC 口（会随 USB 口变，
+# 本机实测 COM5 → COM43）。要强制指定时：make regression-swd COMREG=COM7
+COMREG ?=
+# 回归脚本要 hidapi/pyusb/pyserial —— 这台机器上只有 Python 3.13（py 启动器）装了
+PYHID  ?= py
+REGDIR = build\regression
+COM_ARG = $(if $(COMREG),--port $(COMREG))
 
 .PHONY: all help build build-boot build-app flash flash-app dfu reset-usb clean \
         sram-test rtt-test rtt-max rtt-link uart-echo uart-loop \
+        regression-swd regression-swd-bg regression-swd-log regression-swd-jsonl \
+        regression-riscv regression-riscv-bg regression-riscv-log regression-riscv-jsonl \
         panel panel-red panel-green panel-blue panel-gradient panel-checker panel-le \
         spi-loop spi-frames spi-pintest spi-dbg spi-bench spi-info
 all: help
@@ -157,6 +166,41 @@ spi-bench:
 spi-info:
 	cd script_test && $(PYTHON) spi_bridge_test.py info
 
+# --- one-click regression ---------------------------------------------------
+# SWD  = F103ZE（SRAM 测速 / RTT 20·45·60M 交付率+零丢 / HSS 单·多变量 bench+run+拟合）
+# RISCV = HPM6800EVK（selfcheck+块基准+sbastat / RTT 交付+零丢 / HSS 完整性+bench+契约）
+# 每阶段/每频率档结果实时进 build\regression\<family>.{log,jsonl}；吞吐 < 基线 80%
+# 或错误/丢失非 0 ⇒ 立即 ERROR 退出；--budget 硬超时防卡死。COM 由 COM= 传入。
+regression-swd:
+	@echo [make] SWD regression (F103ZE) - results stream to $(REGDIR)\swd.{log,jsonl}
+	$(PYHID) script_test\regression_swd.py $(COM_ARG)
+
+regression-swd-bg:
+	@if not exist $(REGDIR) mkdir $(REGDIR)
+	@powershell -NoProfile -Command "Start-Process -WindowStyle Hidden -FilePath '$(PYHID)' -ArgumentList 'script_test\regression_swd.py' -RedirectStandardOutput '$(REGDIR)\swd.log' -RedirectStandardError '$(REGDIR)\swd.err' -PassThru | ForEach-Object { 'PID=' + $$_.Id }"
+	@echo [make] watch: make regression-swd-log   /   make regression-swd-jsonl
+
+regression-swd-log:
+	@powershell -NoProfile -Command "if (Test-Path '$(REGDIR)\swd.log') { Get-Content '$(REGDIR)\swd.log' -Tail 40 -Encoding UTF8 } else { 'no log yet' }"
+
+regression-swd-jsonl:
+	@powershell -NoProfile -Command "if (Test-Path '$(REGDIR)\swd.jsonl') { Get-Content '$(REGDIR)\swd.jsonl' -Encoding UTF8 } else { 'no jsonl yet' }"
+
+regression-riscv:
+	@echo [make] RISC-V regression (HPM6800EVK) - results stream to $(REGDIR)\riscv.{log,jsonl}
+	$(PYHID) script_test\regression_riscv.py $(COM_ARG)
+
+regression-riscv-bg:
+	@if not exist $(REGDIR) mkdir $(REGDIR)
+	@powershell -NoProfile -Command "Start-Process -WindowStyle Hidden -FilePath '$(PYHID)' -ArgumentList 'script_test\regression_riscv.py' -RedirectStandardOutput '$(REGDIR)\riscv.log' -RedirectStandardError '$(REGDIR)\riscv.err' -PassThru | ForEach-Object { 'PID=' + $$_.Id }"
+	@echo [make] watch: make regression-riscv-log   /   make regression-riscv-jsonl
+
+regression-riscv-log:
+	@powershell -NoProfile -Command "if (Test-Path '$(REGDIR)\riscv.log') { Get-Content '$(REGDIR)\riscv.log' -Tail 40 -Encoding UTF8 } else { 'no log yet' }"
+
+regression-riscv-jsonl:
+	@powershell -NoProfile -Command "if (Test-Path '$(REGDIR)\riscv.jsonl') { Get-Content '$(REGDIR)\riscv.jsonl' -Encoding UTF8 } else { 'no jsonl yet' }"
+
 clean:
 	@echo [make] cleaning evklite build dirs ...
 	rmdir /s /q $(APP_DIR)\build_dfu_evklite
@@ -189,4 +233,11 @@ help:
 	@echo   make spi-dbg     SPI register snapshot
 	@echo   make spi-bench   poll vs DMA timing
 	@echo   make spi-info    config / profile / status
+	@echo.
+	@echo   One-click regression (results stream to build\regression\*.log+jsonl):
+	@echo   make regression-swd       F103ZE: SRAM + RTT(20/45/60M) + HSS bench/run/fit
+	@echo   make regression-swd-bg    same, background   make regression-swd-log to watch
+	@echo   make regression-riscv     6800EVK: engine + RTT + HSS integrity/contract/fit
+	@echo   make regression-riscv-bg  same, background   make regression-riscv-log to watch
+	@echo   (needs PYHID interpreter with hidapi; floor 80 pct, FAIL = early exit)
 	@echo   make clean       remove evklite build directories

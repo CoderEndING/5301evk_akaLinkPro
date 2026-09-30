@@ -19,7 +19,10 @@ $env:HPM_SDK_TOOLCHAIN_VARIANT = 'gcc'
 
 $bdir = Join-Path $here "build\$buildType"
 Write-Output "building $buildType -> $bdir"
-& cmake -G Ninja -DBOARD=hpm6800evk -DHPM_BUILD_TYPE=$buildType -DCMAKE_BUILD_TYPE=debug -B $bdir -S $here
+# ⚠️ cmake 参数必须**加引号**：裸 token 里的 $buildType 不展开（scope 的 build.ps1
+#    注释记过同一坑，回归脚本经 powershell 5.1 调用时实测也会踩到 —— cmake 收到
+#    字面 "$buildtype" 报 invalid HPM_BUILD_TYPE）。
+& cmake -G Ninja "-DBOARD=hpm6800evk" "-DHPM_BUILD_TYPE=$buildType" "-DCMAKE_BUILD_TYPE=debug" -B $bdir -S $here
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & cmake --build $bdir
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

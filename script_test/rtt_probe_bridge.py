@@ -35,6 +35,11 @@ def _arg(idx, default, cast=str):
 COM = _arg(1, "COM52")
 WINDOW_S = _arg(2, 5.0, float)
 KHZ = _arg(3, 36000, int)
+# 可选第 4 参：桥的 SWD 档（MHz）。0 = 用固件默认（45M 起阶梯）。
+# 走 HID CMD_RTT action 7（ACT_CONFIG）把 s_swd_clock_req 记成该档，AUTOSTART
+# 时固件按"请求档 → 往下找第一个能用的"起链路；status 字 [11] 高 8 位是**实际**
+# 生效档，启动后打印出来（60M 长跑抖动时会自动降到 45M，这是正常行为）。
+CLK = _arg(4, 0, int)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SDK_ENV = os.environ.get("HPM_SDK_ENV_DIR", r"E:\sdk_env_v1.11.0")
@@ -223,6 +228,12 @@ def main():
         ser.read(65536)
     ser.reset_input_buffer()
 
+    if CLK > 0:
+        # ACT_CONFIG: req[4..7]=SWD clock Hz，[8..9]=chunk(0=保持)，[10]=flags，
+        # [11]=delay(0xFF=保持 Set_Clock_Delay 的档位值)。
+        rtt_cmd(dev, 7, CLK * 1000000, 0xFF000000, 0)
+        print("   requested SWD clock: %d MHz" % CLK)
+
     rtt_cmd(dev, ACT_AUTOSTART)
     # the start runs from the main loop; poll until it reports a result
     rc, words = None, None
@@ -236,6 +247,8 @@ def main():
         start_rc -= 256
     print("   start rc=%d (0=ok, negative = rtt_swd_init step)" % start_rc)
     show_status(words, "after-start")
+    if words:
+        print("   active SWD clock: %d MHz" % (words[11] >> 24))
     if start_rc != 0:
         print("   bridge refused to start")
         ser.close()
