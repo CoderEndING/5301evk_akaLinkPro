@@ -727,7 +727,7 @@ static void sb_spi_hw_init(void)
  * 不需要 cache 维护，也不需要 core_local_mem_to_sys_address 转换），
  * 目的地固定是 SPI 的 DATA 寄存器，握手走 DMAMUX 的 HPM_DMA_SRC_SPI2_TX。
  *
- * 通道由 dma_mgr 动态申请（和 CDC 的 UART3 RX/TX 同一套，不会硬编码撞车）；
+ * 通道由 dma_mgr 动态申请（和 CDC 的 UART2 RX/TX 同一套，不会硬编码撞车）；
  * 申请失败就 s_dma_ok=0，整条桥静默退回轮询，不影响功能。
  */
 static void sb_dma_init(void)

@@ -33,7 +33,7 @@
 
 | 功能 | 引脚 | 板上位置 | 说明 |
 | --- | --- | --- | --- |
-| CDC 虚拟串口（UART3） | PB15 (TXD) / PB14 (RXD) | J3.8 / J3.10 | 独立引脚，即板上丝印 UART_TXD/UART_RXD；不与 TDI/TDO 复用 |
+| CDC 虚拟串口（UART2） | PB08 (TXD) / PB09 (RXD) | J3.5 / J3.3 | 板上丝印 I2C_SCL/I2C_SDA，只有 10 k 上拉；2026-09-30 从 UART3/PB15+PB14 迁来（那两根给了 SPI2 的 IO3/IO2） |
 | USER KEY | PA03 | 板载按键 | 按下 = 高；**上电时按住进 ROM ISP** |
 | 运行时长按 USER KEY | PA03 | — | 长按 1s → 复位进 DFU 升级模式 |
 | 状态 LED | PA10 | 板载 LED2 | 低电平点亮；LED1/LED2 模式驱动同一颗灯 |
@@ -44,7 +44,7 @@
 
 | 项目 | akaLinkPro | HPM5301EVKLite |
 | --- | --- | --- |
-| SWDIO | PA28 读 + PA29 写 + PA30 方向（电平转换） | PA07 单脚双向，无方向脚 |
+| SWDIO | 单脚双向（PA07） | PA07 单脚双向，无方向脚 |
 | nRESET | PA26 经三极管反相驱动（固件极性取反） | PA08 直出（真低有效） |
 | VCOM 串口 | PA08/PA09 与 TDI/TDO 复用（JTAG 模式下串口断开） | PB15/PB14（UART3）独立，JTAG 模式下串口照常 |
 | 5V 电平转换 / VREF ADC 检测 / SEL 硬件识别 | 有（PB13/PB10/PB08/09） | 无（功能自动裁剪） |

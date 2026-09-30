@@ -12,7 +12,7 @@ Usage:
   python spi_bridge_test.py frames                   PING/DELAY/GPIO/AUX_IN/CS smoke test
   python spi_bridge_test.py status
 
-The loopback test needs a wire between J3[19] (MOSI) and J3[21] (MISO); without it
+The loopback test needs a wire between J3[28] (MOSI) and J3[27] (MISO); without it
 the reads come back as 0x00/0xFF and the test fails loudly (that is the point).
 
 Every blocking point has a short timeout and the process carries a watchdog.
@@ -49,6 +49,8 @@ TC_LINES_1, TC_LINES_2, TC_LINES_4 = 0, 1, 2
 TC_CMD_EN, TC_ADDR_EN, TC_ADDR_QUAD, TC_DC_EN, TC_DC_LEVEL, TC_TOKEN_EN = 4, 8, 16, 32, 64, 128
 
 # ---- pad table (sb_pad_t) ----
+PADS = {"none": 0, "PB11": 1, "PB12": 2, "PB13": 3, "PB10": 4, "PA02": 5, "PA09": 6,
+        # 2026-09-30 起 PB10~PB13(1~4) 是 SPI2 的 SCLK/MISO/MOSI/CS，PA30(12) 被 Q1 短到地，都别选
 PADS = {"none": 0, "PB11": 1, "PB12": 2, "PB13": 3, "PB10": 4, "PA02": 5, "PA09": 6,
         "PA00": 7, "PA01": 8, "PY00": 9, "PY01": 10, "PA10": 11, "PA30": 12, "PA31": 13}
 PAD_NAMES = {v: k for k, v in PADS.items()}
@@ -350,7 +352,7 @@ def cmd_dbg(args):
     print("reset self-test iters : 0x%08X %s" %
           (d[0], "(STUCK - reset bits never clear!)" if d[0] >= 100000 else "(cleared)"))
     print("CTRL after selftest   : 0x%08X" % d[1])
-    print("spi1 node clk         : %d Hz" % d[2])
+    print("spi node clk          : %d Hz" % d[2])
     print("actual sclk           : %d Hz" % d[3])
     print("STATUS (last xfer)    : 0x%08X  (txfull=%d rxempty=%d active=%d)" %
           (d[4], (d[4] >> 23) & 1, (d[4] >> 20) & 1, 0))
@@ -367,7 +369,7 @@ def cmd_dbg(args):
 
 
 def cmd_pintest(args):
-    """MOSI/MISO 当普通 GPIO：验 pad 输入通路 + J3[19]<->J3[21] 跳线到底通不通。"""
+    """MOSI/MISO 当普通 GPIO：验 pad 输入通路 + J3[28]<->J3[27] 跳线到底通不通。"""
     h = Hid()
     r = h.pintest()
     bits = [("MISO reads 0 while MOSI=0   ", 0, "float+PD ok"),
@@ -380,7 +382,7 @@ def cmd_pintest(args):
         print("%s: %d   %s" % (name, (r >> bit) & 1, note))
     wired = ((r >> 1) & 1) and ((r >> 0) & 1)
     print()
-    print("jumper J3[19]<->J3[21]: %s" % ("CONNECTED" if wired else "*** NOT CONNECTED (or MISO pad dead) ***"))
+    print("jumper J3[28]<->J3[27]: %s" % ("CONNECTED" if wired else "*** NOT CONNECTED (or MISO pad dead) ***"))
     h.close()
     return 0 if wired else 1
 
@@ -572,7 +574,7 @@ def main():
     c.add_argument("--cs-policy", type=int, choices=[0, 1, 2, 3], default=None, dest="cs_policy")
     c.add_argument("--threshold", type=int, default=None)
     c.add_argument("--module-clk", type=int, default=None, dest="module_clk",
-                   help="SPI1 module clock target in Hz (0 = auto); debug knob")
+                   help="SPI2 module clock target in Hz (0 = auto); debug knob")
     c.add_argument("--dc", default=None)
     c.add_argument("--rst", default=None)
     c.add_argument("--cs-aux", default=None, dest="cs_aux")

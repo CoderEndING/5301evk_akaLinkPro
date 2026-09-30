@@ -8,7 +8,7 @@ akaLinkPro (HPM5301) 固件测试脚本集合。这些脚本用于验证 **UART 
 | 板子 | CDC VCOM 引脚 | 回环短接位置 |
 | --- | --- | --- |
 | akaLinkPro | UART2 PA08(TXD)/PA09(RXD) | PA08 ↔ PA09 |
-| HPM5301EVKLite | UART3 PB15(TXD)/PB14(RXD) | **J3.8 ↔ J3.10**（丝印 UART_TXD/UART_RXD） |
+| HPM5301EVKLite | UART2 PB08(TXD)/PB09(RXD) | **J3.5 ↔ J3.3**（丝印 I2C_SCL/I2C_SDA） |
 
 > 接逻辑分析仪**不算**回环，必须把 TX 和 RX 两个脚真正短接。
 

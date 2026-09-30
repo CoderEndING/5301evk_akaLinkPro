@@ -197,7 +197,7 @@ CS↓ ─ [cmd] ─ [addr] ─ [dummy] ─ [data(tx/rx, 1/2/4 线)] ─ CS↑
  0: u32 sclk_hz            期望 SCLK（0 = 默认 20 MHz；上限 100 MHz）
  4: u8  mode               SPI 模式 0~3（CPOL/CPHA 四种组合**都实测通过**）
  5: u8  bits               固定 8
- 6: u8  cs_policy          0 = PA26 作 GPIO CS（默认，每帧自动一个 CS 窗口）
+ 6: u8  cs_policy          0 = PB10 作 GPIO CS（默认，每帧自动一个 CS 窗口）
                            1 = 辅助 GPIO 作 CS
                            2 = 手动（只有 CS 帧能改 CS）
                            3 = 硬件 CS0（**不支持面板档 1 的"一个窗口内翻 DC"**）
@@ -215,7 +215,7 @@ CS↓ ─ [cmd] ─ [addr] ─ [dummy] ─ [data(tx/rx, 1/2/4 线)] ─ CS↑
 18: u16 in_ring_kb
 20: u16 max_frame_bytes    固定 504
 22: u16 reserved1
-24: u32 module_clk_hz      **调板旋钮**：SPI1 模块时钟目标。0 = 自动（推荐）
+24: u32 module_clk_hz      **调板旋钮**：SPI2 模块时钟目标。0 = 自动（推荐）
 28: u8  reserved[4]
 ```
 
@@ -226,7 +226,8 @@ CS↓ ─ [cmd] ─ [addr] ─ [dummy] ─ [data(tx/rx, 1/2/4 线)] ─ CS↑
 | 引脚 | 无 | PB11 | PB12 | PB13 | PB10 | PA02 | PA09 | PA00 | PA01 | PY00 | PY01 | PA10 | PA30 | PA31 |
 | J3 脚 | — | 13 | 27 | 28 | 26 | 7 | 32 | 36 | 38 | 29 | 31 | 33 | 37 | 11 |
 
-- `PA30/PA31` 只有在**没开 quad**（profile ≠ 2）时才允许当辅助脚，固件会拒绝非法映射。
+- `PB10~PB13`（SPI2 的 SCLK/MISO/MOSI/CS）任何档位都不能当辅助脚；`PA30` 也别用
+  （USB0_PWR 网络被板上 Q1 常态短到地，实测拉不动）；`PA31` 现在是自由脚。
 - `PY00/PY01` 属于 PIOC 域，**v1 不支持**（固件返回 `RANGE`）。
 - `PA09` 是板载 TinyUF2 按键脚、`PA10` 是板载 LED —— 列在表里只为完整性，**默认别选**。
 - 默认建议接线（都在 J3 上）：`DC=PB11(J3.13)`、`RST=PB12(J3.27)`、`BL=PB13(J3.28)`、
@@ -272,7 +273,7 @@ def step_frame(cmd, params, delay_ms=0, rsp=False):
 ```
 配置: profile=1, dc_active_high=1, cs_hold_in_step=1, cs_policy=0(PA26 自动 CS),
       pad_dc=PB11(1), pad_rst=PB12(2), pad_bl=PB13(3), pad_te=PB10(4), sclk=40~75 MHz
-接线: SCLK=J3[23] MOSI=J3[19] CS=J3[24] DC=J3[13] RST=J3[27] BL=J3[28] TE=J3[26]
+接线: SCLK=J3[13] MOSI=J3[28] CS=J3[26] DC=J3[7] RST=J3[11] BL=J3[33]（2026-09-30 SPI2 接线）
       （屏的 VCI/VDDI 接 3V3；背光是裸 LED，LEDA/LEDK 要单独供，别指望 GPIO）
 
 序列:
@@ -369,7 +370,7 @@ STEP{cmd=0xF0, params=[28]}  →  线上：CS↓ 02 | 00 F0 00 | 28 | CS↑
 - `DBG`（10）：读 SPI 寄存器快照。里面有 `STATUS/CTRL/TRANSCTRL/TRANSFMT/TIMING`、
   写读计数、SDK 返回码、以及**失败时卡在哪一步**（stage）。
   「复位位清不掉」= IP 没时钟；「`TRANSCTRL` 里计数不对」= 参数没生效。
-- `PINTEST`（11）：把 MOSI/MISO 摘下来当普通 GPIO，直接验 **J3[19]↔J3[21] 跳线通不通**、
+- `PINTEST`（11）：把 MOSI/MISO 摘下来当普通 GPIO，直接验 **J3[28]↔J3[27] 跳线通不通**、
   pad 输入通路好不好。回环测试失败时**先跑它**，能立刻区分"线没插"和"控制器的问题"。
 - `WIGGLE`（12）：在 SCLK/CS/MOSI 上发慢方波，给逻辑分析仪验接线。
 

@@ -5,7 +5,7 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 | 板级 | 板级目录 | DAP 目标侧输出 | CDC 虚拟串口 |
 | --- | --- | --- | --- |
 | akaLinkPro（原板） | `firmware/*/boards/akaLinkPro` | 板载排针 | UART2，PA08/PA09 |
-| HPM5301EVKLite（移植） | `firmware/*/boards/hpm5301evklite` | J5 20 针 JTAG 座 | UART3，PB15/PB14 = J3.8/J3.10 |
+| HPM5301EVKLite（移植） | `firmware/*/boards/hpm5301evklite` | J5 20 针 JTAG 座 | UART2，PB08/PB09 = J3.5/J3.3 |
 
 - 主固件：`firmware/application_5301`
 - DFU/MSC Bootloader：`firmware/bootloader_dfu`
@@ -222,8 +222,8 @@ README 出处）；丢失/误码（RTT lost/dup、HSS u_hi 违例、SBA sticky�
 
 | 功能 | 引脚 | 位置 | 说明 |
 | --- | --- | --- | --- |
-| CDC 虚拟串口 TXD | PB15 | J3.8 | 板上丝印 `UART_TXD`，UART3 |
-| CDC 虚拟串口 RXD | PB14 | J3.10 | 板上丝印 `UART_RXD`，UART3 |
+| CDC 虚拟串口 TXD | PB08 | J3.5 | 板上丝印 `I2C_SCL`，UART2（2026-09-30 从 UART3/PB15 迁来） |
+| CDC 虚拟串口 RXD | PB09 | J3.3 | 板上丝印 `I2C_SDA`，UART2（2026-09-30 从 UART3/PB14 迁来） |
 | UART0 console | PA00 / PA01 | J3.36 / J3.38 | `printf` 调试口，115200-8N1 |
 | USER KEY | PA03 | 板载按键 | 按下为高；**上电时按住进 ROM ISP**，运行时长按 1s 进 DFU |
 | 状态 LED | PA10 | 板载 LED2 | 低电平点亮 |
@@ -1136,12 +1136,12 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 
 | 信号 | 引脚 | J3 脚 | | 信号 | 引脚 | J3 脚 |
 |---|---|---|---|---|---|---|
-| SPI1_CS0 | PA26 | 24 | | SPI1_MOSI / IO0 | PA29 | 19 |
-| SPI1_SCLK | PA27 | 23 | | SPI1_MISO / IO1 | PA28 | 21 |
-| **IO2**（quad） | PA30 | 37 | | **IO3**（quad） | PA31 | 11 |
+| SPI2_CS0 | PB10 | 26 | | SPI2_MOSI / IO0 | PB13 | 28 |
+| SPI2_SCLK | PB11 | 13 | | SPI2_MISO / IO1 | PB12 | 27 |
+| **IO2**（quad） | PB14 | 10 | | **IO3**（quad） | PB15 | 8 |
 
 辅助脚默认：`DC=PB11(J3.13)`、`RST=PB12(J3.27)`、`BL=PB13(J3.28)`、`CS_AUX=PB10(J3.26)`、
-`TE`（输入）= `PB10`。**验收/自测只需一根跳线**：`J3[19] ↔ J3[21]`（MOSI↔MISO）。
+`TE`（输入）= 无（PB10 已归 SPI2 的 CS）。**验收/自测只需一根跳线**：`J3[28] ↔ J3[27]`（MOSI↔MISO）。
 
 ### 实测（2026-09-29，跳线回环）
 
@@ -1176,7 +1176,7 @@ SPI 桥改了 USB 描述符（新增接口 + 一对端点）与 EP0 请求缓冲
   **WebUSB**（界面正常枚举）。
 
 > ⚠️ 一个已知的小 wart：`ENABLE 0` 关桥时**引脚保持现状**（不还原成默认复用）。
-> 也就是用过 SPI 桥之后，`PA26`（它同时是 CDC 的 UART break 脚 `BOARD_APP_UART_BREAK_SIGNAL_PIN`）
+> 也就是用过 SPI 桥之后，`PB08`（它同时是 CDC 的 UART break 脚 `BOARD_APP_UART_BREAK_SIGNAL_PIN`）
 > 会一直留在 SPI/GPIO 状态，直到重启。实测不影响 RTT/CDC 数据通路，但要用 UART break 的话
 > 得先复位探针。要改成"关桥即还原引脚"可以再做。
 
@@ -1194,7 +1194,7 @@ python spi_bridge_test.py dbg             # SPI 寄存器现场快照（卡在�
 ```
 
 > 改这块代码前请先读 `docs/usb-spi-bridge-plan.md` §5.5–§5.7：那里记着四条**只有硬件才
-> 暴露得出来**的硬约束（EP0 请求缓冲要装得下 MS OS 描述符集、SPI1 模块时钟不许顶到
+> 暴露得出来**的硬约束（EP0 请求缓冲要装得下 MS OS 描述符集、SPI 模块时钟不许顶到
 > 720 MHz、SCLK 焊盘必须带 `LOOP_BACK`、延时要有序帧流内生效）。
 
 
