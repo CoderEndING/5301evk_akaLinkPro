@@ -56,6 +56,65 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 - **配置持久化 + WebHID 上位机**：配置存 QSPI NOR（EasyFlash），`docs/index.html` 可直接改。
 - **两块硬件一套源码**：akaLinkPro 原板与 HPM5301EVKLite 移植板，靠 `board.h` 特性宏切换。
 
+## 最新进展（2026-09-30）
+
+### 一键回归双绿：SWD（F103ZE）与 RISC-V（HPM6800EVK）
+
+新增一键回归（用法见 [§测试 的一键回归小节](#一键回归2026-09-30)）：
+`make regression-swd` / `make regression-riscv`，每阶段/每频率档实时出结果
+（`build/regression/*.log + .jsonl`），吞吐 < 基线 ×80% 或误码/丢失非 0 立即
+ERROR 退出。两块靶子当天全绿：
+
+**SWD 回归（STM32F103ZE @96MHz，65.4s，14 项全 PASS）**
+
+| 阶段 | 实测 |
+| --- | --- |
+| SRAM（OpenOCD 20KB load/dump） | 1~60MHz 8 档逐字节 verified；60M xfer 写 **3384** / 读 **2928** KB/s（wall 3101/2595） |
+| RTT 交付（探针侧桥） | 20M **1391.5** / 45M **2512.0** / 60M **2954.4** KB/s，全部 LOSSLESS、rd_err=wr_err=0 |
+| HSS bench 单变量 | 60/45/30/20M = **604.9 / 530.7 / 420.6 / 320.6** kHz；拟合 **T(µs) = 0.911 + 44.1×(MHz/f_swd)**，R²=0.9999 |
+| HSS bench 8 通道 | **88.9** kHz @60M |
+| HSS run 端到端 | 单变量@3µs **321.3** kHz（探针跳拍 4.8%）；8 通道@12µs **75.9** kHz，u_hi 误码 **0** |
+
+**RISC-V 回归（HPM6800EVK / HPM6880，40s，全 PASS）**
+
+| 阶段 | 实测 |
+| --- | --- |
+| DMI/SBA 引擎 | rbench **1506.4** / wbench **1525.8** KB/s；sbastat sticky 全 0；selfcheck PASS |
+| RTT 交付 | **1385.5** KB/s，14.2MB 字节流 **0 丢 0 重** |
+| HSS 单字流水完整性 | u_hi 契约 **32364 样本 0 违例**（本节修复前每 32 拍静默坏 1 个） |
+| HSS bench | 单变量 **317.3** kHz、8 通道 **27.7** kHz（边际 ≈4.7 µs/字） |
+| HSS run | rv 8 字段契约 **PASS**（5.1 kHz）；单变量@10µs **100.5** kHz |
+
+### 二轮代码审查修复（全部上板验证）
+
+完整处置表见 [`docs/代码审查报告.md`](docs/代码审查报告.md)，按价值挑重点：
+
+- 🚨 **RISC-V 单字流水每 32 拍静默毁一个样本（P1，已修）**：`hold_read` 的周期性
+  SBCS 检查借 `dmi_read()`，其第一个 `dmi_post` 把上一拍样本当 pending 响应丢掉，
+  本拍交付的是 NOP 链上的空值 —— 实测 1324/42408 违例（恰 = 样本数/32，坏值全 0，
+  不报任何错）。改成两次原生 `dmi_post` 的流水保持式检查后 **0 违例**，顺带单字
+  M0 4.25 → **3.17 µs**（检查从 3 次扫描省成 2 次）。守门脚本
+  `script_test/riscv_pipe_integrity_test.py`。
+- **raw 通道响应缓冲挡截补全（P1，已修）**：`DAP_Transfer(0x05)` 的 count 是声明
+  值、TIMESTAMP 开着 ⇒ 一条 24B 请求可声明 255 项读（响应 2043B 写穿 1KB 缓冲）；
+  SWD/JTAG Sequence 同类。现在 Sequence 直接拒绝、Transfer 的 count 按"请求里
+  装得下的完整 item 数"钳位。守门脚本 `script_test/dap_raw_boundary_test.py`
+  （支持 `--no-target`，无 ARM 靶子也能跑拒绝/钳位/存活）。
+- **SPI 桥 DMA 通道泄漏（P2，已修）**：每次 SET_CFG/SET_PROFILE/重 ENABLE 泄漏一个
+  DMA 通道，几轮后申请必然失败、桥静默退回轮询 —— 重配先 release；实测 16 轮
+  重配后 `tx_dma_cnt` 仍正常。
+- **SPI 桥硬件初始化下沉主循环（P2，已修）**：ENABLE/SET_CFG/SET_PROFILE 原先在
+  USB 中断里同步做时钟源扫描 + SPI 复位轮询 + DMA 申请（数百 µs，还会打断主循环
+  正在跑的 CS 窗口）—— ISR 只置标志；ENABLE 到应答 4ms。
+- **scope 引擎被主机 stop 后自愈（已修）**：`s_swd_ready` 不交叉校验
+  `riscv_jtag_is_open()`，`CMD_RISCV stop` 之后 bench/采样稳定 -4 且永不自愈 ——
+  recheck 挂进链路/bench/采样错误路径三处。
+- **一批 P3**：ABORT 现在连 IN 队列一起清、清环挪进临界区；`sb_delay_us` 超长延时
+  截断（防 `(int32_t)` 到点判定失效）；scope bench 拒绝运行态调用；6 个 .ps1 补
+  UTF-8 BOM + flash.ps1 对 OpenOCD stderr 降级 —— 都是 PowerShell 5.1 与 pwsh 7
+  的行为差异，脚本经 `powershell -File`（回归编排器）调用才会踩到，手动 pwsh 跑
+  从来不会暴露。
+
 ## HPM5301EVKLite 引脚与接线
 
 ### DAP 目标调试口（J5，同时是芯片自身 JTAG）
