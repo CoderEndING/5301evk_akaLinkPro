@@ -104,6 +104,11 @@ uint8_t spi_bridge_is_enabled(void)
 
 #define SB_MTIME (*(volatile uint32_t *)(HPM_MCHTMR_BASE + 0x00U))
 
+/* HID 配置块按字节原样拷进 sb_cfg_t（SET_CFG），布局变了主机侧就错位 ——
+ * 编译期钉死，改字段必须同步脚本（spi_bridge_test.py 按显式偏移打包）。 */
+_Static_assert(sizeof(sb_cfg_t) == 32U, "sb_cfg_t layout changed: sync spi_bridge_proto.h + host tools");
+_Static_assert(sizeof(sb_profile_t) == 16U, "sb_profile_t layout changed: sync host tools");
+
 /* MCHTMR = osc24m，固定 24 MHz（见 sb_delay_us 的说明） */
 #define SB_MCHTMR_HZ 24000000UL
 
@@ -179,6 +184,12 @@ typedef struct
     volatile uint8_t reset_req;
     volatile uint8_t usb_reset_req; /* 总线复位：在飞传输作废、回调不会来，必须清在飞标志 */
     volatile uint8_t abort_req;
+    /* 硬件重初始化请求（ISR 置位、主循环执行）：ENABLE=1 与 enabled 状态下的
+     * SET_CFG / SET_PROFILE 都要走一次 sb_spi_hw_init —— 时钟源扫描 + SPI 复位
+     * 轮询 + DMA 申请，可达数百 µs。绝不能在 USB 中断里同步做：既长时间挡住
+     * USB/DAP 的中断，又会打断主循环正在跑的 CS 窗口（SPI 格式/时钟/DMA 通道
+     * 在事务中间被换掉）。 */
+    volatile uint8_t hw_req;
 
     uint16_t cs_pad; /* GPIO 模式下生效的 CS 脚；0 = 用硬件 CS0 */
     volatile uint8_t cs_asserted;
@@ -231,6 +242,7 @@ static sb_state_t s_st;
 #define s_reset_req (s_st.reset_req)
 #define s_usb_reset_req (s_st.usb_reset_req)
 #define s_abort_req (s_st.abort_req)
+#define s_hw_req (s_st.hw_req)
 #define s_cs_pad (s_st.cs_pad)
 #define s_cs_asserted (s_st.cs_asserted)
 #define s_pad_dc (s_st.pad_dc)
@@ -365,6 +377,13 @@ static void sb_delay_us(uint32_t us)
     if (ticks == 0ULL)
     {
         ticks = 1ULL; /* 至少让出一次主循环 */
+    }
+    if (ticks > 0x7FFFFFFFULL)
+    {
+        /* 到点判定用的是 (int32_t)(now - until) < 0：deadline 必须落在 now 的
+         * +2^31 以内，否则符号比较直接失效（延时会被当成"早就到点"）。超长
+         * 延时（≥ ~89 s）截到上界 —— 面板场景最长 200 ms，正常碰不到。 */
+        ticks = 0x7FFFFFFFULL;
     }
     s_delay_until = SB_MTIME + (uint32_t)ticks;
     s_delay_active = 1U;
@@ -628,6 +647,8 @@ static void sb_dma_init(void);
 static hpm_stat_t sb_dma_tx_start(const uint8_t *tx, uint32_t len);
 static hpm_stat_t sb_dma_tx_wait(void);
 static hpm_stat_t sb_spi_rx_poll(uint8_t *rx, uint32_t rlen);
+/* 硬件重初始化（实现在配置块段；spi_bridge_poll 在它之前就要用） */
+static void sb_hw_apply(void);
 
 static void sb_spi_hw_init(void)
 {
@@ -710,6 +731,15 @@ static void sb_dma_init(void)
     dma_mgr_chn_conf_t cfg;
 
     s_dma_ok = 0U;
+    /* 上一条通道还在就先还回去。这条路在再次 ENABLE=1 和 enabled 状态下的
+     * SET_CFG / SET_PROFILE 都会重走（sb_spi_hw_init → 这里），不释放直接把
+     * s_dma 覆盖掉的话，每改一次配置就泄漏一个 DMA 通道 —— 池本来就小（CDC 已占
+     * 2 个），几轮重配后 dma_mgr_request_resource 必然失败，桥静默退回轮询且
+     * 重启前无法恢复。 */
+    if (s_dma.base != NULL)
+    {
+        (void)dma_mgr_release_resource(&s_dma);
+    }
     memset(&s_dma, 0, sizeof(s_dma));
     if (dma_mgr_request_resource(&s_dma) != status_success)
     {
@@ -1664,10 +1694,17 @@ void spi_bridge_poll(void)
          *      代数只在 USB 总线复位（传输被硬件作废）时才 +1。
          */
         s_reset_req = 0U;
-        s_out_r = s_out_w;
-        s_out_used = 0U;
-        s_in_r = s_in_w;
-        s_in_used = 0U;
+        /* 清环的读-改-写必须与 out_done/in_done（ISR）互斥：不关中断的话，
+         * "s_out_r = s_out_w" 与 ISR 的 "s_out_w++ / s_out_used++" 交错会把
+         * 刚收下的那包卡在 used=0 的环里（永远不被执行，槽位静默泄漏）。 */
+        {
+            uint32_t lvl = sb_irq_save();
+            s_out_r = s_out_w;
+            s_out_used = 0U;
+            s_in_r = s_in_w;
+            s_in_used = 0U;
+            sb_irq_restore(lvl);
+        }
         s_pkt_active = 0U;
         s_pkt_off = 0U;
         s_pkt_len = 0U;
@@ -1677,8 +1714,16 @@ void spi_bridge_poll(void)
     if (s_abort_req != 0U)
     {
         s_abort_req = 0U;
-        s_out_r = s_out_w;
-        s_out_used = 0U;
+        /* ABORT 的契约是"丢弃未处理帧**与 IN 队列**"（spi_bridge_proto.h）——
+         * OUT 与 IN 两侧一起清，同样要跟完成回调互斥。 */
+        {
+            uint32_t lvl = sb_irq_save();
+            s_out_r = s_out_w;
+            s_out_used = 0U;
+            s_in_r = s_in_w;
+            s_in_used = 0U;
+            sb_irq_restore(lvl);
+        }
         s_pkt_active = 0U;
         s_pkt_off = 0U;
         s_pkt_len = 0U;
@@ -1689,6 +1734,14 @@ void spi_bridge_poll(void)
     if (s_enabled == 0U)
     {
         return;
+    }
+
+    if (s_hw_req != 0U)
+    {
+        /* ISR 登记的硬件重初始化在这里落地（ENABLE / SET_CFG / SET_PROFILE）。
+         * 放在 sb_process_packets 之前，保证任何帧执行时硬件已经就绪。 */
+        s_hw_req = 0U;
+        sb_hw_apply();
     }
 
     sb_in_kick();
@@ -1840,6 +1893,16 @@ static void sb_apply_aux_pins(void)
     }
 }
 
+/* 硬件落地（时钟源扫描 / SPI 复位自检 / DMA 申请 / 辅助脚）。重活：ISR 只登记
+ * s_hw_req，真正执行在主循环 spi_bridge_poll() 里 —— 帧只在 poll 里执行、且
+ * hw_req 的处理排在 sb_process_packets 之前，所以硬件就绪前主机塞进来的帧只会
+ * 在环里排队，不会拿着没初始化的 SPI 跑。 */
+static void sb_hw_apply(void)
+{
+    sb_spi_hw_init();
+    sb_apply_aux_pins();
+}
+
 static void sb_set_enabled(uint8_t on)
 {
     if (on != 0U)
@@ -1850,8 +1913,7 @@ static void sb_set_enabled(uint8_t on)
             {
                 s_reset_req = 1U;
             }
-            sb_spi_hw_init();
-            sb_apply_aux_pins();
+            s_hw_req = 1U;   /* 不在 USB ISR 里做时钟扫描/SPI 复位/DMA 申请 */
         }
         s_enabled = 1U;
         sb_out_kick();
@@ -1859,6 +1921,7 @@ static void sb_set_enabled(uint8_t on)
     else
     {
         s_enabled = 0U;
+        s_hw_req = 0U;       /* 都要关了，挂着的重初始化不必再做 */
         s_reset_req = 1U; /* 关掉时把环与状态清干净；引脚保持现状 */
     }
 }
@@ -2166,8 +2229,7 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         s_cfg = c;
         if (s_enabled != 0U)
         {
-            sb_spi_hw_init();
-            sb_apply_aux_pins();
+            s_hw_req = 1U;   /* 硬件重初始化下沉主循环（见 sb_hw_apply） */
         }
         wr_u32(&res_hid[4], sb_status_word());
         res_hid[1] = 8U;
@@ -2275,8 +2337,7 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         }
         if (s_enabled != 0U)
         {
-            sb_spi_hw_init();
-            sb_apply_aux_pins();
+            s_hw_req = 1U;   /* 换档可能要重配引脚/时钟（quad↔单线），同样下沉主循环 */
         }
         wr_u32(&res_hid[4], sb_status_word());
         res_hid[1] = 8U;

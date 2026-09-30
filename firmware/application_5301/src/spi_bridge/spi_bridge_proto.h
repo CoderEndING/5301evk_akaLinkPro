@@ -66,9 +66,10 @@ typedef enum
 #define SB_F_RSP (1U << 0)       /* 要求回一个应答包 */
 #define SB_F_CS_HOLD (1U << 1)   /* 本帧后保持 CS 有效 */
 #define SB_F_CS_OFF (1U << 2)    /* 本帧后释放 CS */
-#define SB_F_CS_AUX (1U << 3)    /* 本次用辅助 CS 线（默认硬件 CS0） */
 #define SB_F_NO_DMA (1U << 4)    /* 强制轮询 */
 #define SB_F_FORCE_DMA (1U << 5) /* 强制 DMA */
+/* bit3 (0x08) 保留：曾叫 SB_F_CS_AUX，v1 固件从未实现过（CS 线由配置块的
+ * cs_policy 决定，帧级没法逐帧改）。复用这位前先实现它。 */
 
 /* ---- SB_T_XFER 的 12 B 传输头 ---- */
 typedef struct
@@ -183,7 +184,8 @@ typedef enum
 #define SB_ST_OUT_FULL (1U << 4) /* OUT 环接近满 */
 #define SB_ST_SHIFT_ERR 8U       /* 最近错误码（bit8..15） */
 
-/* ---- 配置块（SET_CFG / GET_CFG），总长 32 B ---- */
+/* ---- 配置块（SET_CFG / GET_CFG），sizeof = 32 B（自然对齐；spi_bridge.c 有
+ *      _Static_assert 把关，改字段必须同步主机侧打包偏移） ---- */
 typedef struct
 {
     uint32_t sclk_hz;       /* 期望 SCLK，0 = 板级默认（20 MHz） */
@@ -253,7 +255,12 @@ typedef enum
     SB_PAD_MAX = 14,
 } sb_pad_t;
 
-/* 计数器区（STATUS 的 res[8..]）：8 × u32 小端 */
+/* 内部计数器累加结构。⚠️ 它**不是** STATUS 的线序布局：STATUS（res[8..47)，10 × u32）
+ * 按下面的顺序发，frames_err 在 actual_sclk **之后**（末尾第二个），别按本结构
+ * 的字段顺序去解线上的包（见 docs/web-handoff-spi-bridge.md §4.2）：
+ *   [8] frames_ok  [12] bytes_tx  [16] bytes_rx  [20] tx_poll_cnt  [24] tx_dma_cnt
+ *   [28] out_ring_overrun  [32] in_ring_drop  [36] actual_sclk  [40] frames_err
+ *   [44] last_ticks */
 typedef struct
 {
     uint32_t frames_ok;
