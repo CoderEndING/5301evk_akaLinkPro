@@ -7,9 +7,17 @@
 #include "DAP.h"
 #include "cdc_interface.h"
 #include "scope_sampler.h"
+#include "spi_bridge.h"
 
 #define CMSIS_DAP_INTERFACE_SIZE (9 + 7 + 7 + 7)
 #define CUSTOM_HID_LEN (9 + 9 + 7 + 7)
+/* USB→SPI/QSPI 桥：vendor specific 接口 + 一对 bulk 端点（见 docs/usb-spi-bridge-plan.md）。
+ * 只有引出 SPI1 排针的板子（HPM5301EVKLite）才挂上去，其他板子的枚举结果保持原样。 */
+#ifndef BOARD_HAS_SPI_BRIDGE
+#define BOARD_HAS_SPI_BRIDGE (0)
+#endif
+#define SPI_BRIDGE_ENABLE (BOARD_HAS_SPI_BRIDGE)
+#define SPI_BRIDGE_INTERFACE_SIZE (9 + 7 + 7)
 #define DFU_RUNTIME_INTERFACE_SIZE (9 + 9)
 
 #define HIDRAW_INTERVAL 10
@@ -35,9 +43,19 @@
 #define USBD_WINUSB_DESC_SET_LEN (WINUSB_DESCRIPTOR_SET_HEADER_SIZE +        \
                                   USBD_WEBUSB_ENABLE * FUNCTION_SUBSET_LEN + \
                                   USBD_BULK_ENABLE * FUNCTION_SUBSET_LEN +   \
+                                  SPI_BRIDGE_ENABLE * FUNCTION_SUBSET_LEN +  \
                                   USBD_DFU_RUNTIME_ENABLE * FUNCTION_SUBSET_LEN)
 
 #define USBD_NUM_DEV_CAPABILITIES (USBD_WEBUSB_ENABLE + USBD_WINUSB_ENABLE)
+
+/* CherryUSB serves the MS OS 2.0 descriptor set through the shared EP0 request
+ * buffer and STALLs the request when it does not fit ("Request buffer too
+ * small", usbd_core.c). A stalled WCID request makes Windows fail the whole
+ * composite device (Code 10) - no HID, no bulk, nothing. Keep the two numbers
+ * tied together at compile time. */
+#if (USBD_WINUSB_DESC_SET_LEN > CONFIG_USBDEV_REQUEST_BUFFER_LEN)
+#error "MS OS 2.0 descriptor set does not fit into CONFIG_USBDEV_REQUEST_BUFFER_LEN (see src/usb/usb_config.h)"
+#endif
 
 #define USBD_WEBUSB_DESC_LEN 24
 #define USBD_WINUSB_DESC_LEN 28
@@ -49,13 +67,15 @@
 #define USB_CONFIG_SIZE (9 +                                                    \
                          CMSIS_DAP_INTERFACE_SIZE + CDC_ACM_DESCRIPTOR_LEN +    \
                          CONFIG_CHERRYDAP_USE_CUSTOM_HID * CUSTOM_HID_LEN +     \
+                         SPI_BRIDGE_ENABLE * SPI_BRIDGE_INTERFACE_SIZE +        \
                          USBD_WEBUSB_ENABLE * 9 +                               \
                          USBD_DFU_RUNTIME_ENABLE * DFU_RUNTIME_INTERFACE_SIZE + \
                          CONFIG_CHERRYDAP_USE_MSC * MSC_DESCRIPTOR_LEN)
 
-#define INTF_NUM (1 + 2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID + USBD_WEBUSB_ENABLE + USBD_DFU_RUNTIME_ENABLE + CONFIG_CHERRYDAP_USE_MSC)
+#define INTF_NUM (1 + 2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID + SPI_BRIDGE_ENABLE + USBD_WEBUSB_ENABLE + USBD_DFU_RUNTIME_ENABLE + CONFIG_CHERRYDAP_USE_MSC)
 #define HID_INTF_NUM (2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID)
-#define MSC_INTF_NUM (HID_INTF_NUM + CONFIG_CHERRYDAP_USE_CUSTOM_HID)
+#define SPI_INTF_NUM (HID_INTF_NUM + CONFIG_CHERRYDAP_USE_CUSTOM_HID)
+#define MSC_INTF_NUM (SPI_INTF_NUM + SPI_BRIDGE_ENABLE)
 #define WEBUSB_INTF_NUM (MSC_INTF_NUM + CONFIG_CHERRYDAP_USE_MSC)
 #define DFU_INTF_NUM (WEBUSB_INTF_NUM + 1)
 
@@ -121,6 +141,36 @@ __ALIGN_BEGIN const uint8_t USBD_WinUSBDescriptorSetDescriptor[] = {
     '4', 0, '6', 0, '6', 0, '3', 0, '-', 0,
     'A', 0, 'A', 0, '3', 0, '6', 0, '-',
     0, '1', 0, 'A', 0, 'A', 0, 'E', 0, '4', 0, '6', 0, '4', 0, '6', 0, '3', 0, '7', 0, '7', 0, '6', 0,
+    '}', 0, 0, 0, 0, 0,
+#endif
+#if SPI_BRIDGE_ENABLE
+    /* WinUSB function subset for the USB->SPI bridge interface so that Windows
+     * binds WinUSB to it and libusb / WebUSB can claim it. Without this subset
+     * the interface enumerates fine but cannot be opened (libusb NOT_SUPPORTED),
+     * which is exactly what the first on-board P1 run hit. */
+    WBVAL(WINUSB_FUNCTION_SUBSET_HEADER_SIZE), /* wLength */
+    WBVAL(WINUSB_SUBSET_HEADER_FUNCTION_TYPE), /* wDescriptorType */
+    SPI_INTF_NUM,                              /* bFirstInterface */
+    0,                                         /* bReserved */
+    WBVAL(FUNCTION_SUBSET_LEN),                /* wSubsetLength */
+    WBVAL(WINUSB_FEATURE_COMPATIBLE_ID_SIZE),  /* wLength */
+    WBVAL(WINUSB_FEATURE_COMPATIBLE_ID_TYPE),  /* wDescriptorType */
+    'W', 'I', 'N', 'U', 'S', 'B', 0, 0,        /* CompatibleId*/
+    0, 0, 0, 0, 0, 0, 0, 0,                    /* SubCompatibleId*/
+    WBVAL(DEVICE_INTERFACE_GUIDS_FEATURE_LEN), /* wLength */
+    WBVAL(WINUSB_FEATURE_REG_PROPERTY_TYPE),   /* wDescriptorType */
+    WBVAL(WINUSB_PROP_DATA_TYPE_REG_MULTI_SZ), /* wPropertyDataType */
+    WBVAL(42),                                 /* wPropertyNameLength */
+    'D', 0, 'e', 0, 'v', 0, 'i', 0, 'c', 0, 'e', 0,
+    'I', 0, 'n', 0, 't', 0, 'e', 0, 'r', 0, 'f', 0, 'a', 0, 'c', 0, 'e', 0,
+    'G', 0, 'U', 0, 'I', 0, 'D', 0, 's', 0, 0, 0,
+    WBVAL(80), /* wPropertyDataLength */
+    '{', 0,
+    '3', 0, 'E', 0, '7', 0, 'B', 0, '1', 0, 'C', 0, '4', 0, '8', 0, '-', 0,
+    '9', 0, 'D', 0, '2', 0, 'A', 0, '-', 0,
+    '4', 0, 'F', 0, '6', 0, '1', 0, '-', 0,
+    'B', 0, '5', 0, 'E', 0, '8', 0, '-', 0,
+    '7', 0, 'C', 0, '0', 0, '4', 0, 'A', 0, '9', 0, 'D', 0, '3', 0, 'F', 0, '2', 0, '1', 0, '0', 0,
     '}', 0, 0, 0, 0, 0,
 #endif
 #if USBD_DFU_RUNTIME_ENABLE
@@ -242,6 +292,36 @@ static const struct
 // clang-format on
 #endif
 
+/* USB→SPI/QSPI 桥：vendor specific 接口（0xFF）+ 一对 512 B bulk 端点。
+ * 协议见 src/spi_bridge/spi_bridge_proto.h 与 docs/usb-spi-bridge-plan.md §4。 */
+// clang-format off
+#define SPI_BRIDGE_DESC()                                                           \
+    /************** Descriptor of SPI bridge interface *****************/           \
+    0x09,                                    /* bLength: Interface Descriptor size */\
+    USB_DESCRIPTOR_TYPE_INTERFACE,           /* bDescriptorType */                  \
+    SPI_INTF_NUM,                            /* bInterfaceNumber */                 \
+    0x00,                                    /* bAlternateSetting */                \
+    0x02,                                    /* bNumEndpoints */                    \
+    0xFF,                                    /* bInterfaceClass: vendor specific */ \
+    0x00,                                    /* bInterfaceSubClass */               \
+    0x00,                                    /* nInterfaceProtocol */               \
+    0x00,                                    /* iInterface */                       \
+    /************** bulk OUT (host -> probe) *****************/                     \
+    0x07,                                    /* bLength: Endpoint Descriptor size */\
+    USB_DESCRIPTOR_TYPE_ENDPOINT,            /* bDescriptorType */                  \
+    SPI_OUT_EP,                              /* bEndpointAddress (OUT) */           \
+    USB_ENDPOINT_TYPE_BULK,                  /* bmAttributes */                     \
+    WBVAL(DAP_PACKET_SIZE),                  /* wMaxPacketSize */                   \
+    0x00,                                    /* bInterval */                        \
+    /************** bulk IN (probe -> host) *****************/                      \
+    0x07,                                    /* bLength: Endpoint Descriptor size */\
+    USB_DESCRIPTOR_TYPE_ENDPOINT,            /* bDescriptorType */                  \
+    SPI_IN_EP,                               /* bEndpointAddress (IN) */            \
+    USB_ENDPOINT_TYPE_BULK,                  /* bmAttributes */                     \
+    WBVAL(DAP_PACKET_SIZE),                  /* wMaxPacketSize */                   \
+    0x00                                     /* bInterval */
+// clang-format on
+
 static const uint8_t device_descriptor[] = {
     USB_DEVICE_DESCRIPTOR_INIT(USB_2_1, 0xEF, 0x02, 0x01, USBD_VID, USBD_PID, 0x0100, 0x01),
 };
@@ -259,6 +339,9 @@ static const uint8_t config_descriptor[] = {
     CDC_ACM_DESCRIPTOR_INIT(0x01, CDC_INT_EP, CDC_OUT_EP, CDC_IN_EP, DAP_PACKET_SIZE, CDC_INTF_STRING_INDEX),
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
     HID_DESC(),
+#endif
+#if SPI_BRIDGE_ENABLE
+    SPI_BRIDGE_DESC(),
 #endif
 #if CONFIG_CHERRYDAP_USE_MSC
     MSC_DESCRIPTOR_INIT(MSC_INTF_NUM, MSC_OUT_EP, MSC_IN_EP, DAP_PACKET_SIZE, MSC_INTF_STRING_INDEX),
@@ -295,6 +378,9 @@ static const uint8_t other_speed_config_descriptor[] = {
     CDC_ACM_DESCRIPTOR_INIT(0x01, CDC_INT_EP, CDC_OUT_EP, CDC_IN_EP, DAP_PACKET_SIZE, CDC_INTF_STRING_INDEX),
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
     HID_DESC(),
+#endif
+#if SPI_BRIDGE_ENABLE
+    SPI_BRIDGE_DESC(),
 #endif
 #if CONFIG_CHERRYDAP_USE_MSC
     MSC_DESCRIPTOR_INIT(0x04, MSC_OUT_EP, MSC_IN_EP, DAP_PACKET_SIZE, MSC_INTF_STRING_INDEX),
@@ -472,6 +558,8 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
         /* J-Scope 采样器的包缓冲账本同理：在飞的 bulk IN 0x83 传输全被复位作废，
          * 完成回调不会再来。这里只置标志，真正的清账放主循环做（不和推包抢状态）。 */
         scope_sampler_usb_reset();
+        /* USB→SPI 桥的 OUT/IN 环同理：在飞的 0x0B/0x8B 传输作废，环归零 */
+        spi_bridge_usb_reset();
         break;
     case USBD_EVENT_CONNECTED:
         break;
@@ -486,6 +574,8 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
         USB_RequestIdle = 0U;
         usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_XFER_SIZE);
         usbd_ep_start_read(0, CDC_OUT_EP, usb_tmpbuffer, DAP_PACKET_SIZE);
+        /* USB→SPI 桥：武装它的 OUT 端点（未使能时内部会直接返回，主机侧收到 NAK） */
+        spi_bridge_usb_ready();
         /* Re-arm the UART bridge as well: the reset above cleared
          * config_uart_transfer and a host that reuses its previous line coding
          * would otherwise never restart it. */
@@ -628,6 +718,32 @@ struct usbd_endpoint hid_custom_out_ep = {
 };
 #endif
 
+/* ---- USB→SPI/QSPI 桥的两个回调：只做「投递/还槽」，真正的执行在主循环 ---- */
+
+void spi_bridge_out_callback(uint8_t busid, uint8_t ep, uint32_t nbytes)
+{
+    (void)busid;
+    (void)ep;
+    spi_bridge_out_done(nbytes);
+}
+
+void spi_bridge_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes)
+{
+    (void)busid;
+    (void)ep;
+    spi_bridge_in_done(nbytes);
+}
+
+struct usbd_endpoint spi_bridge_out_ep = {
+    .ep_addr = SPI_OUT_EP,
+    .ep_cb = spi_bridge_out_callback,
+};
+
+struct usbd_endpoint spi_bridge_in_ep = {
+    .ep_addr = SPI_IN_EP,
+    .ep_cb = spi_bridge_in_callback,
+};
+
 struct usbd_interface dap_intf;
 struct usbd_interface cdc_intf1;
 struct usbd_interface cdc_intf2;
@@ -720,6 +836,12 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base)
     hid_intf.notify_handler = hid_custom_notify_handler;
     usbd_add_endpoint(0, &hid_custom_in_ep);
     usbd_add_endpoint(0, &hid_custom_out_ep);
+#endif
+
+#if SPI_BRIDGE_ENABLE
+    /*!< USB→SPI/QSPI 桥：只需登记端点，接口没有类驱动（vendor specific） */
+    usbd_add_endpoint(0, &spi_bridge_out_ep);
+    usbd_add_endpoint(0, &spi_bridge_in_ep);
 #endif
 
 #if CONFIG_CHERRYDAP_USE_MSC

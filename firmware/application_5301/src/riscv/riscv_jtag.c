@@ -83,13 +83,12 @@ static uint8_t s_sba_failed;
  *   ① DAP 通路一动就作废缓存（rtt_bridge_note_dap_activity → riscv_jtag_invalidate_cache）
  *      —— 覆盖 OpenOCD/DFU 复位；
  *   ② 距离上一次 DMI 活动超过 SBA_CFG_GAP 就强制重写配置 —— 覆盖目标断电/未知复位。
- * 🚨 只靠 ② 是不够的：采样期间探针自己在连续做 DMI 扫描，**永远没有空档**，脏缓存
- * 会一直骗下去（实测：靶子被复位后，整段采样读回同一个陈旧值）。所以再加
- *   ③ 每 SBA_CFG_RECHECK 次操作强制重配一次 —— 把"被骗窗口"压到有界。 */
+ * （曾试过第三道"每 N 次操作强制重配"：SBCS 在 posted 读还在飞的时候被改写，
+ *  之后每次 dmi_post 收到的都是更早一拍的响应，读值冻结在某个曾经正确的值上 ——
+ *  实测整段采样恒定、而 OpenOCD 读同一地址是活的。配置只能在"安静点"改：
+ *  会话开始/结束或长时间空闲，见 sba_cfg_stale。） */
 #define SBA_CFG_GAP_TICKS (24U * 1000U * 50U)     /* 50 ms（MCHTMR 24 MHz） */
-#define SBA_CFG_RECHECK   4096U                   /* 每这么多次操作强制重配一次 */
 static uint32_t s_dmi_stamp;
-static uint32_t s_cfg_ops;
 
 static uint32_t mchtmr_now(void)
 {
@@ -100,7 +99,6 @@ void riscv_jtag_invalidate_cache(void)
 {
     s_sbcs_valid = 0U;
     s_hold_ok = 0U;
-    s_cfg_ops = 0U;
 }
 
 /* 距离上一次 DMI 活动太久 ⇒ 认为中间可能有外部复位，把缓存作废。
@@ -592,23 +590,56 @@ int riscv_jtag_hold_read(uint32_t *val)
     }
 
     /* 🚨 这条路径每拍只有 1 次 DMI 扫描，"每拍都回读 SBCS"会把吞吐砍掉一半
-     * （2 次扫描的检查 vs 1 次扫描的读取）。所以**摊薄**：每 HOLD_ERR_CHECK_PERIOD
-     * 拍核对一次 sticky 错误。发现错误就地重挂地址再读一次 —— 对采样器透明，
-     * 最多丢一拍；不这么做的话，sbbusyerror 会让读值永久冻结（静默、不恢复）。 */
+     * （2 次扫描的检查 vs 1 次扫描的读取）。所以**摊薄**：每 SBA_ERR_CHECK_PERIOD
+     * 拍核对一次 sticky 错误。不这么做的话，sbbusyerror 会让读值永久冻结（静默、不恢复）。
+     *
+     * 🚨 但检查**不能借 sba_check_errors()/dmi_read()**：它们开头的第一个 dmi_post
+     * 就是来丢 pending 响应的（"flush"）—— 在流水模式下那正是上一拍 SBDATA0 读的
+     * **真值**，被丢掉之后本拍再照常 post 一次，交付的就是 flush 链上那个 NOP 的响应
+     * （实测 data=0）：每 32 拍静默毁一个样本（约 3%，不报任何错；判据见
+     * script_test/riscv_pipe_integrity_test.py，修复前实测 1324/42408 ≈ 样本数/32）。
+     * 所以这里用两次**原生** dmi_post 自己拼，流水一拍不丢：
+     *   P1 = post(READ SBCS)     —— 返回的是**上一拍的样本**（本拍照常交付它）；
+     *   P2 = post(READ SBDATA0)  —— 返回的是 SBCS 现场值（拿去查 sticky 错误），
+     *                               它自己那笔读的结果留在管里，下一拍照常收回。 */
     if ((++s_hold_reads % SBA_ERR_CHECK_PERIOD) == 0U)
     {
-        if (sba_check_errors() != 0)
-        {
-            s_hold_ok = 0U;
-            if (riscv_jtag_hold_prepare(s_hold_addr) != 0)
-            {
-                return -1;
-            }
-            s_sba_err_recover++;
-        }
-    }
+        resp = dmi_post(DMI_OP_READ, DM_SBCS, 0U);                  /* 本拍要交付的样本 */
+        uint64_t sbcs_resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U); /* SBCS 现场 */
 
-    resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
+        if (dmi_resp_op(sbcs_resp) == DMI_OP_STATUS_SUCCESS)
+        {
+            uint32_t sbcs = dmi_resp_data(sbcs_resp);
+
+            s_last_sbcs = sbcs;
+            if ((sbcs & (SBCS_SBBUSYERROR | SBCS_SBERROR)) != 0U)
+            {
+                if (s_sba_err_events == 0U)
+                {
+                    s_sba_err_sbcs = sbcs;  /* 留第一现场，与 sba_clear_errors 同一套统计 */
+                }
+                s_sba_err_events++;
+                /* 就地重挂（prepare 内部会清 sticky 错误、重配 SBCS、重新点火）。
+                 * 重挂会清空流水，点火那一拍是新鲜值：走下面的常规 post 收它。 */
+                s_hold_ok = 0U;
+                s_sba_failed = 1U;
+                if (riscv_jtag_hold_prepare(s_hold_addr) != 0)
+                {
+                    return -1;
+                }
+                s_sba_err_recover++;
+                resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
+            }
+            /* 无错误：resp 已经是本拍样本，**不要再 post** —— 多 post 一拍会把
+             * 下一拍的值提前消费掉，流水错位（这正是被换掉的老实现毁样本的根源）。 */
+        }
+        /* SBCS 读本身没应答成功（偶发 BUSY）：本轮跳过检查，resp 里的样本照常
+         * 走下面的状态判定交付。 */
+    }
+    else
+    {
+        resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
+    }
 
     /* 目标全速运行时 DM 偶发 BUSY：同一个地址重读是幂等的，重发几次再判死
      * （与块读同一策略，见 riscv_jtag_read_once）。 */

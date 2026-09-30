@@ -163,3 +163,55 @@ void init_unused_pin_as_input(void)
 void init_jtag_swd_pin(void)
 {
 }
+
+/**
+ * @brief USB→SPI/QSPI 桥的 SPI1 引脚（J3 排针）
+ *
+ *   SCLK = PA27 (J3[23])       MOSI/IO0 = PA29 (J3[19])
+ *   MISO/IO1 = PA28 (J3[21])   CS = PA26 (J3[24]，见 hw_cs)
+ *   quad 时：IO2 = PA30 (J3[37])、IO3 = PA31 (J3[11])
+ *
+ * @param quad   1 = 把 PA30/PA31 复用成 SPI1_DAT2/DAT3（四线 QSPI）
+ * @param hw_cs  1 = PA26 作硬件 CS0（每帧自动时序）；0 = 留给软件 GPIO CS
+ *
+ * 注意：**不要**照抄 SDK init_spi1_pins() 里的 LOOP_BACK 位（那是 SPI 自环测试用的，
+ * 正常通信会把输出环回进输入）。
+ */
+void init_spi1_bridge_pins(uint8_t quad, uint8_t hw_cs)
+{
+    HPM_IOC->PAD[IOC_PAD_PA26].FUNC_CTL =
+        hw_cs ? IOC_PA26_FUNC_CTL_SPI1_CS_0 : IOC_PA26_FUNC_CTL_GPIO_A_26;
+    /*
+     * ⚠️ PA27(SCLK) 上的 `LOOP_BACK` 位**必须留着**，这是 SDK 的
+     * hpm5301evklite/init_spi1_pins() 的原样做法（只加在 SCLK 上，MISO/MOSI 都不加）。
+     *
+     * 它是"force input on"：把该 pad 的输入通路强制打开。SPI 主机发完时钟后，
+     * **接收移位是靠 SCLK 这条输入通路回来打拍的** —— 少了它，波形看起来完全正常
+     * （LA 上 8 字节 = 64 拍、MOSI 数据对、下降沿采样 MOSI=MISO=发送数据），
+     * 但控制器的 RX FIFO 里读出来是**恒定的空闲电平**（CPOL=0 时全 00、CPOL=1 时全 FF），
+     * 也就是"一个 bit 都没移进来"。
+     *
+     * P1 当初"特意不抄 LOOP_BACK"（以为是自环测试用的）就是这个坑的源头。
+     * 反过来也不要乱加：实测加在 PA28/PA29 上会把波形搞坏（len=4 只发 8 拍、
+     * MOSI 几乎不动），所以只在 SCLK 上按 SDK 的原样加。
+     */
+    HPM_IOC->PAD[IOC_PAD_PA27].FUNC_CTL = IOC_PA27_FUNC_CTL_SPI1_SCLK | IOC_PAD_FUNC_CTL_LOOP_BACK_MASK;
+    HPM_IOC->PAD[IOC_PAD_PA28].FUNC_CTL = IOC_PA28_FUNC_CTL_SPI1_MISO;
+    HPM_IOC->PAD[IOC_PAD_PA29].FUNC_CTL = IOC_PA29_FUNC_CTL_SPI1_MOSI;
+
+    /* 40~80 MHz 目标：这四根走 fast slew + 最大驱动 */
+    const uint32_t pad_ctl = IOC_PAD_PAD_CTL_PE_SET(0) | IOC_PAD_PAD_CTL_PS_SET(0) |
+                             IOC_PAD_PAD_CTL_OD_SET(0) | IOC_PAD_PAD_CTL_SR_SET(1) |
+                             IOC_PAD_PAD_CTL_SPD_SET(3) | IOC_PAD_PAD_CTL_DS_SET(4);
+    HPM_IOC->PAD[IOC_PAD_PA27].PAD_CTL = pad_ctl;
+    HPM_IOC->PAD[IOC_PAD_PA28].PAD_CTL = pad_ctl;
+    HPM_IOC->PAD[IOC_PAD_PA29].PAD_CTL = pad_ctl;
+
+    if (quad)
+    {
+        HPM_IOC->PAD[IOC_PAD_PA30].FUNC_CTL = IOC_PA30_FUNC_CTL_SPI1_DAT2;
+        HPM_IOC->PAD[IOC_PAD_PA31].FUNC_CTL = IOC_PA31_FUNC_CTL_SPI1_DAT3;
+        HPM_IOC->PAD[IOC_PAD_PA30].PAD_CTL = pad_ctl;
+        HPM_IOC->PAD[IOC_PAD_PA31].PAD_CTL = pad_ctl;
+    }
+}

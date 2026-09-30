@@ -753,15 +753,23 @@ void rtt_bridge_request_raw(const uint8_t *req, uint32_t len)
     s_raw_req_len = len;
     s_raw_rsp_len = 0U;
 
-    /* 有几类请求的响应长度**不由请求长度限定**，必须在这里就挡住：
+    /* 有几类请求的响应长度 / 请求消费长度**不由请求长度限定**，必须在这里就挡住：
      *   - 空请求：req[0] 还是上一条命令的残留，会被原样再执行一次；
      *   - ExecuteCommands(0x7F)：嵌套命令的响应叠加，还能再套一层 —— raw 通道的
      *     语义本来就是"发一条命令"，直接拒绝；
+     *   - SWD/JTAG Sequence(0x1D/0x14)：序列数是声明值，DIN 序列每个往响应里追加
+     *     (bits+7)/8 字节（最多 ~2 KB），handler 还会按声明逐序列消费请求字节、
+     *     走出 s_raw_req —— 同样直接拒绝（位级序列不是 raw 通道的用途；
+     *     SWJ_Sequence 0x12 没有 DIN 响应，不受影响）；
      *   - TransferBlock(0x06)：count 是请求里声明的 2 字节字段，把 count 钳到
-     *     响应缓冲装得下的上界。
-     * 其余命令的响应长度天然被 24 字节的请求长度限死（最坏是 Transfer 带时间戳：
-     * 3 + 20×8 = 163 B），装得下。 */
-    if ((len == 0U) || (s_raw_req[0] == ID_DAP_ExecuteCommands))
+     *     响应缓冲装得下的上界；
+     *   - Transfer(0x05)：count 也是**声明值**，而 TIMESTAMP_CLOCK 是开着的（带
+     *     时间戳的读项响应 8 B），count=255 时 3+255×8=2043 B 会写穿 1 KB 缓冲 ——
+     *     按请求里装得下的**完整 item 数**（读 1 B / 写 5 B）把 count 收进来，
+     *     响应侧随之有界（24 B 请求最多 21 项 → 3+21×8 = 171 B）。
+     * 其余命令的响应长度确实被 24 字节请求长度限死，装得下。 */
+    if ((len == 0U) || (s_raw_req[0] == ID_DAP_ExecuteCommands) ||
+        (s_raw_req[0] == ID_DAP_SWD_Sequence) || (s_raw_req[0] == ID_DAP_JTAG_Sequence))
     {
         s_raw_rsp[0] = DAP_ERROR;      /* 给主机一个看得见的拒绝 */
         s_raw_rsp_len = 1U;
@@ -777,6 +785,32 @@ void rtt_bridge_request_raw(const uint8_t *req, uint32_t len)
         {
             s_raw_req[2] = (uint8_t)limit;
             s_raw_req[3] = (uint8_t)(limit >> 8);
+        }
+    }
+    if ((len >= 4U) && (s_raw_req[0] == ID_DAP_Transfer))
+    {
+        uint32_t count = s_raw_req[2];
+        uint32_t off = 3U;
+        uint32_t fit = 0U;
+
+        while ((fit < count) && (off < len))
+        {
+            /* 请求字节数：读 = 1（带 MATCH_VALUE 再 +4 的匹配值）；写 = 1+4。
+             * 响应侧每项最多 4 数据 + 4 时间戳 = 8 B，钳完自然有界
+             * （24 B 请求最多 ~19 项 → 3+19×8 = 155 B）。 */
+            uint32_t item = s_raw_req[off];
+            uint32_t rbytes = ((item & DAP_TRANSFER_RnW) != 0U)
+                                  ? (((item & DAP_TRANSFER_MATCH_VALUE) != 0U) ? 5U : 1U)
+                                  : 5U;
+            off += rbytes;
+            if (off <= len)
+            {
+                fit++;
+            }
+        }
+        if (fit < count)
+        {
+            s_raw_req[2] = (uint8_t)fit;   /* 声明多少不算数，装得下多少才算数 */
         }
     }
     s_raw_reject = 0U;

@@ -16,6 +16,10 @@
 #   make uart-echo  - EVKLite CDC loopback check   (short J3.8 <-> J3.10 first)
 #   make uart-loop  - EVKLite CDC loopback sweep, 9600 .. 10 Mbps
 #
+# USB -> SPI/QSPI panel targets (see docs/spi-bridge-wiring.md):
+#   make panel      - ★ one-shot: reset + init + colour bars on the AXS15352 panel
+#   make spi-loop   - SPI bridge loopback acceptance (jumper J3[19] <-> J3[21])
+#
 # Variables:
 #   PYTHON  - interpreter for the test scripts (needs pyserial for uart-*)
 #   COM     - CDC port of the probe, e.g. COM7
@@ -35,7 +39,9 @@ PYTHON ?= python
 COM    ?= COM52
 
 .PHONY: all help build build-boot build-app flash flash-app dfu reset-usb clean \
-        sram-test rtt-test rtt-max rtt-link uart-echo uart-loop
+        sram-test rtt-test rtt-max rtt-link uart-echo uart-loop \
+        panel panel-red panel-green panel-blue panel-gradient panel-checker panel-le \
+        spi-loop spi-frames spi-pintest spi-dbg spi-bench spi-info
 all: help
 
 build: build-boot build-app
@@ -103,6 +109,54 @@ uart-loop:
 	@echo [make] CDC loopback sweep on $(COM) ...
 	$(PYTHON) script_test\uart_loopback_common.py $(COM)
 
+# --- USB -> SPI/QSPI bridge -------------------------------------------------
+# Wiring: docs/spi-bridge-wiring.md   Protocol: docs/web-handoff-spi-bridge.md
+# The panel is the TianMa 2P01 / AXS15352 (240x296, 4-wire SPI + DC):
+#   SCLK=J3[23] MOSI=J3[19] CS=J3[24] DC=J3[13] RST=J3[27] BL=J3[28] TE=J3[26]
+# Loopback tests need a jumper between J3[19] (MOSI) and J3[21] (MISO).
+panel:  ## ★ 一键刷屏：复位 + 初始化 + 彩色条
+	@echo [make] panel: reset + init + colour bars (TianMa 2P01 / AXS15352) ...
+	$(PYTHON) tools\panel_show.py
+
+panel-red:
+	$(PYTHON) tools\panel_show.py -p solid -c red
+
+panel-green:
+	$(PYTHON) tools\panel_show.py -p solid -c green
+
+panel-blue:
+	$(PYTHON) tools\panel_show.py -p solid -c blue
+
+panel-gradient:
+	$(PYTHON) tools\panel_show.py -p gradient
+
+panel-checker:
+	$(PYTHON) tools\panel_show.py -p checker
+
+# Same bars but with the other RGB565 byte order - flip between the two when
+# red and blue look swapped (the canonical setting is MADCTL=0x00 + big endian).
+panel-le:
+	$(PYTHON) tools\panel_show.py --littleendian
+
+spi-loop:  ## SPI 桥回环全量验收（要 J3[19]<->J3[21] 跳线）
+	@echo [make] SPI bridge loopback sweep (jumper J3[19] <-> J3[21]) ...
+	cd script_test && $(PYTHON) spi_bridge_test.py loop
+
+spi-frames:
+	cd script_test && $(PYTHON) spi_bridge_test.py frames
+
+spi-pintest:  ## 回环失败时先跑它：验 MOSI<->MISO 跳线通断 + pad 输入通路
+	cd script_test && $(PYTHON) spi_bridge_test.py pintest
+
+spi-dbg:
+	cd script_test && $(PYTHON) spi_bridge_test.py dbg
+
+spi-bench:
+	cd script_test && $(PYTHON) spi_bridge_test.py bench
+
+spi-info:
+	cd script_test && $(PYTHON) spi_bridge_test.py info
+
 clean:
 	@echo [make] cleaning evklite build dirs ...
 	rmdir /s /q $(APP_DIR)\build_dfu_evklite
@@ -123,4 +177,16 @@ help:
 	@echo   make rtt-link    SWD read reliability while the target runs
 	@echo   make uart-echo   CDC loopback check (COM=COMx)
 	@echo   make uart-loop   CDC loopback sweep 9600..10M (COM=COMx)
+	@echo.
+	@echo   USB -^> SPI/QSPI bridge (panel = TianMa 2P01 / AXS15352):
+	@echo   make panel       ★ one-shot: reset + init + colour bars
+	@echo   make panel-red   solid red      make panel-green   solid green
+	@echo   make panel-blue  solid blue     make panel-gradient gradient
+	@echo   make panel-checker checkerboard make panel-le      bars, other byte order
+	@echo   make spi-loop    loopback sweep (jumper J3[19] to J3[21])
+	@echo   make spi-frames  PING/DELAY/AUX_IN/CS smoke test
+	@echo   make spi-pintest jumper continuity check (run this first on failure)
+	@echo   make spi-dbg     SPI register snapshot
+	@echo   make spi-bench   poll vs DMA timing
+	@echo   make spi-info    config / profile / status
 	@echo   make clean       remove evklite build directories

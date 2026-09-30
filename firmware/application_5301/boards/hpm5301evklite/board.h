@@ -163,6 +163,10 @@
 #define BOARD_UART_DTR_PAD (0U)
 #define BOARD_UART_RTS_PAD (0U)
 
+/* USB→SPI/QSPI 转发桥：J3 排针上引出完整 SPI1（含 quad 的 PA30/PA31），见
+ * docs/usb-spi-bridge-plan.md。其他板子（akaLinkPro）没这套排针定义，置 0。 */
+#define BOARD_HAS_SPI_BRIDGE (1)
+
 #if defined(__cplusplus)
 extern "C"
 {

@@ -28,6 +28,12 @@
 #define MSC_IN_EP  0x89
 #define MSC_OUT_EP 0x0A
 
+/* USB→SPI/QSPI 桥（vendor specific 接口，见 src/spi_bridge/）。
+ * 物理 EP11 双向：IN 应答流 / OUT 帧流。EP11~15 原本都空着，而 DCD 的 QHD/QTD
+ * 竞技场是按 16 端点静态分配的，所以加这一对**不花 RAM**。 */
+#define SPI_IN_EP  0x8B
+#define SPI_OUT_EP 0x0B
+
 #define USBD_VID           0x0D28
 #define USBD_PID           0x0204
 #define USBD_MAX_POWER     250

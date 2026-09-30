@@ -18,7 +18,8 @@
 HID 取回的响应被 api_param 截到 16 字节，所以大 count 的用例只核对包头里的
 count/status 字段与前几个字 —— 关键是**探针不能死**。
 
-用法：python dap_raw_boundary_test.py
+用法：python dap_raw_boundary_test.py            # 完整模式（需要挂 ARM/SWD 靶子）
+       python dap_raw_boundary_test.py --no-target  # 只跑拒绝/钳位/存活（无 ARM 靶子也能跑）
 """
 import os
 import sys
@@ -181,12 +182,61 @@ def diag(dev):
     return 0
 
 
+def alive(dev):
+    """探针存活检查：RTT status（action 2）应当回一个 50+ 字节的正常响应。"""
+    r = xfer(dev, [0x01, 0x01, CMD_RTT, 2])
+    return r is not None and len(r) >= 10
+
+
+def main_no_target(dev):
+    """无 ARM 靶子模式（--no-target）：只跑**不依赖 SWD 链路**的用例。
+
+    拒绝类（0x7F / Sequence）在 HID 入口就被挡下，与链路无关；钳位类的响应
+    count 取决于执行结果（无靶子时第一项就 FAIL，count=0），所以这里断言的是
+    "响应正常回来、count 不超过钳位上界、探针 afterward 还活着" —— 修复前
+    大 count 会写穿 1 KB 邻接静态区，探针大概率直接挂掉，这个对照本身就是判据。
+    """
+    print("=== 无靶子模式：拒绝 + 钳位形状 + 存活 ===")
+    check(alive(dev), "基线：探针应答正常")
+
+    print("--- 拒绝类（入口挡下，与链路无关）---")
+    r = raw(dev, [ID_DAP_EXECUTE_COMMANDS, 0x01, 0x01, ID_DAP_TRANSFER, 0x00, 0x01, 0x02],
+            "ExecuteCommands(0x7F)")
+    n, payload = (r[0], r[1]) if r else (None, b"")
+    check(n == 1 and payload[:1] == b"\xFF", "回一个 DAP_ERROR", "n=%s payload=%s" % (n, payload.hex()))
+    for name, seq_id in (("SWD_Sequence(0x1D)", 0x1D), ("JTAG_Sequence(0x14)", 0x14)):
+        r = raw(dev, [seq_id, 0xFF, 0x40], "%s 声明 255 个序列" % name)
+        n, payload = (r[0], r[1]) if r else (None, b"")
+        check(n == 1 and payload[:1] == b"\xFF", "%s 回 DAP_ERROR" % name,
+              "n=%s payload=%s" % (n, payload.hex()))
+
+    print("--- 钳位类（无靶子：断言 count 上界 + 探针不死）---")
+    ts_read_item = APnDP | RnW | 0x80 | 0x0C   # TIMESTAMP（bit7，不是 0x10 的 MATCH_VALUE）
+    req = [ID_DAP_TRANSFER, 0x00, 0xFF] + [ts_read_item] * 11
+    r = raw(dev, req, "Transfer count=255（钳到 11）")
+    count, status, _ = summary(r[1]) if r else (None, None, [])
+    check(r is not None and count is not None and count <= 11,
+          "响应回来且 count ≤ 11", "count=%s status=%s" % (count, status))
+    req = [ID_DAP_TRANSFER_BLOCK, 0x00, 0xFF, 0xFF, APnDP | RnW | 0x0C]
+    r = raw(dev, req, "TransferBlock count=0xFFFF（钳到 255）")
+    count, status, _ = summary(r[1]) if r else (None, None, [])
+    check(r is not None and count is not None and count <= 255,
+          "响应回来且 count ≤ 255", "count=%s status=%s" % (count, status))
+
+    print("--- 收尾 ---")
+    check(alive(dev), "攻击报文之后探针仍应答正常")
+    print("\n%s" % ("全部通过 ✓" if not FAILS else "失败 %d 项：%s" % (len(FAILS), FAILS)))
+    return 0 if not FAILS else 1
+
+
 def main():
     if "--diag" in sys.argv:
         dev = open_hid()
         return diag(dev)
 
     dev = open_hid()
+    if "--no-target" in sys.argv:
+        return main_no_target(dev)
     if not bring_up(dev):
         return 1
 
@@ -219,11 +269,49 @@ def main():
     check(r is not None and count is not None and count <= 255 and acked(r[1]),
           "count=0xFFFF 被钳位", "count=%s status=%s" % (count, status))
 
-    print("\n=== 4. #3：ExecuteCommands(0x7F) 应被拒绝 ===")
+    print("\n=== 4. #3：ExecuteCommands(0x7F) / SWD/JTAG Sequence 应被拒绝 ===")
     r = raw(dev, [ID_DAP_EXECUTE_COMMANDS, 0x01, 0x01, ID_DAP_TRANSFER, 0x00, 0x01, 0x02],
             "ExecuteCommands（嵌套）")
     n, payload = (r[0], r[1]) if r else (None, b"")
     check(n == 1 and payload[:1] == b"\xFF", "回一个 DAP_ERROR", "n=%s payload=%s" % (n, payload.hex()))
+
+    # SWD/JTAG Sequence：序列数是声明值（DIN 序列每个往响应里追加 (bits+7)/8 字节，
+    # 声明 255 个就能写穿 1 KB 缓冲；handler 还会按声明消费请求字节、走出 s_raw_req）。
+    # raw 通道的用途是寄存器级访问，位级序列直接拒绝（SWJ_Sequence 0x12 不受影响）。
+    for name, seq_id in (("SWD_Sequence(0x1D)", 0x1D), ("JTAG_Sequence(0x14)", 0x14)):
+        r = raw(dev, [seq_id, 0xFF, 0x40], "%s 声明 255 个序列" % name)
+        n, payload = (r[0], r[1]) if r else (None, b"")
+        check(n == 1 and payload[:1] == b"\xFF", "%s 回 DAP_ERROR" % name,
+              "n=%s payload=%s" % (n, payload.hex()))
+
+    print("\n=== 4b. raw 通道的 DAP_Transfer：count 按请求里装得下的 item 数钳位 ===")
+    # count 是声明值，TIMESTAMP（bit7）开着时每个读项响应 8 B：count=255 + TIMESTAMP
+    # 的读项 ⇒ 3+255×8=2043 B，会写穿 1 KB 缓冲（修复前）。现在按"完整 item 数"
+    # （读 1 B / 带匹配值的读 5 B / 写 5 B）钳位：3 头 + 11 个读项只装得下 11 项。
+    # ⚠️ bit4(0x10) 是 MATCH_VALUE 不是 TIMESTAMP —— 用错会让读变成"匹配读"。
+    ts_read_item = APnDP | RnW | 0x80 | 0x0C   # APnDP | RnW | TIMESTAMP | DRW
+    req = [ID_DAP_TRANSFER, 0x00, 0xFF] + [ts_read_item] * 11
+    r = raw(dev, req, "count=255 全读项（应钳到 11）")
+    count, status, words = summary(r[1]) if r else (None, None, [])
+    check(r is not None and count == 11 and acked(r[1]),
+          "count=255 → 11（装得下的读项数）", "count=%s status=%s" % (count, status))
+    # 写项占 5 B：3 个写项 = 15 B ⇒ 18 B 请求装 3 个 ⇒ count=5 被钳到 3。
+    # 写的是 DP ABORT = 0（无副作用，见下面第 5 节的同一用法）。
+    req = [ID_DAP_TRANSFER, 0x00, 0x05]
+    for _ in range(3):
+        req += [0x00, 0, 0, 0, 0]              # DP write ABORT(=0)
+    r = raw(dev, req, "count=5 全写项（应钳到 3）")
+    count, status, words = summary(r[1]) if r else (None, None, [])
+    check(r is not None and count == 3 and acked(r[1]),
+          "count=5 → 3（装得下的写项数）", "count=%s status=%s" % (count, status))
+    # 数据完整性：钳位后的读项数据必须仍然正确（首字 = TAR 处的内存字）。
+    set_tar(dev, SP_ADDR)
+    req = [ID_DAP_TRANSFER, 0x00, 0x02, APnDP | RnW | 0x0C, APnDP | RnW | 0x0C]
+    r = raw(dev, req, "钳位路径读 2 项")
+    count, status, words = summary(r[1]) if r else (None, None, [])
+    check(bool(words) and words[0] == sp, "钳位后数据仍正确",
+          "words=%s（期望首字 0x%08X）" % (["0x%08X" % w for w in words[:2]], sp))
+
 
     print("\n=== 5. #6：混合“读 + 写”的 DAP_Transfer（收上一笔读必须走读引擎）===")
     # item0 = 读 AP DRW（自增），item1 = 写 DP ABORT（写 0，无副作用）。
