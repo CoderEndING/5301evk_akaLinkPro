@@ -27,7 +27,8 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 
 - **CMSIS-DAP 调试器**：USB-HS 复合设备（DAP + CDC + 自定义 HID + WebUSB + DFU Runtime），
   SWJ 支持 SWD/JTAG；bit-bang 引擎按速度预编译（20/30/36/45/60 MHz 档 + Slow C 版），
-  实测目标 SRAM 读在 60 MHz 档达 2376~2640 KB/s。
+  主机驱动（OpenOCD 纯传输口径）60M 档实测写 **3384** / 读 **2928** KB/s
+  （F103ZE @96MHz，09-30 回归；两种口径的差别与历程见实测记录）。
 - **探针侧 SEGGER RTT→CDC 桥**（HID `CMD_RTT` 0x31）：把 RTT 轮询从主机下沉进探针固件
   （J-Link 式），主机只读一个串口。**默认 45 MHz 档：2527 KB/s（2.47 MB/s）零丢包**；
   切 60 MHz 档：**2954 KB/s（2.89 MB/s）** —— 比主机轮询上限（1140 KB/s）快 **2.6 倍**。
@@ -35,8 +36,8 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 - **J-Scope 波形（探针侧 HSS 采样，HID `CMD_SCOPE` 0x32 + bulk IN `0x83`）**：类 SEGGER
   J-Scope 的变量示波器 —— 探针自己按周期用 SWD 读目标 RAM 里 1~8 个变量，组 512 B
   自描述包推给主机，**目标固件一行都不用改**（变量地址来自目标 `.elf` 的 DWARF）。
-  单变量 u32 实测**端到端 329 kHz**（3 µs 周期，探针侧零丢；探针本体 632 kHz），
-  8 通道 6 字 span 89.6 kHz。采样期间可一键让出 CDC/串口桥（`flags bit5` 或 HID `0x34`）。
+  单变量 u32 实测**端到端 329 kHz**（3 µs 周期，探针侧零丢；探针本体 629 kHz），
+  8 通道 6 字 span 89.3 kHz。采样期间可一键让出 CDC/串口桥（`flags bit5` 或 HID `0x34`）。
   详见 [J-Scope 波形（探针侧 HSS 采样）](#j-scope-波形探针侧-hss-采样)。
 - **支持 RISC-V 目标（JTAG-only，HID `CMD_RISCV` 0x33）**：新增探针侧 RISC-V
   Debug Module 引擎（DMI + SBA，`src/riscv/` + 专用 DMI 扫描汇编，TDI 预置 + 循环
@@ -74,6 +75,10 @@ ERROR 退出。两块靶子当天全绿：
 | HSS bench 单变量 | 60/45/30/20M = **604.9 / 530.7 / 420.6 / 320.6** kHz；拟合 **T(µs) = 0.911 + 44.1×(MHz/f_swd)**，R²=0.9999 |
 | HSS bench 8 通道 | **88.9** kHz @60M |
 | HSS run 端到端 | 单变量@3µs **321.3** kHz（探针跳拍 4.8%）；8 通道@12µs **75.9** kHz，u_hi 误码 **0** |
+
+> 注：bench 单变量 604.9 kHz 与 09-28 定稿的 629.3 kHz 相差 ~4%，是 300-iter 短标定的
+> run-to-run 波动（两读数都在 80% floor 之上）；RTT 三档 `wr_err` 本次全 0 —— 09-28 记录的
+> 「F103 @60M wr_err=1 既有现象」本次未复现。
 
 **RISC-V 回归（HPM6800EVK / HPM6880，40s，全 PASS）**
 
@@ -115,7 +120,89 @@ ERROR 退出。两块靶子当天全绿：
   的行为差异，脚本经 `powershell -File`（回归编排器）调用才会踩到，手动 pwsh 跑
   从来不会暴露。
 
-## HPM5301EVKLite 引脚与接线
+## 快速上手
+
+### 构建
+
+依赖 HPM SDK 1.11.0 环境（含 `rv32imac_zicsr_zifencei_multilib_b_ext-win` 工具链），
+默认路径 `E:\sdk_env_v1.11.0`，用环境变量 `HPM_SDK_ENV_DIR` 覆盖。
+
+```bat
+make build          :: bootloader + APP
+make build-boot     :: 仅 DFU bootloader -> build_xip_evklite\
+make build-app      :: 仅 APP（DFU 布局）-> build_dfu_evklite\，产出 _pack.bin/_pack.hex
+make clean
+```
+
+也可以直接跑板级脚本：`firmware/application_5301/build_dfu_evklite.bat`、
+`firmware/bootloader_dfu/build_xip_evklite.bat`。
+
+> **SDK 1.11 兼容说明**：新版 SDK 移除了 `flash_dfu` 构建类型，EVKLite 脚本改用
+> `HPM_BUILD_TYPE=flash_xip` + 自定义链接脚本 `linker/flash_dfu_app.ld`，并由 CMake
+> 追加 `-DFLASH_XIP=0 -DFLASH_DFU=1`，得到与原 `flash_dfu` 一致的镜像布局
+> （APP 头在 `0x80020000`，入口 `0x80020100`）。
+>
+> APP 固件区尾部两个 4K 扇区（`0x800FE000`/`0x800FF000`）留给参数存储
+> （EasyFlash），构建已把 `_flash_size` 收窄 8K，不会被代码占用。
+
+
+### 烧录
+
+| 场景 | 方法 |
+| --- | --- |
+| 首次烧录（空片） | J-Link 接 J5：`make flash`（bootloader + APP 一次烧完） |
+| 日常只更新 APP | `make flash-app`（J-Link，保留 bootloader） |
+| DFU 升级 | 长按 USER KEY 1s 或发 HID `CMD_ENTER_DFU(0xFF)` → 把 `akaLinkPro_App_pack.bin` 拖进虚拟 U 盘 |
+| dfu-util | `make dfu`（需自行安装 dfu-util 并加入 PATH） |
+| 救砖 | 按住 USER KEY 上电/复位进 ROM ISP，用 hpm_manufacturing_tool 经 USB/UART0 下载 |
+
+> **烧录前提**：APP 运行时 PA04–PA08 被 DAP 占用（就是芯片自身的 JTAG 脚），
+> J-Link 连不上，必须先让板子进入 DFU / ISP 模式。
+>
+> DFU 虚拟盘写入偶尔不触发 bootloader 提交，重新写一次文件即可。
+
+
+### 测试
+
+```bat
+make sram-test   :: STM32F103 SRAM 读写测速（CMSIS-DAP + OpenOCD，1~60 MHz，逐字节校验）
+make rtt-test    :: STM32F103 SEGGER RTT 吞吐（OpenOCD rtt server）
+make rtt-max     :: RTT 取数上限（轮询跑在 OpenOCD 内部，无 telnet 往返）
+make rtt-link    :: 目标运行中 SWD 读的可靠性矩阵
+make uart-echo   :: EVKLite CDC 回环快检（先短接 J3.8 <-> J3.10）
+make uart-loop   :: EVKLite CDC 全速率回环扫描
+```
+
+探针侧 RTT 桥的三个脚本（需要目标板跑 `script_test/stm32f103_rtt_speed`，默认自带 96 MHz 超频）：
+
+```bat
+python script_test\rtt_probe_bridge.py COM52 10       :: 桥测速 + 全流零丢包校验（最常用）
+python script_test\rtt_probe_bridge.py COM52 10 0 60  :: 同上，第 4 参指定 SWD 档（MHz，0=默认阶梯）
+python script_test\rtt_rate_matrix.py COM52           :: 逐档对照：SWD 读速 / 交付率 / 占比 / 谁主导
+python script_test\rtt_bridge_sweep.py COM52 --clk=60 :: 调优扫描：时钟 x 块大小 x 丢弃模式
+```
+
+#### 一键回归（2026-09-30）
+
+两个编排器把上面的单项测试串成回归，**每阶段/每频率档实时出结果**（控制台 +
+`build/regression/<family>.log` 人读 + `.jsonl` 机读）：
+
+| 命令 | 目标 | 内容 |
+| --- | --- | --- |
+| `make regression-swd` | F103ZE @96MHz | SRAM 1~60M 逐字节校验 + RTT 交付率/零丢（20/45/60M）+ HSS 单·多变量 bench（多档 + 拟合 `T=a+b·MHz/f`）与 run（端到端 + u_hi 误码） |
+| `make regression-riscv` | HPM6800EVK | selfcheck + 块读/写基准 + sbastat + RTT 交付/零丢（烧 flood 固件）+ HSS 单字流水完整性/契约/bench（自动换烧 scope 固件） |
+| `make regression-swd-bg` / `-riscv-bg` | 同上 | 后台执行，`make regression-swd-log` / `-riscv-log`（或 `-jsonl`）随时看进度 |
+
+判定规则：吞吐 ≥ 基线 × **80%**（`--floor` 可调，基线表在两个脚本头部、全部注明
+README 出处）；丢失/误码（RTT lost/dup、HSS u_hi 违例、SBA sticky）**必须为 0**；
+任一阶段 FAIL ⇒ 立即停止退出码 2；全程预算 `--budget` 硬超时防卡死。探针 CDC 口
+自动探测（VID/PID 匹配），要强制指定用 `make regression-swd COMREG=COM7`。
+靶子固件由编排器自动构建/烧录（`--skip-flash` 跳过）。
+
+
+## 硬件接线（EVKLite）
+
+### HPM5301EVKLite 引脚与接线
 
 ### DAP 目标调试口（J5，同时是芯片自身 JTAG）
 
@@ -159,82 +246,91 @@ make uart-loop COM=COM7     :: 9600 ~ 10 Mbps 全速率扫描
 
 实测：9600 ~ 10 Mbps 全部通过，10 Mbps → 974 KB/s（线速效率 99.7%）。
 
-## 构建
 
-依赖 HPM SDK 1.11.0 环境（含 `rv32imac_zicsr_zifencei_multilib_b_ext-win` 工具链），
-默认路径 `E:\sdk_env_v1.11.0`，用环境变量 `HPM_SDK_ENV_DIR` 覆盖。
+## 实测记录（时间线）
 
-```bat
-make build          :: bootloader + APP
-make build-boot     :: 仅 DFU bootloader -> build_xip_evklite\
-make build-app      :: 仅 APP（DFU 布局）-> build_dfu_evklite\，产出 _pack.bin/_pack.hex
-make clean
-```
+> 按日期排的实测记录。三个专题大节（RISC-V 调试 / J-Scope / SPI 桥）在这一节之后，
+> 各自内部也按天展开；09-29 / 09-30 的内容在这三处与顶部「最新进展」。
 
-也可以直接跑板级脚本：`firmware/application_5301/build_dfu_evklite.bat`、
-`firmware/bootloader_dfu/build_xip_evklite.bat`。
+### 2026-09-27 · RTT 提速：从 919 KB/s 到 2.9 MB/s，探针侧桥落地
 
-> **SDK 1.11 兼容说明**：新版 SDK 移除了 `flash_dfu` 构建类型，EVKLite 脚本改用
-> `HPM_BUILD_TYPE=flash_xip` + 自定义链接脚本 `linker/flash_dfu_app.ld`，并由 CMake
-> 追加 `-DFLASH_XIP=0 -DFLASH_DFU=1`，得到与原 `flash_dfu` 一致的镜像布局
-> （APP 头在 `0x80020000`，入口 `0x80020100`）。
->
-> APP 固件区尾部两个 4K 扇区（`0x800FE000`/`0x800FF000`）留给参数存储
-> （EasyFlash），构建已把 `_flash_size` 收窄 8K，不会被代码占用。
+#### SEGGER RTT 吞吐：从 919 KB/s 到 2.9 MB/s
 
-## 烧录
+RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 WrOff/RdOff → 读环形
+缓冲 → 写回 RdOff），而 SRAM 测速是一次大块流水传输，所以两者不可比。实测阶梯
+（目标均归一到 64 MHz）：
 
-| 场景 | 方法 |
+| 配置 | 吞吐 |
 | --- | --- |
-| 首次烧录（空片） | J-Link 接 J5：`make flash`（bootloader + APP 一次烧完） |
-| 日常只更新 APP | `make flash-app`（J-Link，保留 bootloader） |
-| DFU 升级 | 长按 USER KEY 1s 或发 HID `CMD_ENTER_DFU(0xFF)` → 把 `akaLinkPro_App_pack.bin` 拖进虚拟 U 盘 |
-| dfu-util | `make dfu`（需自行安装 dfu-util 并加入 PATH） |
-| 救砖 | 按住 USER KEY 上电/复位进 ROM ISP，用 hpm_manufacturing_tool 经 USB/UART0 下载 |
+| 目标停在复位默认 8 MHz（RTT 生产者在目标侧，此时封顶） | 277 KB/s |
+| `make rtt-test`（OpenOCD rtt server） | **919 KB/s** |
+| `make rtt-max`（轮询在 OpenOCD 内 + 32 位分块读 + 12 KB 环） | **1140 KB/s** |
+| **探针侧 RTT 桥**（`CMD_RTT` 0x31，固件自己轮询 RTT + CDC 转发） | **2527 KB/s（2.47 MB/s）零丢包**；切到 60 MHz 档可到 **2954 KB/s（2.89 MB/s）** |
 
-> **烧录前提**：APP 运行时 PA04–PA08 被 DAP 占用（就是芯片自身的 JTAG 脚），
-> J-Link 连不上，必须先让板子进入 DFU / ISP 模式。
->
-> DFU 虚拟盘写入偶尔不触发 bootloader 提交，重新写一次文件即可。
 
-## 测试
+#### 探针侧 RTT→CDC 桥
 
-```bat
-make sram-test   :: STM32F103 SRAM 读写测速（CMSIS-DAP + OpenOCD，1~60 MHz，逐字节校验）
-make rtt-test    :: STM32F103 SEGGER RTT 吞吐（OpenOCD rtt server）
-make rtt-max     :: RTT 取数上限（轮询跑在 OpenOCD 内部，无 telnet 往返）
-make rtt-link    :: 目标运行中 SWD 读的可靠性矩阵
-make uart-echo   :: EVKLite CDC 回环快检（先短接 J3.8 <-> J3.10）
-make uart-loop   :: EVKLite CDC 全速率回环扫描
+把轮询从主机搬到探针固件里，是 J-Link 式 RTT 的做法（参考实现：
+[MicroLink](https://github.com/minichao9901) 的同款 5301 工程）：固件自己在主循环里
+读 RTT 控制块 → 搬环形缓冲 → 写回 RdOff，数据直接进 CDC 的 `g_uartrx` 环，主机只管
+收串口。省掉的正是那 3 个 host↔探针来回。
+
+- **SWD 访问直接用 ARM DAPLink 官方 `swd_host.c`**（见 `firmware/application_5301/src/swd_host/`），
+  只裁掉 flash 算法/目标状态机部分，时序逻辑一字未改；平台胶水 `swd_host_port.c`
+  把 `SWD_Transfer()` 分派到本工程 `SW_DP.c` 的 `SWD_Read()/SWD_Write()`，即与 DAP
+  主机通路同一套按速度预编译的 bit-bang blob。
+- **握手用默认低速档、之后再提速**（真实主机也是这个顺序）：`swd_init_debug()` 内部会
+  再调一次 `swd_init()` → `DAP_Setup()` 把时钟重置回默认档，所以提速必须放在它之后。
+- **背压 + 幂等重试保证不丢不重**：每轮只搬 `min(目标可读, 2048 B, CDC 环剩余空间)`；
+  先交付到环再推进目标 RdOff，RdOff 写失败则记下来下轮补写（RdOff 是绝对值，重写无害）。
+  实测 2×13.5 MB 全流校验 0 丢包 0 重包。
+- 与 DAP 主机通路**互斥**：只在 DAP 空闲 ≥20 ms 时轮询，调试时最多多 ~1 ms 抖动。
+
+启动方式（HID 自定义命令 `CMD_RTT` 0x31）：
+
+```powershell
+python script_test\rtt_probe_bridge.py COM52 6 36000   # 自动 boost 目标 + 启动桥 + 测速
 ```
 
-探针侧 RTT 桥的三个脚本（需要目标板跑 `script_test/stm32f103_rtt_speed`，默认自带 96 MHz 超频）：
+吞吐随 SWD 时钟上升，但会撞到两侧不同的天花板（详见
+[`docs/HPM5301EVKLite_port.md` §5.4](docs/HPM5301EVKLite_port.md#54-调优实测天花板在哪一侧2026-09-27)）：
 
-```bat
-python script_test\rtt_probe_bridge.py COM52 10       :: 桥测速 + 全流零丢包校验（最常用）
-python script_test\rtt_probe_bridge.py COM52 10 0 60  :: 同上，第 4 参指定 SWD 档（MHz，0=默认阶梯）
-python script_test\rtt_rate_matrix.py COM52           :: 逐档对照：SWD 读速 / 交付率 / 占比 / 谁主导
-python script_test\rtt_bridge_sweep.py COM52 --clk=60 :: 调优扫描：时钟 x 块大小 x 丢弃模式
-```
+| 量的是什么 | 数字 |
+| --- | --- |
+| SWD 侧（纯读目标 SRAM） | 20/30/36/45/60 MHz → 1476/2053/2359/2788/**3312** KB/s |
+| 桥的搬运（丢弃模式，不送 CDC）@60 MHz | 3232 KB/s |
+| 端到端（CDC 读走）@45 MHz（默认）/ @60 MHz | **2527** / **2954 KB/s，零丢包** |
 
-### 一键回归（2026-09-30）
+60 MHz 档原来做完整初始化会失败（换挡瞬态），已用「斜坡换挡 + 换挡后热身 + 失败先清
+sticky 错误再判死」修好；但它**长跑偶尔抖动**（约每 5~10 次 10 秒一次），所以默认仍取
+稳定的 45 MHz，想要极限速度可用 HID `CMD_RTT` action 7 切 60 MHz（固件带自动降档兜底）。
+现在 60 MHz 下的瓶颈已转到 USB/CDC（丢弃 3232 vs 端到端 2954），详见
+[`docs/HPM5301EVKLite_port.md` §5.8/§5.9](docs/HPM5301EVKLite_port.md#58-swd-读速-vs-rtt-交付率逐档对照表)。
 
-两个编排器把上面的单项测试串成回归，**每阶段/每频率档实时出结果**（控制台 +
-`build/regression/<family>.log` 人读 + `.jsonl` 机读）：
+> ⚠️ 测交付率时主机侧读法影响极大：Windows 上 pyserial 的 `ser.read(n)` 会把主机侧压到
+> 2169 KB/s，`ser.readinto(大缓冲)` 才有 2956 KB/s（差 36%）。所有脚本已改用 readinto。
 
-| 命令 | 目标 | 内容 |
-| --- | --- | --- |
-| `make regression-swd` | F103ZE @96MHz | SRAM 1~60M 逐字节校验 + RTT 交付率/零丢（20/45/60M）+ HSS 单·多变量 bench（多档 + 拟合 `T=a+b·MHz/f`）与 run（端到端 + u_hi 误码） |
-| `make regression-riscv` | HPM6800EVK | selfcheck + 块读/写基准 + sbastat + RTT 交付/零丢（烧 flood 固件）+ HSS 单字流水完整性/契约/bench（自动换烧 scope 固件） |
-| `make regression-swd-bg` / `-riscv-bg` | 同上 | 后台执行，`make regression-swd-log` / `-riscv-log`（或 `-jsonl`）随时看进度 |
+块大小 512 B → 2048 B 多 1.2%（每块固定开销本来就只有 5 次传输）；
+`clock_delay` 覆盖无差别；`__inline__` 无收益（`-O3` 已把
+`swd_read_block`/`swd_transfer_retry`/`swd_read_word` 全部内联，符号表里已不存在）。
 
-判定规则：吞吐 ≥ 基线 × **80%**（`--floor` 可调，基线表在两个脚本头部、全部注明
-README 出处）；丢失/误码（RTT lost/dup、HSS u_hi 违例、SBA sticky）**必须为 0**；
-任一阶段 FAIL ⇒ 立即停止退出码 2；全程预算 `--budget` 硬超时防卡死。探针 CDC 口
-自动探测（VID/PID 匹配），要强制指定用 `make regression-swd COMREG=COM7`。
-靶子固件由编排器自动构建/烧录（`--skip-flash` 跳过）。
+高频档是**间歇性**的，所以固件带三处自愈：启动时从请求档位往下找可用档
+（60→45→36→30→20→10）、运行中连续出错则降一档重来（只在重扫也失败时降，否则一次瞬态
+就会白白降档）、换挡后先读一次 DP IDCODE 热身并清 sticky 错误；控制块扫描
+也从 4 字节小读改成 512 B 重叠窗块读（传输数少一个数量级）。扫描脚本
+`script_test/rtt_bridge_sweep.py` 一次跑完「纯 SWD / 丢弃 / 端到端」三段对照。
 
-### SRAM 吞吐：主机驱动 vs 纯 SWD 链路
+另外：目标**运行中**时长块 SWD 读会失败（内核抢总线），必须限长分块 + 重试
+（桥里默认 512 B/块）。详见
+[`script_test/README.md`](script_test/README.md#rtt-测速为什么慢实测结论2026-09-27)。
+
+脚本说明见 [`script_test/README.md`](script_test/README.md)；`sram/rtt` 脚本的工具路径
+可用 `OPENOCD_EXE`、`OPENOCD_SCRIPTS`、`HPM_SDK_ENV_DIR` 覆盖。
+
+
+### 2026-09-28 · SRAM 双口径、瓶颈收口、RISC-V 首秀
+
+#### SRAM 吞吐：主机驱动 vs 纯 SWD 链路
 
 这两个数字**不是一回事**，放一起看才不会被误导：
 
@@ -317,7 +413,8 @@ USB 批量端点）—— 比链路天花板低一档，但**不是因为"每趟
 > - RTT 那两次都有 `wr_err=1`（流依然字节级无损）：这是 **F103 在 60 MHz 档上的既有现象**
 >   （H743 全档 `wr_err=0`），`docs/HPM5301EVKLite_port.md` 里早有记录，重写 RdOff 是幂等的。
 
-### 2026-09-28 收口：瓶颈在**探针侧**，不在目标侧
+
+#### 收口（2026-09-28）：瓶颈在**探针侧**，不在目标侧
 
 三个目标、两套取数工具（本探针 vs SEGGER J-Link）跑下来，结论收敛了。
 
@@ -366,7 +463,8 @@ USB 批量端点）—— 比链路天花板低一档，但**不是因为"每趟
 > 它现在还会识别"固件已跑在 PLL 上"从而不去动 RCC）。
 >
 
-### 2026-09-28 追加：RISC-V 走 JTAG —— 主机侧是**往返受限**，探针侧才有速度
+
+#### RISC-V 走 JTAG（2026-09-28 首秀）：主机侧往返受限，探针侧才有速度
 
 第一次用本探针调 **RISC-V**（HPM6800EVK / HPM6880，只有 JTAG、没有 SWD）。这一块
 内容已经长成独立一章 —— 接线与前置条件、**必须烧 ELF 的启动头坑**、引擎与 RTT
@@ -378,77 +476,6 @@ USB 批量端点）—— 比链路天花板低一档，但**不是因为"每趟
 95.9 KB/s；把搬运下沉进探针固件后 **1504.5 KB/s（9 倍）**，RTT 交付
 **1385 KB/s 且字节级零丢包**（28.5 MB，0 丢 0 重）。
 
-### SEGGER RTT 吞吐：从 919 KB/s 到 2.9 MB/s
-
-RTT 是**主机轮询**模型：每次取数要 3 个 host↔探针来回（读 WrOff/RdOff → 读环形
-缓冲 → 写回 RdOff），而 SRAM 测速是一次大块流水传输，所以两者不可比。实测阶梯
-（目标均归一到 64 MHz）：
-
-| 配置 | 吞吐 |
-| --- | --- |
-| 目标停在复位默认 8 MHz（RTT 生产者在目标侧，此时封顶） | 277 KB/s |
-| `make rtt-test`（OpenOCD rtt server） | **919 KB/s** |
-| `make rtt-max`（轮询在 OpenOCD 内 + 32 位分块读 + 12 KB 环） | **1140 KB/s** |
-| **探针侧 RTT 桥**（`CMD_RTT` 0x31，固件自己轮询 RTT + CDC 转发） | **2527 KB/s（2.47 MB/s）零丢包**；切到 60 MHz 档可到 **2954 KB/s（2.89 MB/s）** |
-
-### 探针侧 RTT→CDC 桥
-
-把轮询从主机搬到探针固件里，是 J-Link 式 RTT 的做法（参考实现：
-[MicroLink](https://github.com/minichao9901) 的同款 5301 工程）：固件自己在主循环里
-读 RTT 控制块 → 搬环形缓冲 → 写回 RdOff，数据直接进 CDC 的 `g_uartrx` 环，主机只管
-收串口。省掉的正是那 3 个 host↔探针来回。
-
-- **SWD 访问直接用 ARM DAPLink 官方 `swd_host.c`**（见 `firmware/application_5301/src/swd_host/`），
-  只裁掉 flash 算法/目标状态机部分，时序逻辑一字未改；平台胶水 `swd_host_port.c`
-  把 `SWD_Transfer()` 分派到本工程 `SW_DP.c` 的 `SWD_Read()/SWD_Write()`，即与 DAP
-  主机通路同一套按速度预编译的 bit-bang blob。
-- **握手用默认低速档、之后再提速**（真实主机也是这个顺序）：`swd_init_debug()` 内部会
-  再调一次 `swd_init()` → `DAP_Setup()` 把时钟重置回默认档，所以提速必须放在它之后。
-- **背压 + 幂等重试保证不丢不重**：每轮只搬 `min(目标可读, 2048 B, CDC 环剩余空间)`；
-  先交付到环再推进目标 RdOff，RdOff 写失败则记下来下轮补写（RdOff 是绝对值，重写无害）。
-  实测 2×13.5 MB 全流校验 0 丢包 0 重包。
-- 与 DAP 主机通路**互斥**：只在 DAP 空闲 ≥20 ms 时轮询，调试时最多多 ~1 ms 抖动。
-
-启动方式（HID 自定义命令 `CMD_RTT` 0x31）：
-
-```powershell
-python script_test\rtt_probe_bridge.py COM52 6 36000   # 自动 boost 目标 + 启动桥 + 测速
-```
-
-吞吐随 SWD 时钟上升，但会撞到两侧不同的天花板（详见
-[`docs/HPM5301EVKLite_port.md` §5.4](docs/HPM5301EVKLite_port.md#54-调优实测天花板在哪一侧2026-09-27)）：
-
-| 量的是什么 | 数字 |
-| --- | --- |
-| SWD 侧（纯读目标 SRAM） | 20/30/36/45/60 MHz → 1476/2053/2359/2788/**3312** KB/s |
-| 桥的搬运（丢弃模式，不送 CDC）@60 MHz | 3232 KB/s |
-| 端到端（CDC 读走）@45 MHz（默认）/ @60 MHz | **2527** / **2954 KB/s，零丢包** |
-
-60 MHz 档原来做完整初始化会失败（换挡瞬态），已用「斜坡换挡 + 换挡后热身 + 失败先清
-sticky 错误再判死」修好；但它**长跑偶尔抖动**（约每 5~10 次 10 秒一次），所以默认仍取
-稳定的 45 MHz，想要极限速度可用 HID `CMD_RTT` action 7 切 60 MHz（固件带自动降档兜底）。
-现在 60 MHz 下的瓶颈已转到 USB/CDC（丢弃 3232 vs 端到端 2954），详见
-[`docs/HPM5301EVKLite_port.md` §5.8/§5.9](docs/HPM5301EVKLite_port.md#58-swd-读速-vs-rtt-交付率逐档对照表)。
-
-> ⚠️ 测交付率时主机侧读法影响极大：Windows 上 pyserial 的 `ser.read(n)` 会把主机侧压到
-> 2169 KB/s，`ser.readinto(大缓冲)` 才有 2956 KB/s（差 36%）。所有脚本已改用 readinto。
-
-块大小 512 B → 2048 B 多 1.2%（每块固定开销本来就只有 5 次传输）；
-`clock_delay` 覆盖无差别；`__inline__` 无收益（`-O3` 已把
-`swd_read_block`/`swd_transfer_retry`/`swd_read_word` 全部内联，符号表里已不存在）。
-
-高频档是**间歇性**的，所以固件带三处自愈：启动时从请求档位往下找可用档
-（60→45→36→30→20→10）、运行中连续出错则降一档重来（只在重扫也失败时降，否则一次瞬态
-就会白白降档）、换挡后先读一次 DP IDCODE 热身并清 sticky 错误；控制块扫描
-也从 4 字节小读改成 512 B 重叠窗块读（传输数少一个数量级）。扫描脚本
-`script_test/rtt_bridge_sweep.py` 一次跑完「纯 SWD / 丢弃 / 端到端」三段对照。
-
-另外：目标**运行中**时长块 SWD 读会失败（内核抢总线），必须限长分块 + 重试
-（桥里默认 512 B/块）。详见
-[`script_test/README.md`](script_test/README.md#rtt-测速为什么慢实测结论2026-09-27)。
-
-脚本说明见 [`script_test/README.md`](script_test/README.md)；`sram/rtt` 脚本的工具路径
-可用 `OPENOCD_EXE`、`OPENOCD_SCRIPTS`、`HPM_SDK_ENV_DIR` 覆盖。
 
 ## HPM6800EVK（HPM6880，RISC-V）目标调试
 
@@ -632,6 +659,7 @@ powershell -File script_test\hpm6800_timing_sweep.ps1
 HID 侧接口：`CMD_RISCV`（**0x33** —— 原本是 0x32，因网页侧 SCOPE 占了 0x32 而让位；动作见
 [`Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md)）；
 RTT 桥切目标类型用 `CMD_RTT`（0x31）的 action 10。
+
 
 ## J-Scope 波形（探针侧 HSS 采样）
 
@@ -954,14 +982,15 @@ DMA 定位追平，不会灌一整圈陈旧字节给主机。
 
 | 配置 | 每样本 | 上限 | 对照（SWD @60M） |
 | --- | --- | --- | --- |
-| 单变量 u32（J-Scope 快路径：SBA 抱地址 + posted 扫描） | **4.25 µs** | **235 kHz** | 1.588 µs / 629 kHz |
-| 8 通道连续 u32（32 B，一个 span） | **36.6 µs** | **27.3 kHz** | 11.19 µs / 89.3 kHz |
+| 单变量 u32（J-Scope 快路径：SBA 抱地址 + posted 扫描） | **3.15 µs**（09-30 修复周期性检查后；修复前 4.25 µs 且每 32 拍坏 1 个样本） | **317 kHz** | 1.588 µs / 629 kHz |
+| 8 通道连续 u32（32 B，一个 span） | **36.1 µs**（09-30 回归；09-29 为 36.6 µs） | **27.7 kHz** | 11.19 µs / 89.3 kHz |
 
 > 单字那条已经**贴到 DMI 扫描的时序下限**（一次 54 TCK 扫描 ≈ 2.7 µs，等于块读里
 > 每个词的耗时），比"每拍 4 次扫描"的裸单字 SBA 路径（25.6 µs）快 **9 倍**。
 > 多通道那条原先每次块读要白付 6 次扫描（重配 `SBCS` 4 次 + 收尾读回清错 2 次），
 > 改成"配置变了才写、上一次失败过才清错"后 45.64 → 30.81 µs；**本轮又主动加回 2 次
-> 扫描**（收尾回读 SBCS 查 sticky 错误，见下）→ 36.6 µs，用 +19% 换掉一类**静默故障**。
+> 扫描**（收尾回读 SBCS 查 sticky 错误，见下）→ 36.6 µs，用 +19% 换掉一类**静默故障**。（09-30：单字路径的检查改成流水保持式后
+  不再付这笔账 —— 4.25 → 3.15 µs，每 32 拍毁样本的 bug 一并修掉，见顶部最新进展。）
 > 整层顺带变快：1 KB 块读 1504.5 → **1518 KB/s**、块写 → **1551 KB/s**、
 > RTT 交付 1389 → **1405 KB/s**（丢包校验仍是 0 丢 0 重）。
 > 再往上就要动 DMI 扫描汇编（现在约 18 指令/bit ≈ 20 MHz TCK；SWD blob 是 6 指令/bit），
@@ -1089,6 +1118,7 @@ python script_test\scope_hss_test.py status --bridge off     :: 之后记得 --b
 > 例程的 F103ZE）：它的第 3 阶段会启动 RTT 桥并反复重扫，实测把探针主循环拖到不再应答
 > HID，只能**拔插一次**才能恢复。纯 SWD 块读那两阶段（3301 KB/s）是可以跑的。
 
+
 ## USB→SPI/QSPI 转发桥
 
 > 分支 `feature/usb-spi-bridge`。方案与全部实测记录：`docs/usb-spi-bridge-plan.md`；
@@ -1167,6 +1197,7 @@ python spi_bridge_test.py dbg             # SPI 寄存器现场快照（卡在�
 > 暴露得出来**的硬约束（EP0 请求缓冲要装得下 MS OS 描述符集、SPI1 模块时钟不许顶到
 > 720 MHz、SCLK 焊盘必须带 `LOOP_BACK`、延时要有序帧流内生效）。
 
+
 ## 文档
 
 | 文档 | 内容 |
@@ -1176,6 +1207,7 @@ python spi_bridge_test.py dbg             # SPI 寄存器现场快照（卡在�
 | [`docs/HANDOVER-evklite-20260927.md`](docs/HANDOVER-evklite-20260927.md) | 移植过程交接记录（含 CDC 回环故障的根因与修复） |
 | [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议（0x31 RTT / 0x32 SCOPE / 0x33 RISCV / 0x34 BRIDGE） |
 | [`docs/web-handoff-riscv-scope.md`](docs/web-handoff-riscv-scope.md) | **给网页侧的最小改动说明**：波形页采 RISC-V 需要的三个新位、哪些 SWD 专属控件该藏、按后端分档的采样率提示 |
+| [`docs/代码审查报告.md`](docs/代码审查报告.md) | 两轮代码审查全文 + 逐条处置结论（修复/上板验证/判定不修的理由） |
 | [`docs/web-handoff-spi-bridge.md`](docs/web-handoff-spi-bridge.md) | **USB→SPI/QSPI 桥的主机侧实现说明**：HID 0x35 全部动作、bulk 帧格式与流程、面板初始化表怎么搬、排坑清单、实测性能 |
 | [`docs/usb-spi-bridge-plan.md`](docs/usb-spi-bridge-plan.md) | USB→SPI/QSPI 桥方案 + P1~P4 上板实测记录（含四条硬件硬约束与四个真坑） |
 | [`script_test/stm32f103_scope/`](script_test/stm32f103_scope) | J-Scope 的靶子固件（F103C8/ZE，96 MHz，10 kHz 契约波形）+ `check.py` 客观验收 |
