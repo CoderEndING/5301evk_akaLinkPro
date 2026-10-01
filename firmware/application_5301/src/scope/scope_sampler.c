@@ -113,8 +113,11 @@ static uint8_t  s_stage[SCOPE_SPAN_MAX + 4U];
 ATTR_PLACE_AT_NONCACHEABLE_BSS_WITH_ALIGNMENT(4)
 static uint8_t s_pkt[SCOPE_TX_BUFS][SCOPE_PACKET];
 static volatile uint8_t s_tx_busy[SCOPE_TX_BUFS];
-static uint8_t  s_inflight[SCOPE_TX_BUFS];    /* 在飞顺序（FIFO）：回调不带下标，只能按序还 */
+static uint8_t  s_inflight[SCOPE_TX_BUFS];    /* 发送队列（FIFO）：回调不带下标，只能按序还 */
 static uint8_t  s_if_head, s_if_count;
+static uint8_t  s_tx_active;                  /* 端点上有 1 笔在飞（DWC2 只认一笔，见 scope_tx_kick） */
+static uint8_t  s_tx_gen;                     /* 队列代数：START / USB 复位清账时 +1 */
+static uint8_t  s_tx_armed_gen;               /* 当前在飞那一笔属于哪一代 */
 static uint8_t  s_fill_buf;                   /* 正在填的缓冲；0xFF = 还没分配 */
 static uint16_t s_fill_n;                     /* 已经填了几个样本 */
 static uint32_t s_fill_t0;                    /* 本包第一个样本的 t_us */
@@ -325,6 +328,68 @@ static uint8_t scope_alloc_buf(void)
     return 0xFFU;
 }
 
+/* ---- 发送队列 ---------------------------------------------------------------
+ *
+ * 🚨 端点**忙**的时候 usbd_ep_start_write 照样返回 0：移植层把底层
+ *    `usb_device_edpt_xfer()` 的 bool 丢掉了（usb_dc_hpm.c:254），而 DWC2 对一个
+ *    已经有在飞传输的端点会直接拒绝这一笔 —— 于是"发成功"是假的：不会有完成回调，
+ *    这个包缓冲永远回不来（= 二轮审查的 N1）。实测（8 通道 200 µs 档跑 3 s）：
+ *    推出 1005 包 / 主机收到 999 / 完成回调恰好也是 999 —— 差的 6 个全是 STAT，
+ *    它们的缓冲永久占死，池子几秒内从 8 个缩到 2 个（之后主机稍一卡就丢样本）。
+ *
+ * 所以必须自己排队：**同一时刻只允许 1 笔在飞**（s_tx_active），其余按 seq 顺序
+ * 躺在 s_inflight 环里，由完成回调接着踢下一包。"查在飞 + 启动"走关中断 ——
+ * 入队（主循环）与出队（回调 ISR）都会进这里，两步之间被打断就会重复启动、
+ * 又把缓冲漏掉。同一套推理与写法见 spi_bridge.c 的 sb_out_kick()。 */
+
+static uint32_t scope_irq_save(void)
+{
+    return disable_global_irq(CSR_MSTATUS_MIE_MASK);
+}
+
+static void scope_irq_restore(uint32_t lvl)
+{
+    enable_global_irq(lvl);
+}
+
+static void scope_tx_kick(void)
+{
+    uint32_t lvl = scope_irq_save();
+
+    if ((s_tx_active == 0U) && (s_if_count != 0U))
+    {
+        uint8_t buf = s_inflight[s_if_head];
+
+        if (usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET) == 0)
+        {
+            s_tx_active = 1U;
+            s_tx_armed_gen = s_tx_gen;
+        }
+    }
+    scope_irq_restore(lvl);
+}
+
+/* 入队一包（内容已经填好）。返回 1 = 已入队（由 kick 决定什么时候真的发出去）。
+ * 返回 0 只可能是"队列里已经有 8 个缓冲"——而 buf 是刚从空闲池里拿的，凑不满，
+ * 所以那是理论分支，调用方按"这一包没出去"如实记账即可。 */
+static uint8_t scope_tx_enqueue(uint8_t buf)
+{
+    uint32_t lvl = scope_irq_save();
+    uint8_t ok = 0U;
+
+    if (s_if_count < SCOPE_TX_BUFS)
+    {
+        s_tx_busy[buf] = 1U;
+        s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
+        s_if_count++;
+        ok = 1U;
+    }
+    scope_irq_restore(lvl);
+
+    if (ok != 0U) { scope_tx_kick(); }
+    return ok;
+}
+
 /* 把当前填满的包交给 USB */
 static void scope_push_packet(void)
 {
@@ -347,23 +412,10 @@ static void scope_push_packet(void)
     {
         s_discard_pkts++;
     }
-    else
+    else if (scope_tx_enqueue(s_fill_buf) == 0U)
     {
-        uint8_t buf = s_fill_buf;
-        /* 端点写失败（端口层在端点未使能时返回非 0 —— 例如刚经历 USB 复位的窗口）
-         * 必须**不记账**：记了账却没有完成回调，这个缓冲就永远回不来，之后一包也
-         * 推不出去。注意端点"忙"时端口层是静默顶掉上一笔（仍返回 0），那种情况在
-         * 这里查不出来 —— 靠 USBD_EVENT_RESET 的清账兜底（scope_sampler_usb_reset）。 */
-        if (usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET) != 0)
-        {
-            s_usb_drop += (uint32_t)s_fill_n;   /* 这一包的样本确实没出去，如实计数 */
-        }
-        else
-        {
-            s_tx_busy[buf] = 1U;
-            s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
-            s_if_count++;
-        }
+        /* 队列满（理论不可达，见 scope_tx_enqueue）：这一包的样本确实没出去，如实计数 */
+        s_usb_drop += (uint32_t)s_fill_n;
     }
 
     /* 下一包。**拿不到就置 0xFF（"没有缓冲"），绝不退回某个固定下标** ——
@@ -407,16 +459,8 @@ static void scope_push_def(void)
     s_bytes += SCOPE_PACKET;
     if (!(s_flags & SCOPE_FLAG_DISCARD))
     {
-        /* 🚨 与 scope_push_packet 同一套账：**先记账再发、还不看返回值**是错的 ——
-         * 端点写失败（USB 复位后、端点重新使能之前，端口层返回 -2）不会有完成回调，
-         * 这个缓冲就永远回不来；STAT 每 64 包一次，攒够 8 次推流就停摆。
-         * 失败就不记账，让它留在空闲池里（DEF/STAT 不带样本，所以不计 usb_drop）。 */
-        if (usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET) == 0)
-        {
-            s_tx_busy[buf] = 1U;
-            s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
-            s_if_count++;
-        }
+        /* 入发送队列（DEF/STAT 不带样本，排队失败就丢掉这一包，不计 usb_drop） */
+        (void)scope_tx_enqueue(buf);
     }
     s_fill_buf = save;
 }
@@ -443,13 +487,8 @@ static void scope_push_stat(void)
     s_bytes += SCOPE_PACKET;
     if (!(s_flags & SCOPE_FLAG_DISCARD))
     {
-        /* 同上（scope_push_def 的说明）：失败不记账，否则缓冲永久占死。 */
-        if (usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET) == 0)
-        {
-            s_tx_busy[buf] = 1U;
-            s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
-            s_if_count++;
-        }
+        /* 同上（scope_push_def）：入队，失败就丢这一包。 */
+        (void)scope_tx_enqueue(buf);
     }
     s_fill_buf = save;
 }
@@ -767,6 +806,10 @@ static int scope_start_now(void)
     s_last_sample_ticks = 0U;
     s_if_head = 0U; s_if_count = 0U;
     memset((void *)s_tx_busy, 0, sizeof(s_tx_busy));
+    /* 队列代数 +1：上一轮遗留的在飞传输（主机不读时它可能还挂着）即使回调迟到，
+     * 也不会来动这一轮的队列。**不动 s_tx_active** —— 那一笔是真的在飞，
+     * 必须等它的回调把端点交还（踢早了会被 DWC2 静默拒绝，又漏缓冲）。 */
+    s_tx_gen++;
     s_fill_buf = scope_alloc_buf();
     s_fill_n = 0U;
     s_fill_t0 = 0U;
@@ -865,6 +908,10 @@ static void scope_usb_reset_apply(void)
     }
     s_if_head = 0U;
     s_if_count = 0U;
+    /* 在飞那一笔随总线复位一起作废（回调不会来），代数 +1 让任何迟到的回调
+     * 都不会去动已经被清空的队列。 */
+    s_tx_active = 0U;
+    s_tx_gen++;
 
     /* 正在填的那个缓冲按设计不会是"在飞"的，内容还作数；只有本来就是"没有缓冲"
      * （0xFF 哨兵）时才需要重新要一个。 */
@@ -1113,11 +1160,20 @@ int scope_sampler_bench_result(uint32_t *iters, uint32_t *ticks, int32_t *err)
 void scope_sampler_tx_complete(void)
 {
     s_tx_done++;
-    if (s_if_count == 0U) { return; }                  /* 丢弃模式下没有在飞的包 */
-    uint8_t idx = s_inflight[s_if_head];
-    s_if_head = (uint8_t)((s_if_head + 1U) % SCOPE_TX_BUFS);
-    s_if_count--;
-    if (idx < SCOPE_TX_BUFS) { s_tx_busy[idx] = 0U; }
+
+    /* 一笔传完：端点空了，接着把队列里的下一包踢出去。
+     * 跨代的那笔（清账之前发出去的）**不还缓冲** —— 队列已经被清、缓冲已经被回收，
+     * 再去 pop 只会把新队列里的某一包误还掉（spi_bridge 的 armed_gen 同一个道理）。 */
+    uint32_t lvl = scope_irq_save();
+    s_tx_active = 0U;
+    if ((s_tx_armed_gen == s_tx_gen) && (s_if_count != 0U))
+    {
+        uint8_t idx = s_inflight[s_if_head];
+        s_if_head = (uint8_t)((s_if_head + 1U) % SCOPE_TX_BUFS);
+        s_if_count--;
+        if (idx < SCOPE_TX_BUFS) { s_tx_busy[idx] = 0U; }
+    }
+    scope_irq_restore(lvl);
 
     /* 刚还回来的缓冲如果正是"缺的那个"，立刻接手继续填 —— 不然会一直丢拍到下一次推包 */
     if ((s_fill_buf >= SCOPE_TX_BUFS) && s_running)
@@ -1125,6 +1181,8 @@ void scope_sampler_tx_complete(void)
         s_fill_buf = scope_alloc_buf();
         s_fill_n = 0U;
     }
+
+    scope_tx_kick();
 }
 
 /* 12 个状态字，位域见 docs/scope-page.md §7.1（网页 parseScopeStatus 按同一张表解） */

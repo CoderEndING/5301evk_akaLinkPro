@@ -140,14 +140,18 @@ def main():
               "nvars=%d spans=%d" % (st['nvars'], st['spans']))
 
     print("\n=== 2. 被拒之后不能偷偷采样：START / BENCH 都应报 -3 ===")
+    # 注意比的是**增量**：produced 只在真正启动成功时清零（scope_start_now 的 -3 是
+    # 提前返回），所以"上一轮的账"会留在状态字里，不能直接断言它等于 0。
+    st0 = status(dev)
     xfer(dev, [ACT['START']])
     time.sleep(0.4)
     st = status(dev)
     check(st is not None and st['startRc'] == RC_NOVARS, "START → -3（变量表为空）",
           "startRc=%s running=%s" % (st and st['startRc'], st and st['running']))
     check(st is not None and st['running'] == 0, "没有真的跑起来")
-    check(st is not None and st['produced'] == 0, "一个样本都没采（越界写的前提是真的去读）",
-          "produced=%s" % (st and st['produced']))
+    check(st is not None and st0 is not None and st['produced'] == st0['produced'],
+          "一个样本都没采（越界写的前提是真的去读）",
+          "produced %s -> %s" % (st0 and st0['produced'], st and st['produced']))
 
     b = bench(dev, 500)
     check(b is not None and b['err'] == RC_NOVARS, "BENCH → err=-3（没有排计划）",
