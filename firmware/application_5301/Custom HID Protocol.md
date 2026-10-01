@@ -386,8 +386,12 @@ Byte[0x03-0x3F] = Command data（可选）
     值**上、且不会自愈。固件已经做了检测与恢复（见第 17 条 action 9），
     真出问题先跑 `python script_test/hpm6800_riscv.py sbastat` 看计数。
 
-    响应：Byte[0x01] = 长度，Byte[0x02] = 0x32，**Byte[0x03] = 启动码**（网页读 `res[2]`，
-    -100 = 排队中，0 = 正常，-1/-2/-3/-4 见 scopeRcText），Byte[0x04..0x33] = 12 个状态字。
+    响应：Byte[0x01] = 长度，Byte[0x02] = 0x32，**Byte[0x03] = 启动码 / 配置判定**
+    （网页读 `res[2]`，-100 = 排队中，0 = 正常/已采纳，-1/-2/-3/-4/-6 见 scopeRcText），
+    Byte[0x04..0x33] = 12 个状态字。
+    ⚠️ action=7（CONFIG）时这一字节报的是**本次配置的判定**：`0` = 已采纳、`-6` = 整包拒绝
+    （变量宽度不是 1/2/4/8，一个字段都不采纳、变量表清空；随后 START 会拿到 `-3`）。
+    2026-10-02 之前这里会停在上一次的启动结果上（例如 -3），是陈旧值。
     ⚠️ 状态字 0 的 **bit1 = 生效后端是 RISC-V/JTAG**（丢弃模式下没有 DEF 包，就靠这一位
     判断实际走的哪条路）；DEF 包里则看 flags bit6。两者都报**生效值**：后端不匹配时
     采样器会换另一条路再试一次，所以"你设的"和"实际用的"可能不同。
@@ -417,6 +421,12 @@ Byte[0x03-0x3F] = Command data（可选）
       kind 1=DEF：`swd_hz(4) period_us(4) flags(2) nvars(1) spans(1)` + n×(addr4,size1,type1)
       kind 2=DATA：载荷 = n 帧，变量按**地址排序后**紧排、各按自己的 size 小端
       kind 3=STAT：`produced(4) dropped(4) pkts(4) usb_err(2) swd_err(2) period_actual(4) swd_mhz(1) disc(1)`，每 64 包插一个
+     ⚠️ DEF/STAT 的送达由探针侧的**发送队列**保证（2026-10-02 修）：DWC2 端点只认一笔在飞，
+     而移植层丢掉了底层 `usb_device_edpt_xfer()` 的返回值 ⇒ 端点忙时"发成功"是假的。此前
+     STAT 一个都到不了主机（面板那几个数永远是死的）、DEF 偶尔被吞（主机侧会走"没等到 DEF"
+     的兜底）；现在**同一时刻只放一笔在飞**，其余按 seq 排队、由完成回调接着踢。
+     回归脚本 `script_test/scope_tx_queue_test.py`：推出多少收到多少 / 回调数 == 收到包数 /
+     STAT 到齐 / seq 无缺口（修复前实测 1005 推 / 999 收 / STAT 0 个）。
     丢包判定：seq 跳号 / t_us 跳变 / STAT.dropped，三者都要显示，绝不静默。
 
     收尾顺序（WebUSB 没有取消接口）：**先 HID STOP → 等 100~200 ms → 把在飞的读收干净 → 再 close**。
