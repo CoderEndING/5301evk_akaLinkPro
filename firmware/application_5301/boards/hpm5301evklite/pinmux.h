@@ -34,6 +34,12 @@ void init_jtag_swd_pin(void);
  * （SPI1 的 IO2=PA30 被板上 Q1 短到地，四线用不了，见 pinmux.c 的说明。） */
 void init_spi2_bridge_pins(uint8_t quad, uint8_t hw_cs);
 
+/* USB→I2C 桥：**I2C3** 的 PA28=SDA(J3[21]) / PA29=SCL(J3[19])。
+ * pullup=1 打开内部上拉（弱，只在没外接上拉时应急）。 */
+void init_i2c_bridge_pins(uint8_t pullup);
+/* 同一对脚切成 GPIO 开漏（总线恢复打拍用）；用完要切回 I2C 复用。 */
+void init_i2c_bridge_pins_gpio(uint8_t pullup);
+
 #ifdef __cplusplus
 }
 #endif

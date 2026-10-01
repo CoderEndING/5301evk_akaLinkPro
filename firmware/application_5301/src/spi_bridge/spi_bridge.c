@@ -34,6 +34,7 @@
 #include "pinmux.h"
 #include "usb_composite.h"
 #include "spi_bridge.h"
+#include "i2c_bridge.h"   /* 交叉检查：I2C 桥使能时占着 PA28/PA29，别当辅助脚用 */
 
 #if !defined(BOARD_HAS_SPI_BRIDGE) || (BOARD_HAS_SPI_BRIDGE == 0)
 
@@ -1894,7 +1895,10 @@ static uint8_t sb_cfg_validate(const sb_cfg_t *c)
     return 1U;
 }
 
-/* 辅助脚索引在这套固件里还能不能用（PB10~PB15 是 SPI2 的信号线，PA30 被板上 Q1 短到地）*/
+/* 辅助脚索引在这套固件里还能不能用（PB10~PB15 是 SPI2 的信号线，PA30 被板上 Q1 短到地）。
+ * 另外还要问一句 I2C 桥：它使能时占着 PA28/PA29（I2C3 的 SDA/SCL），
+ * 那两根在 pad 表里是 16/17 —— 两个模块抢同一根脚的后果是"谁后配谁赢"，
+ * 静默且难查，所以这里直接拒掉。I2C 桥没使能时行为与以前完全一致。 */
 static uint8_t sb_pad_usable(uint16_t pad)
 {
     if (pad == 0U)
@@ -1910,6 +1914,10 @@ static uint8_t sb_pad_usable(uint16_t pad)
         {
             return 0U;
         }
+    }
+    if (i2c_bridge_owns_pad(pad) != 0U)
+    {
+        return 0U;
     }
     return 1U;
 }

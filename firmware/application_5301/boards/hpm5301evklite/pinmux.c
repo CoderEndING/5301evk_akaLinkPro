@@ -228,3 +228,55 @@ void init_spi2_bridge_pins(uint8_t quad, uint8_t hw_cs)
         HPM_IOC->PAD[IOC_PAD_PB15].PAD_CTL = pad_ctl;
     }
 }
+
+/**
+ * @brief USB→I2C 桥的引脚（**I2C3**：PA28=SDA / PA29=SCL，J3[21] / J3[19]）
+ *
+ * 为什么是这一对：把 HPM5301 的全部 I2C 功能脚与 J3 排针交叉比对，只有
+ * I2C3 的 PA28/PA29 这一对同时引出来（其余组合的另一半分别是 USER 按键 PA03、
+ * nRESET PA08、CDC 的 UART2 PB08、USB0 的 PA24/PA25 —— 都占着）。
+ * 与 SPI2(PB10~PB15)、SWD(PA04~PA08)、UART0 均不冲突。
+ *
+ * 电气（照 SDK `init_i2c2_pins()` 的原样，换实例后结论不变）：
+ *   · FUNC_CTL 加 `LOOP_BACK`（IOC 手册里是 "force input on"）—— I2C 的输入通路
+ *     要在焊盘复用到外设之后仍然有效，ACK/读数据都靠它；
+ *   · `OD=1` 开漏，这是 I2C 的硬要求（谁都不能推高）；
+ *   · `PE/PS`：pullup=1 才开内部上拉。**注意 PE=1/PS=0 是下拉** —— 那会把总线
+ *     按住，所以"不用内部上拉"必须是 PE=0（高阻），不是 PS=0。
+ *
+ * ⚠️ 本板 PA29 与 USB0_OC 网络共用（AP2151 的 nFAULT + R6 10k 上拉）：开漏使用没问题；
+ * ⚠️ PA28 上**没有**外部上拉，建议外接 4.7k~10k 到 3.3V，或临时用 pullup=1 应急。
+ */
+void init_i2c_bridge_pins(uint8_t pullup)
+{
+    const uint32_t pad_ctl = IOC_PAD_PAD_CTL_OD_SET(1) |
+                             IOC_PAD_PAD_CTL_PE_SET(pullup ? 1U : 0U) |
+                             IOC_PAD_PAD_CTL_PS_SET(pullup ? 1U : 0U) |
+                             IOC_PAD_PAD_CTL_SR_SET(1) |
+                             IOC_PAD_PAD_CTL_SPD_SET(2) |
+                             IOC_PAD_PAD_CTL_DS_SET(3);
+
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SDA_PAD].FUNC_CTL =
+        BOARD_I2C_BRIDGE_SDA_FUNC | IOC_PAD_FUNC_CTL_LOOP_BACK_MASK;
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SCL_PAD].FUNC_CTL =
+        BOARD_I2C_BRIDGE_SCL_FUNC | IOC_PAD_FUNC_CTL_LOOP_BACK_MASK;
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SDA_PAD].PAD_CTL = pad_ctl;
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SCL_PAD].PAD_CTL = pad_ctl;
+}
+
+/**
+ * @brief 把 I2C 那两根脚切成 GPIO（开漏输出），供总线恢复手动打拍用。
+ * 用完必须调 init_i2c_bridge_pins() 切回 I2C 复用。
+ */
+void init_i2c_bridge_pins_gpio(uint8_t pullup)
+{
+    const uint32_t pad_ctl = IOC_PAD_PAD_CTL_OD_SET(1) |
+                             IOC_PAD_PAD_CTL_PE_SET(pullup ? 1U : 0U) |
+                             IOC_PAD_PAD_CTL_PS_SET(pullup ? 1U : 0U) |
+                             IOC_PAD_PAD_CTL_HYS_SET(1);
+
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SDA_PAD].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SCL_PAD].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SDA_PAD].PAD_CTL = pad_ctl;
+    HPM_IOC->PAD[BOARD_I2C_BRIDGE_SCL_PAD].PAD_CTL = pad_ctl;
+}

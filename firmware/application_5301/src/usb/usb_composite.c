@@ -8,6 +8,7 @@
 #include "cdc_interface.h"
 #include "scope_sampler.h"
 #include "spi_bridge.h"
+#include "i2c_bridge.h"
 
 #define CMSIS_DAP_INTERFACE_SIZE (9 + 7 + 7 + 7)
 #define CUSTOM_HID_LEN (9 + 9 + 7 + 7)
@@ -561,6 +562,8 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
         scope_sampler_usb_reset();
         /* USB→SPI 桥的 OUT/IN 环同理：在飞的 0x0B/0x8B 传输作废，环归零 */
         spi_bridge_usb_reset();
+        /* USB→I2C 桥没有自己的端点，只有"登记了还没做完的那次事务"要作废 */
+        i2c_bridge_usb_reset();
         break;
     case USBD_EVENT_CONNECTED:
         break;

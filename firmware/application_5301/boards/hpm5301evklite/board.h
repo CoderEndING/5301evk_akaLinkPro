@@ -174,6 +174,25 @@
  * 其他板子（akaLinkPro）没这套排针定义，置 0。 */
 #define BOARD_HAS_SPI_BRIDGE (1)
 
+/* USB→I2C 转发桥：**I2C3** 的 PA28=SDA / PA29=SCL，J3[21] / J3[19]。
+ * 这是 J3 排针上唯一一对引出来的硬件 I2C 脚（I2C 的全部功能脚 × J3 交叉比对：
+ * 其它组合的另一半分别是 USER 按键 PA03、nRESET PA08、CDC 的 UART2 PB08、
+ * USB0 的 PA24/PA25 —— 都占着）。与 SPI2(PB10~PB15)、SWD(PA04~PA08)、
+ * UART0(PA00/PA01) 均不冲突，见 docs/web-handoff-i2c-bridge.md 的接线表。
+ * ⚠️ 板丝印还停在 SPI1 时代（MISO/MOSI）；⚠️ PA29 与 USB0_OC 网络共用
+ * （AP2151 nFAULT + R6 10k 上拉）：开漏使用没问题，USB 限流报故障时会把 SCL 拉低。
+ * ⚠️ 这两根脚同时也在 SPI 桥的辅助脚 pad 表里（索引 16/17）—— 桥使能时
+ * i2c_bridge_owns_pad() 会让 SPI 桥拒掉它们，避免两个模块抢同一根脚。 */
+#define BOARD_HAS_I2C_BRIDGE (1)
+#define BOARD_I2C_BRIDGE_BASE HPM_I2C3
+#define BOARD_I2C_BRIDGE_CLK clock_i2c3
+#define BOARD_I2C_BRIDGE_SDA_PAD IOC_PAD_PA28
+#define BOARD_I2C_BRIDGE_SCL_PAD IOC_PAD_PA29
+#define BOARD_I2C_BRIDGE_SDA_FUNC IOC_PA28_FUNC_CTL_I2C3_SDA
+#define BOARD_I2C_BRIDGE_SCL_FUNC IOC_PA29_FUNC_CTL_I2C3_SCL
+#define BOARD_I2C_BRIDGE_SDA_LABEL "PA28/J3[21]"
+#define BOARD_I2C_BRIDGE_SCL_LABEL "PA29/J3[19]"
+
 #if defined(__cplusplus)
 extern "C"
 {

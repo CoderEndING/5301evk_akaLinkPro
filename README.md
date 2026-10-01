@@ -52,6 +52,13 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
   **20/40/60/75 MHz 全部通过**，DMA 与轮询两条 TX 路径可配。详见
   [USB→SPI/QSPI 转发桥](#usbspiqspi-转发桥) 与
   [`docs/web-handoff-spi-bridge.md`](docs/web-handoff-spi-bridge.md)。
+- **USB→I2C 转发桥（HID `CMD_I2C` 0x36，只走 HID、不用 DMA）**：I2C3 = **PA28/SDA(J3.21)**
+  + **PA29/SCL(J3.19)**（J3 上唯一一对引出来的硬件 I2C 脚，与 SPI2/SWD/UART 都不冲突）。
+  一次事务 = 子地址 + 写数据 + repeated START + 读（写 ≤51 B / 读 ≤54 B），主机轮询取结果；
+  100 kHz / 400 kHz / 1 MHz 三档，带总线扫描、引脚自检、总线恢复。实测 AT24Cxx：
+  扫描 0x50、页写回读逐字节一致、54 B 块读 100 kHz **5243 µs** → 400 kHz **1309 µs**。
+  详见 [`docs/web-handoff-i2c-bridge.md`](docs/web-handoff-i2c-bridge.md) 与
+  [`docs/usb-i2c-bridge-plan.md`](docs/usb-i2c-bridge-plan.md)。
 - **DFU/MSC Bootloader**：长按 USER 键进 DFU，虚拟 U 盘 `AKALINKPRO` 拖入 `.bin` 即升级；
   APP 带签名 + 长度 + CRC32 校验，校验失败停在 DFU。
 - **配置持久化 + WebHID 上位机**：配置存 QSPI NOR（EasyFlash），`docs/index.html` 可直接改。
@@ -96,6 +103,38 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 即：**修掉漏缓冲之后，原先被它吃掉的吞吐自己回来了**（pack +8.7%、单变量 +5.6%），
 采样热路径一行没动、DLM 零增长（106592 B）。**网页侧不需要改代码** —— `parseDef`/`parseStat`
 与固件字节布局本来就逐字段一致，变化只是这些包现在真的会到。
+
+### 新功能：USB→I2C 转发桥（HID `0x36`，分支 `feature/usb-i2c-bridge`）
+
+把探针当"USB 转 I2C 主机"用：网页发一次事务（子地址 + 写数据 + repeated START + 读），
+探针在总线上跑完并把数据带回来。**只走 HID、不做 DMA**（I2C 慢且事务小，DMA 与 bulk
+那套在这里都不划算），一次 HID 报文装一次事务（写 ≤51 B / 读 ≤54 B），主机轮询 `RESULT`
+取结果 —— 事务最长 ~5 ms，只能这么干（HID 中断里绝不能跑）。
+
+| 项 | 值 |
+| --- | --- |
+| 引脚 | **PA28=SDA(J3[21]) / PA29=SCL(J3[19])**（I2C3）；J3 上唯一一对引出来的硬件 I2C 脚 |
+| 档位 | 100 kHz / 400 kHz / 1 MHz（`scl_hz` 是档位选择器，实际值回报在 `actual_scl_hz`） |
+| 动作 | STATUS / ENABLE / RESET(总线恢复) / SET_CFG / GET_CFG / XFER / RESULT / SCAN + DBG / PINTEST |
+| 上拉 | SCL 板上有 R6 10k；**SDA 没有**（外接 4.7k~10k，或用 `pullup=1` 开内部上拉应急） |
+
+**上板实测**（AT24Cxx @0x50；`python script_test/i2c_bridge_test.py eeprom` 一条命令跑完）：
+
+| 项 | 结果 |
+| --- | --- |
+| 扫描 0x08..0x77 | 找到 **0x50** |
+| 页写 8 B + 回读对账 | **逐字节一致**（A5 5A DE AD BE EF 12 34） |
+| 54 B 块读（地址自增） | 读到 EEPROM 里的 `"WELCOM TO RTT…"` |
+| 同一笔 54 B 读：100 kHz → 400 kHz | **5243 µs → 1309 µs**（4.0×，与档位一致）；1 MHz 该模块也跟得上 |
+| 错误路径 | 无器件 NACK / 参数越界 / 未使能 / 事务中重发 —— 全部按预期报码（`... err` 全绿） |
+
+**踩过的两个坑**（已写进文档）：① 子地址原来按"u32 小端取低位"解释，`addr_len=1` 时发出去的
+恒是 0x00（每次读都从地址 0 开始，白查一轮）—— 现在协议就是"字节数组按原序发出"；
+② GPIO 接管焊盘必须 `gpiom_set_pin_controller()` + `gpiom_enable_pin_visibility()` 两步，
+只做后者的话 `gpio_write_pin()` 写了不出去，现象和"脚没接上"一模一样。
+
+网页侧按 [`docs/web-handoff-i2c-bridge.md`](docs/web-handoff-i2c-bridge.md) 做即可
+（协议逐字节、取结果流程、排障三件套、页面形态建议都在里面）。
 
 ## 最新进展（2026-09-30）
 

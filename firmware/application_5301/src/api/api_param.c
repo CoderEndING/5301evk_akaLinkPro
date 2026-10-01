@@ -7,6 +7,7 @@
 #include "riscv_svc.h"
 #include "scope_sampler.h"
 #include "spi_bridge.h"
+#include "i2c_bridge.h"
 #include "SW_DP.h"
 #include "led_state.h"
 #include "hpm_dfu_trigger.h"
@@ -98,6 +99,13 @@
  * res_hid[3] = 动作号回显，res_hid[4..] = 状态字/计数器/配置块。
  * 动作表与帧格式见 src/spi_bridge/spi_bridge_proto.h 与 docs/usb-spi-bridge-plan.md。 */
 #define CMD_SPI (0x35)
+
+/* ---- CMD 0x36 I2C：USB→I2C 转发桥（src/i2c_bridge/）----
+ * I2C 慢、事务小，所以控制面与数据面都在**同一条 HID 报文**里（不开 bulk、不做 DMA）：
+ * 一次 XFER 登记一次事务（主循环执行，最长几毫秒），主机轮询 RESULT 取数据。
+ * 响应形状同上：res_hid[3] = 动作号回显，res_hid[4..7] = 状态字，res_hid[8..] = 数据。
+ * 动作表/状态字/XFER 布局见 src/i2c_bridge/i2c_bridge_proto.h 与 docs/web-handoff-i2c-bridge.md。 */
+#define CMD_I2C (I2C_HID_CMD)
 
 #define PARAM_MAGIC_NUMBER (0x0D000721UL)
 /* EasyFlash ENV key that stores the whole api_param_t blob. */
@@ -608,6 +616,13 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
         /* USB→SPI/QSPI 转发桥的控制面（动作见 src/spi_bridge/spi_bridge_proto.h）。
          * 数据面走新开的一对 bulk：OUT 0x0B / IN 0x8B。 */
         spi_bridge_hid(req_hid, res_hid);
+        break;
+    }
+    case CMD_I2C:
+    {
+        /* USB→I2C 转发桥（动作见 src/i2c_bridge/i2c_bridge_proto.h）。
+         * 控制面与数据面都在这一条 HID 上：中断里只登记请求，主循环执行事务。 */
+        i2c_bridge_hid(req_hid, res_hid);
         break;
     }
     case CMD_RESET_DEVICE:

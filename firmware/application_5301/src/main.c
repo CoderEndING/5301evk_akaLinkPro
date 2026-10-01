@@ -19,6 +19,7 @@
 #include "riscv_svc.h"
 #include "scope_sampler.h"
 #include "spi_bridge.h"
+#include "i2c_bridge.h"
 #include "led_state.h"
 
 #if BOARD_HAS_USER_KEY_DFU
@@ -100,6 +101,9 @@ int main(void)
     /* USB→SPI/QSPI 转发桥：只清状态（引脚/时钟在 ENABLE=1 时才动）。 */
     spi_bridge_init();
 
+    /* USB→I2C 转发桥：同上，只清状态。 */
+    i2c_bridge_init();
+
     while (1)
     {
         chry_dap_handle();
@@ -122,6 +126,9 @@ int main(void)
         /* USB→SPI/QSPI 转发桥（HID 0x35 控制面 + bulk 0x0B/0x8B 数据面）。
          * 未使能时只有一条分支的开销；使能后每轮按预算处理若干帧。 */
         spi_bridge_poll();
+        /* USB→I2C 转发桥（HID 0x36）：执行主机登记的事务（最长几毫秒，所以
+         * 绝不在 HID 中断里做）。未使能时只有一条分支的开销。 */
+        i2c_bridge_poll();
     }
     return 0;
 }

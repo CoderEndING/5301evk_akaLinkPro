@@ -565,6 +565,61 @@ Byte[0x03-0x3F] = Command data（可选）
       做**显式勾选框**用的。自动暂停只恢复"自己关过的那一次"，不会覆盖手动关掉的状态。
     - 关着的时候别去开 RTT —— 桥被关了，RTT 的数据没有出口。
 
+19. USB→I2C 转发桥指令 0x36（分支 `feature/usb-i2c-bridge`，**仅 HPM5301EVKLite**）
+    把探针当"USB 转 I2C 主机"用。I2C 慢、事务小，所以**控制面与数据面都在这一条 HID
+    报文里**：不开 bulk 端点、不用 DMA、没有环/帧流。一次 XFER = 一次完整事务
+    （`START … repeated START … STOP`），由**主循环**执行（最长 ~5 ms，绝不能占着 USB
+    中断），HID 中断只登记请求；主机发完轮询 `RESULT` 取错误码与数据 —— 与第 17 条
+    RISC-V、第 16 条标定同一套"登记 → 主循环执行 → 轮询取结果"模式。
+
+    引脚（EVKLite J3）：**PA28 = SDA = J3[21]**、**PA29 = SCL = J3[19]**（I2C3；
+    J3 上唯一一对引出来的硬件 I2C 脚，与 SPI2/SWD/UART 都不冲突）。
+    ⚠️ SCL 上有 R6 10k 上拉、**SDA 没有**（外接 4.7k~10k，或 `pullup=1` 开内部上拉应急）；
+    ⚠️ PA29 与 USB0_OC 网络共用（AP2151 nFAULT）：开漏使用没问题，USB 限流报故障时会把
+    SCL 拉低 → 发 `RESET` 恢复。
+
+    主机发送 request（数据区 60 B 可用）
+    Byte[0x00] = 0x01 // Report ID（**不足 64 B 要补零**）
+    Byte[0x01] = 长度
+    Byte[0x02] = 0x36 // Command type
+    Byte[0x03] = action
+    Byte[0x04..] = 参数（按 action）
+
+    action 表：0 = STATUS（读计数器）、1 = ENABLE（`req[4]` = 0/1）、2 = RESET（总线恢复）、
+    3 = SET_CFG（`req[4..19]` = 16 B 配置块）、4 = GET_CFG、5 = XFER（`req[4..]` = 一次事务）、
+    6 = RESULT（取上一次结果）、7 = SCAN（扫 0x08..0x77）、
+    10 = DBG（12 × u32 现场快照）、11 = PINTEST（引脚/上拉/驱动自检）、
+    12 = BITPROBE（实验性的 GPIO 位翻转探测，**别用它判器件在不在**）。
+
+    设备回应 response
+    Byte[0x00] = 0x02 // Report ID
+    Byte[0x01] = 长度
+    Byte[0x02] = 0x36 // Command type
+    Byte[0x03] = **回显 action**
+    Byte[0x04..0x07] = 状态字（小端）
+    Byte[0x08..] = 数据（按 action）
+
+    状态字：bit0 = 已使能；bit1 = PENDING（还没做完，继续轮询 RESULT）；
+    bit2 = BUS_OK（总线空闲）；bit3/bit4 = SDA/SCL 线电平（控制器线感知）；
+    bit8..15 = 最近一次**完成**事务的错误码；bit16..23 = 完成计数（低 8 位）；
+    **bit24..31 = 本命令的结果码**（0 = 正常；XFER/SCAN 下非 0 = 被拒，2 = 忙就重发）。
+
+    XFER 参数（`req[4..]`）：`flags`(1，保留必须 0) `dev`(1，7 位) `addr_len`(1) `wr_len`(1)
+    `rd_len`(1) `addr`(4，**字节数组按原序发出**) `wr_data`(≤51)。约束：`wr_len ≤ 51`、
+    `rd_len ≤ 54`。线序四种子情况：只探测（都 0）／只写／只读（无子地址）／
+    写子地址+数据再 repeated START 读。
+
+    RESULT：`res[8]` = 错误码、`res[9]` = 长度 n、`res[10..]` = 数据（SCAN 的 n = 14，
+    是 0x08..0x77 的位图，bit0 = 0x08）。
+
+    错误码：0 OK / 1 未使能 / 2 忙 / 3 地址没 ACK / 4 数据被 NACK / 5 超时 /
+    6 参数越界 / 7 未知 action / 8 总线被拉死 / 9 其它。
+
+    **逐字节细节、取结果流程、分片办法、排障三件套与页面形态建议**：
+    见仓库文档 `docs/web-handoff-i2c-bridge.md`（协议唯一真源是
+    `src/i2c_bridge/i2c_bridge_proto.h`）。自检工具：
+    `python script_test/i2c_bridge_test.py eeprom|scan|pintest|err`。
+
 ## 配置说明
 
 1. 输出模式

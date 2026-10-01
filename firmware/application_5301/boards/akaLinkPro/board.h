@@ -150,6 +150,10 @@
  * USB→SPI/QSPI 转发桥在这个构建里编成空实现。见 docs/usb-spi-bridge-plan.md §2.8。 */
 #define BOARD_HAS_SPI_BRIDGE (0)
 
+/* USB→I2C 转发桥：本板不引出（EVKLite 用的 PA28/PA29 在这块板上是 SWDIO/SWCLK，
+ * 正是 DAP 的目标调试口），编成空实现。见 docs/web-handoff-i2c-bridge.md。 */
+#define BOARD_HAS_I2C_BRIDGE (0)
+
 
 #if defined(__cplusplus)
 extern "C"
