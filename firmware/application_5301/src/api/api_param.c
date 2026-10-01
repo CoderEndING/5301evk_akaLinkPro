@@ -484,7 +484,9 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
                 vars[i].type = p[5];
                 vars[i].rsv = 0U;
             }
-            scope_sampler_configure(period, flags, n, vars);
+            /* 返回码经 res[2]（start_result）与状态字 10 回报：-6 = 变量宽度非法整包拒绝。
+             * 被拒时变量表会被清空，主机随后发 START 会拿到 -3，不会拿旧计划偷偷跑。 */
+            (void)scope_sampler_configure(period, flags, n, vars);
             break;
         }
         case SCOPE_ACT_BENCH:

@@ -40,6 +40,17 @@
 #define SCOPE_MCHTMR_HZ   24000000UL          /* MCHTMR = osc24m（与 rtt_bridge.c 一致） */
 #define SCOPE_HDR         16U
 #define SCOPE_PAYLOAD     (SCOPE_PACKET - SCOPE_HDR)   /* 496 */
+
+/* 变量宽度只允许 1/2/4/8（scope_var_t 的契约）。主机报文里那个 size 字节是
+ * **唯一**决定 span 长度与帧内偏移的输入：不校验的后果是越界写，而且是静默的 ——
+ *   · span 长度会到 256 B，而中转缓冲 s_stage 只有 SCOPE_SPAN_MAX+4 = 68 B；
+ *   · 8 个宽变量的帧长可到 2016 B，直读落点会推到 512 B 包缓冲外面（最多 ~1.5 KB）。
+ * 所以 configure 里整包拒绝、make_plan 里再守一道（防将来的调用方绕过）。 */
+#define SCOPE_VAR_SIZE_OK(sz) (((sz) == 1U) || ((sz) == 2U) || ((sz) == 4U) || ((sz) == 8U))
+#define SCOPE_ERR_BADVAR  (-6)                /* 配置被拒：变量宽度非法 */
+
+/* 帧必须装得进一个包：宽度 ≤8 × 变量数 ≤8 ⇒ ≤64 B。宽度校验把这条变成不变量。 */
+_Static_assert((SCOPE_MAX_VARS * 8U) <= SCOPE_PAYLOAD, "帧装不进一个包");
 #define SCOPE_MAGIC       0x4A53U             /* 'J','S'（小端下发：53 4A） */
 #define SCOPE_VER         1U
 #define SCOPE_KIND_DEF    1U
@@ -184,6 +195,21 @@ static int scope_span_is_direct(const scope_span_t *sp)
  * 与网页 planReads() 同源，两边的 span 数应当一致（DEF 包里回报，主机对账）。 */
 static void scope_make_plan(void)
 {
+    /* 🚨 硬守卫（冷路径，配置时跑一次）：宽度非法就**不排计划** —— s_nspans/s_frame_bytes
+     * 留 0，于是 scope_start_now()/scope_run_bench() 都会以 -3 退出，一次读都不会发。
+     * 正常路径在 scope_sampler_configure() 已经整包拒绝过了，这里防的是"将来新增的
+     * 调用方绕过那道校验"：一旦排出去，span 长度会超过 s_stage 与包缓冲，越界写是静默的。 */
+    for (uint8_t i = 0U; i < s_nvars; i++)
+    {
+        if (!SCOPE_VAR_SIZE_OK(s_var[i].size))
+        {
+            s_nspans = 0U;
+            s_frame_bytes = 0U;
+            s_per_packet = 0U;
+            return;
+        }
+    }
+
     /* 插入排序：只有 ≤8 个元素，不值得引 qsort */
     for (uint8_t i = 1U; i < s_nvars; i++)
     {
@@ -381,10 +407,16 @@ static void scope_push_def(void)
     s_bytes += SCOPE_PACKET;
     if (!(s_flags & SCOPE_FLAG_DISCARD))
     {
-        s_tx_busy[buf] = 1U;
-        s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
-        s_if_count++;
-        usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET);
+        /* 🚨 与 scope_push_packet 同一套账：**先记账再发、还不看返回值**是错的 ——
+         * 端点写失败（USB 复位后、端点重新使能之前，端口层返回 -2）不会有完成回调，
+         * 这个缓冲就永远回不来；STAT 每 64 包一次，攒够 8 次推流就停摆。
+         * 失败就不记账，让它留在空闲池里（DEF/STAT 不带样本，所以不计 usb_drop）。 */
+        if (usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET) == 0)
+        {
+            s_tx_busy[buf] = 1U;
+            s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
+            s_if_count++;
+        }
     }
     s_fill_buf = save;
 }
@@ -411,10 +443,13 @@ static void scope_push_stat(void)
     s_bytes += SCOPE_PACKET;
     if (!(s_flags & SCOPE_FLAG_DISCARD))
     {
-        s_tx_busy[buf] = 1U;
-        s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
-        s_if_count++;
-        usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET);
+        /* 同上（scope_push_def 的说明）：失败不记账，否则缓冲永久占死。 */
+        if (usbd_ep_start_write(0, SWO_IN_EP, s_pkt[buf], SCOPE_PACKET) == 0)
+        {
+            s_tx_busy[buf] = 1U;
+            s_inflight[(s_if_head + s_if_count) % SCOPE_TX_BUFS] = buf;
+            s_if_count++;
+        }
     }
     s_fill_buf = save;
 }
@@ -912,9 +947,42 @@ void scope_sampler_poll(void)
 
 /* ------------------------------------------------------------------ 控制面 */
 
-void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars)
+/* 停采样，并把"是因为采样才关掉的"那一次 CDC/串口桥还回去。
+ * 两条路走它：① 运行中改配置（半新半旧地跑要不得）；② 配置被拒（整包拒绝时也得停）。
+ * 不动 s_start_rc —— 由调用方决定报什么码。 */
+static void scope_stop_for_reconfig(void)
+{
+    s_running = 0U;
+    if (s_cdc_suspended)
+    {
+        s_cdc_suspended = 0U;
+        chry_dap_usb2uart_set_enabled(1U);
+    }
+}
+
+int scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars)
 {
     if (nvars > SCOPE_MAX_VARS) { nvars = SCOPE_MAX_VARS; }
+
+    /* 🚨 主机输入面：变量宽度必须合法（见 SCOPE_VAR_SIZE_OK 的说明）。不合法**整包拒绝**
+     * —— 不采纳、不建计划、把变量表清空（半解析的 plan 更难查），并把返回码经
+     * res[2]（start_result）与状态字 10 报给主机：-6 = 配置被拒。
+     * 之后主机再发 START 会拿到 -3（变量表为空），不会拿着旧计划偷偷跑。 */
+    for (uint8_t i = 0U; i < nvars; i++)
+    {
+        if (!SCOPE_VAR_SIZE_OK(vars[i].size))
+        {
+            scope_stop_for_reconfig();
+            s_nvars = 0U;
+            s_nspans = 0U;
+            s_frame_bytes = 0U;
+            s_per_packet = 0U;
+            s_start_rc = (int8_t)SCOPE_ERR_BADVAR;
+            s_last_cmd = 7U;
+            return SCOPE_ERR_BADVAR;
+        }
+    }
+
     if (period_us < SCOPE_MIN_PERIOD_US) { period_us = SCOPE_MIN_PERIOD_US; }
     if (period_us > SCOPE_MAX_PERIOD_US) { period_us = SCOPE_MAX_PERIOD_US; }
     s_period_us = period_us;
@@ -961,16 +1029,15 @@ void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, c
     if (s_running)
     {
         /* 运行中改配置：停掉再等主机启动 —— 免得半新半旧地跑（周期/变量表混用） */
-        s_running = 0U;
-        s_start_rc = -100;
-        /* 这条路径也在"停"，所以自动暂停的 CDC 桥同样要还回去 */
-        if (s_cdc_suspended)
-        {
-            s_cdc_suspended = 0U;
-            chry_dap_usb2uart_set_enabled(1U);
-        }
+        scope_stop_for_reconfig();
     }
     s_last_cmd = 7U;
+
+    /* 配置动作的应答里那个返回码（res[2] / 状态字 10）报的就是**本次配置的判定**：
+     * 0 = 已采纳、-6 = 被拒。不写这一行的话它会停在上一次的启动结果上（例如 -3），
+     * 主机读到的就是陈旧值 —— 验收脚本里当场抓到过。 */
+    s_start_rc = 0;
+    return 0;
 }
 
 void scope_sampler_set_clock(uint32_t hz)

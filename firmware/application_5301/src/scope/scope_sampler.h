@@ -56,8 +56,10 @@ typedef struct
     uint16_t rsv;
 } scope_var_t;
 
-/* HID 0x32 action 7：周期 + 变量表（地址排序由本模块自己做，主机只管给表） */
-void scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars);
+/* HID 0x32 action 7：周期 + 变量表（地址排序由本模块自己做，主机只管给表）。
+ * 返回 0 = 已采纳；-6 = 整包拒绝（变量宽度不是 1/2/4/8，见 scope_sampler.c 的说明）。
+ * 被拒时**不采纳任何字段**、变量表清空；判定经 res[2] / 状态字 10 回报（0 或 -6）。 */
+int scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars);
 
 /* HID 0x32 action 3：设 SWD 时钟（Hz，走 RTT 桥那套斜坡换挡）。0 = 不动。 */
 void scope_sampler_set_clock(uint32_t hz);
@@ -66,7 +68,8 @@ void scope_sampler_set_clock(uint32_t hz);
 void scope_sampler_request_start(void);
 
 /* 最近一次启动的返回码：0 正常 / -1 SWJ_Clock / -2 SWD 初始化 / -3 变量表为空 /
- * -4 该档链路不可用 / -100 = 排队中（哨兵值，不是错误 —— 与 RTT 桥同一约定） */
+ * -4 该档链路不可用 / -6 配置被拒（变量宽度非法）/ -100 = 排队中（哨兵值，不是错误 ——
+ * 与 RTT 桥同一约定）。-5 = 标定没有空闲包缓冲，只在 bench 结果里出现。 */
 int  scope_sampler_start_result(void);
 
 /* HID 0x32 action 0 */
