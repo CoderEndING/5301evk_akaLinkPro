@@ -99,7 +99,7 @@ uint8_t i2c_bridge_owns_pad(uint16_t pad)
  * 主循环十几毫秒，DAP/CDC 会卡）。 */
 #define IB_SCAN_PER_POLL 16U
 
-/* 请求种类（s_req_kind） */
+/* 请求种类（i2c_bridge_req_kind） */
 #define IB_REQ_NONE    0U
 #define IB_REQ_XFER    1U
 #define IB_REQ_SCAN    2U
@@ -128,7 +128,8 @@ static i2c_cfg_t s_cfg;
 static uint8_t   s_enabled;
 static uint32_t  s_actual_scl_hz;
 
-static volatile uint8_t s_req_kind;              /* ≠0 = 有登记请求还没做完 */
+/* 非 static：主循环用头文件里的 i2c_bridge_busy() 内联读它，避免为了看一眼标志就进 flash（见 i2c_bridge.h） */
+volatile uint8_t i2c_bridge_req_kind;              /* ≠0 = 有登记请求还没做完 */
 static uint8_t  s_req[IB_REQ_BYTES];             /* XFER 参数副本 */
 static uint8_t  s_scan_next;                     /* 扫描进度：下一个要探测的地址 */
 
@@ -253,13 +254,13 @@ static void ib_enable(uint8_t on)
     {
         init_i2c_bridge_pins(s_cfg.pullup);
         ib_hw_init();
-        s_req_kind = IB_REQ_NONE;
+        i2c_bridge_req_kind = IB_REQ_NONE;
         s_enabled = 1U;
     }
     else
     {
         s_enabled = 0U;
-        s_req_kind = IB_REQ_NONE;
+        i2c_bridge_req_kind = IB_REQ_NONE;
         i2c_reset(IB_I2C);              /* 控制器先关掉，再松开引脚 */
         ib_pad_release(BOARD_I2C_BRIDGE_SDA_PAD);
         ib_pad_release(BOARD_I2C_BRIDGE_SCL_PAD);
@@ -394,7 +395,7 @@ static void ib_finish(uint8_t err, uint8_t len, uint32_t t0)
     s_last_ticks = (uint32_t)(mchtmr_now() - t0);
     if (err == I2C_OK) { s_ok++; } else { s_err_cnt++; }
     s_done_cnt++;
-    s_req_kind = IB_REQ_NONE;          /* ← 最后一步：主机据此判定"结果可用" */
+    i2c_bridge_req_kind = IB_REQ_NONE;          /* ← 最后一步：主机据此判定"结果可用" */
 }
 
 static void ib_exec_xfer(void)
@@ -600,7 +601,7 @@ void i2c_bridge_poll(void)
      * 所以只留**一次** volatile 读 + 一条分支 —— USB 复位的作废请求被编码成
      * `IB_REQ_CANCEL`（见 i2c_bridge_usb_reset()），不再单独查一个标志位
      * （实测两个标志 1.7% 的采样率，合并后回到 main 的水平）。 */
-    uint8_t kind = s_req_kind;
+    uint8_t kind = i2c_bridge_req_kind;
 
     if (kind == IB_REQ_NONE)
     {
@@ -608,12 +609,12 @@ void i2c_bridge_poll(void)
     }
     if (kind == IB_REQ_CANCEL)
     {
-        s_req_kind = IB_REQ_NONE;      /* 主机重新枚举：挂起的请求作废 */
+        i2c_bridge_req_kind = IB_REQ_NONE;      /* 主机重新枚举：挂起的请求作废 */
         return;
     }
     if (s_enabled == 0U)
     {
-        s_req_kind = IB_REQ_NONE;
+        i2c_bridge_req_kind = IB_REQ_NONE;
         return;
     }
 
@@ -629,7 +630,7 @@ void i2c_bridge_poll(void)
         (void)ib_exec_recover();
         break;
     default:
-        s_req_kind = IB_REQ_NONE;
+        i2c_bridge_req_kind = IB_REQ_NONE;
         break;
     }
 }
@@ -637,7 +638,7 @@ void i2c_bridge_poll(void)
 void i2c_bridge_usb_reset(void)
 {
     /* 中断上下文：一条字节写即原子。挂起的请求直接作废（与旧行为一致）。 */
-    s_req_kind = IB_REQ_CANCEL;
+    i2c_bridge_req_kind = IB_REQ_CANCEL;
 }
 
 uint8_t i2c_bridge_is_enabled(void)
@@ -689,7 +690,7 @@ static uint32_t ib_status_word(void)
             w |= I2C_ST_SCL;
         }
     }
-    if (s_req_kind != IB_REQ_NONE)
+    if (i2c_bridge_req_kind != IB_REQ_NONE)
     {
         w |= I2C_ST_PENDING;
     }
@@ -779,14 +780,14 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         {
             rc = I2C_E_DISABLED;
         }
-        else if (s_req_kind != IB_REQ_NONE)
+        else if (i2c_bridge_req_kind != IB_REQ_NONE)
         {
             rc = I2C_E_BUSY;
             s_busy_rej++;
         }
         else
         {
-            s_req_kind = IB_REQ_RECOVER;
+            i2c_bridge_req_kind = IB_REQ_RECOVER;
         }
         break;
 
@@ -825,7 +826,7 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         {
             rc = I2C_E_DISABLED;
         }
-        else if (s_req_kind != IB_REQ_NONE)
+        else if (i2c_bridge_req_kind != IB_REQ_NONE)
         {
             rc = I2C_E_BUSY;
             s_busy_rej++;
@@ -836,7 +837,7 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
             if (rc == I2C_OK)
             {
                 memcpy(s_req, p, IB_REQ_BYTES);
-                s_req_kind = IB_REQ_XFER;
+                i2c_bridge_req_kind = IB_REQ_XFER;
             }
         }
         break;
@@ -846,7 +847,7 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         {
             rc = I2C_E_DISABLED;
         }
-        else if (s_req_kind != IB_REQ_NONE)
+        else if (i2c_bridge_req_kind != IB_REQ_NONE)
         {
             rc = I2C_E_BUSY;
             s_busy_rej++;
@@ -855,14 +856,14 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         {
             memset(s_res_data, 0, I2C_SCAN_BYTES);
             s_scan_next = I2C_SCAN_FIRST;
-            s_req_kind = IB_REQ_SCAN;
+            i2c_bridge_req_kind = IB_REQ_SCAN;
         }
         break;
 
     case I2C_ACT_RESULT:
     {
         res_hid[IB_RES_OFF + 4U] = s_res_err;
-        if (s_req_kind == IB_REQ_NONE)
+        if (i2c_bridge_req_kind == IB_REQ_NONE)
         {
             res_hid[IB_RES_OFF + 5U] = s_res_len;
             if (s_res_len != 0U)
@@ -927,7 +928,7 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
             rc = I2C_E_DISABLED;
             break;
         }
-        if (s_req_kind != IB_REQ_NONE)
+        if (i2c_bridge_req_kind != IB_REQ_NONE)
         {
             rc = I2C_E_BUSY;
             break;
@@ -968,7 +969,7 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
             rc = I2C_E_DISABLED;
             break;
         }
-        if (s_req_kind != IB_REQ_NONE)
+        if (i2c_bridge_req_kind != IB_REQ_NONE)
         {
             rc = I2C_E_BUSY;
             break;
@@ -1005,7 +1006,7 @@ void i2c_bridge_init(void)
     s_cfg.retries = 0U;
     s_enabled = 0U;
     s_actual_scl_hz = 0U;
-    s_req_kind = IB_REQ_NONE;
+    i2c_bridge_req_kind = IB_REQ_NONE;
     s_res_err = I2C_E_STATE;
     s_res_len = 0U;
     s_done_cnt = 0U;

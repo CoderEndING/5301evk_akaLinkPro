@@ -39,4 +39,15 @@ uint8_t i2c_bridge_is_enabled(void);
 /* 交叉检查：桥使能时是否占着这根 pad（SPI 桥把它当辅助脚之前会问一句）。 */
 uint8_t i2c_bridge_owns_pad(uint16_t pad);
 
+/* ---- 主循环热路径专用 ------------------------------------------------------
+ * `i2c_bridge_poll()` 在 flash 里；主循环**每圈**都调它的话，那次 XPI 取指的
+ * 固定开销会摊进采样周期 —— 实测 SCOPE 单变量标定 611 → 589 kHz（−3%）。
+ * 所以主循环先内联读一下这个标志，只有真有请求时才进函数（零开销、延迟最小）。 */
+extern volatile uint8_t i2c_bridge_req_kind;
+
+static inline uint8_t i2c_bridge_busy(void)
+{
+    return (i2c_bridge_req_kind != 0U) ? 1U : 0U;
+}
+
 #endif /* __I2C_BRIDGE_H__ */

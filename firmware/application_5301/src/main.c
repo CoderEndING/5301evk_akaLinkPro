@@ -127,8 +127,13 @@ int main(void)
          * 未使能时只有一条分支的开销；使能后每轮按预算处理若干帧。 */
         spi_bridge_poll();
         /* USB→I2C 转发桥（HID 0x36）：执行主机登记的事务（最长几毫秒，所以
-         * 绝不在 HID 中断里做）。未使能时只有一条分支的开销。 */
-        i2c_bridge_poll();
+         * 绝不在 HID 中断里做）。🚨 先内联读标志再决定要不要进函数：poll 在
+         * flash 里，每圈都调它的话那次 XPI 取指会摊进采样周期（实测 SCOPE
+         * 单变量标定 −3%）；内联判断后与 main 持平。 */
+        if (i2c_bridge_busy())
+        {
+            i2c_bridge_poll();
+        }
     }
     return 0;
 }
