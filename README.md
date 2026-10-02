@@ -1,5 +1,26 @@
 # akaLinkPro
 
+> ## 用 J-Link PRO **1% 的价格**（**¥69** vs **¥7000**），拿到它 **90% 的性能**
+>
+> 整机 = 一块 HPM5301EVKLite 开发板（**¥69**）+ 一根 USB 线。**零安装、零驱动、零配置** ——
+> 浏览器打开一个网址，就是一套完整的调试工作台：调试、烧录、串口、RTT、变量示波、点屏、摸总线。
+
+| # | 能力 | 实测数字 |
+| --- | --- | --- |
+| ① | **调试与传输**（对标 J-Link PRO 的下载 / 调试通路） | 60 MHz 档写 **3384** / 读 **2928** KB/s（OpenOCD 纯传输口径）；探针侧 RTT→CDC **2954 KB/s = 主机轮询上限的 2.6 倍**；RISC-V 目标 SRAM 读写 **约 1510 KB/s = OpenOCD 主机驱动的 9 倍** |
+| ② | **变量示波（J-Scope / HSS）** | 单变量 u32 端到端 **330 kHz**（探针本体 637 kHz）、双变量 **114 kHz**、8 通道 **82 kHz**。同样口径下 **J-Link PRO 的 J-Scope 单变量是 100 kHz** —— 这里是它的 **3.3 倍**；而且**目标固件一行都不用改** |
+| ③ | **零安装上位机**（WebUSB / WebHID） | **11 个标签页**：DAPLink 调试器 · gdb 风格命令行调试 · 串口助手 · Xshell 式终端 · RTT Viewer · RTT→串口超高速转发 · J-Scope 变量示波 · 零安装 Flash 烧录 · USB→SPI/QSPI 调试助手 · SPI/QSPI 点屏助手 · USB→I2C 调试助手 · 典型工程 Makefile 模板生成 |
+
+**③ 就在这里，不用装任何东西**：👉 <https://minichao9901.github.io/web-serial-rtt-tools/>
+（桌面版 Chrome / Edge，插上探针授权一次即可；源码在
+[web-serial-rtt-tools](https://github.com/minichao9901/web-serial-rtt-tools)，逐页说明见
+[上位机（零安装网页工作台）](#上位机零安装网页工作台)）
+
+> 一句话：**同样的活它能干，价格只有它的 1/100**（¥69 对 ¥7000）。下面每一格数字都是本仓库里
+> 可复现的上板实测，不是标称值 —— 口径、靶子型号、测量脚本都在 [`script_test/`](script_test)。
+
+<br>
+
 akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套应用源码支持两块硬件：
 
 | 板级 | 板级目录 | DAP 目标侧输出 | CDC 虚拟串口 |
@@ -63,6 +84,33 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
   APP 带签名 + 长度 + CRC32 校验，校验失败停在 DFU。
 - **配置持久化 + WebHID 上位机**：配置存 QSPI NOR（EasyFlash），`docs/index.html` 可直接改。
 - **两块硬件一套源码**：akaLinkPro 原板与 HPM5301EVKLite 移植板，靠 `board.h` 特性宏切换。
+
+## 上位机（零安装网页工作台）
+
+**纯静态网页，直接托管在 GitHub Pages，打开就能用：**
+👉 <https://minichao9901.github.io/web-serial-rtt-tools/>
+
+桌面版 Chrome / Edge；串口、HID、USB 设备在页面里**授权一次**即可，不装驱动、不装 OpenOCD、
+不装 gdb、不装 J-Link 软件包。源码与逐页文档在另一个仓库
+[web-serial-rtt-tools](https://github.com/minichao9901/web-serial-rtt-tools)。
+
+| 标签页 | 干什么 |
+| --- | --- |
+| **调试器** | 网页里的极简 DAPLink：暂停 / 继续 / **单步** / 复位、寄存器表（回车即改）、内存 hexdump（点字节即改）、**FPB 硬件断点**、按符号名的 **gdb 风格命令行**，旁边顺手看 RTT。载入 `.elf` 后可按**源码行**下断点，停下来时源码区跟着 PC 走（DWARF 行号表） |
+| **烧录器** | `.elf/.hex/.bin` 写进目标：**零安装 WebUSB**（页面里跑 flashloader，擦 / 写 / 校验 / 复位一条龙），或可选本地桥 + OpenOCD |
+| **串口助手** | SSCOM 那套核心功能：ASCII/HEX 收发、**ANSI 彩色接收**、时间戳、定时发送、快捷发送、存盘、**高速自动关显示**（>50 KB/s 停渲染、数据照收） |
+| **终端** | Xshell 式串口终端：xterm.js 渲染 ANSI、本地回显、回车/退格映射、粘贴发送；侧栏可直接开 RTT→CDC 转发 |
+| **RTT Viewer** | SEGGER RTT 多通道查看 + 下行输入 + 复位目标，**目标类型 SWD/ARM 或 RISC-V/JTAG 可选**（HPM 系列走 JTAG+DMI+SBA），四种后端 |
+| **RTT 转发** | 本探针的**探针侧** RTT→CDC：探针自己轮询目标控制块、把数据塞进自己的 CDC 口，**主机只读一个 COM 口** —— 网页上它就长成"一个超高速串口" |
+| **J-Scope 波形** | 变量示波器：探针自己按固定周期读目标 RAM（HSS），多通道波形 + 触发 + CSV 导出 + 原始包回放 |
+| **SPI/QSPI 桥** | USB→SPI/QSPI 调试助手：命令表 / 脚本 / **外接 NOR flash 测试**（读 ID、SFDP、读测速、擦写校验）/ 回环自检 |
+| **SPI/QSPI 屏** | 点屏助手：刷屏（内置图案 / 拖入图片 / 动图 / 视频，**局部刷新**只发与上一帧不同的包围盒）、厂规面板初始化表解析与重放（每个字节可改、可点开看 8 个 bit）、读回 GRAM 还原成图 |
+| **USB→I2C** | USB 转 I2C 主机：总线扫描 / 命令表 / 脚本（`loop 100ms … end` 就是 `while(1)` 定时读写）/ 实时值解码（把字节变成 g / ℃ / V + 迷你曲线），长读自动分片 |
+| **工程生成** | 拖进 Keil `.uvprojx`，生成 `Makefile.jlink` / `jlink_gdb.script` / `Makefile.pyocd` / `Makefile.openocd`（含 `rtt_logger.py`）/ `test_sram.bin`，参数可填可勾、产物实时预览 |
+
+> 为什么零安装这件事不容易：J-Link 与 OpenOCD 都是**本机程序**，浏览器无权启动进程、
+> 也无权开 TCP。所以本项目的零安装通路是 **WebUSB 直连 CMSIS-DAP 探针**（RTT / J-Scope /
+> 烧录都走它），想用 J-Link 或 OpenOCD 时再启动那个可选的本地桥（`bridge/`）。
 
 ## 最新进展（2026-10-02）
 
@@ -764,8 +812,9 @@ RTT 桥切目标类型用 `CMD_RTT`（0x31）的 action 10。
 类 SEGGER J-Scope 的**变量示波器**：探针自己按固定周期用 SWD 读目标 RAM 里 1~8 个变量，
 组 512 B 自描述包，从 interface 0 上那个**原本闲置的 bulk IN `0x83`**（SWO 端点，
 `SWO_STREAM=0` 所以一直没人写过）推给主机。**目标固件一行都不用改** —— 变量地址来自
-目标 `.elf` 的 DWARF。上位机是另一仓库
-[web-serial-rtt-tools](https://github.com/minichao9901) 的「J-Scope 波形」页（WebUSB）。
+目标 `.elf` 的 DWARF。上位机是另一个仓库
+[web-serial-rtt-tools](https://github.com/minichao9901/web-serial-rtt-tools) 的
+「J-Scope 波形」页（WebUSB，**在线直接打开**：<https://minichao9901.github.io/web-serial-rtt-tools/>）。
 
 控制面 HID `CMD_SCOPE 0x32`（形状照抄 0x31），数据面 `0x83`。协议与状态字见
 [`Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) 第 16 条。
@@ -1297,6 +1346,66 @@ python spi_bridge_test.py dbg             # SPI 寄存器现场快照（卡在�
 > 720 MHz、SCLK 焊盘必须带 `LOOP_BACK`、延时要有序帧流内生效）。
 
 
+## USB→I2C 转发桥
+
+把探针当 **USB 转 I2C 主机**用：HID `CMD_I2C` **0x36**，**只走 HID 一条通路、不占 DMA**。
+上位机是网页版「USB→I2C」标签页（总线扫描 / 命令表 / 脚本 / 实时值四个 tab，
+<https://minichao9901.github.io/web-serial-rtt-tools/>）。
+
+### 接线
+
+| 信号 | 引脚 | J3 位置 |
+| --- | --- | --- |
+| **SDA** | `PA28` | J3.21 |
+| **SCL** | `PA29` | J3.19 |
+
+这是 J3 上唯一一对引出来的硬件 I2C 脚（I2C3）。记得**共地**；上拉按从器件的实际情况加。
+
+### 协议与能力
+
+- **一次事务 = 一条 HID 报文**：子地址 + 写数据 + **repeated START** + 读，一口气跑完；
+  写 ≤ **51 B** / 读 ≤ **54 B**。
+- **主机轮询取结果**，不在中断里碰外设寄存器：事务登记在 HID 中断、执行在主循环
+  （与 `CMD_RISCV` 同款模型）。
+- **三档速率**：100 kHz / 400 kHz / 1 MHz。
+- 状态字里除了**本命令的结果码**（bit24..31），还有 **SDA/SCL 的真实线电平**（bit3/4）——
+  总线被谁拉死一眼可见。
+- 配套三个诊断：**总线扫描**（0x08..0x77）、**引脚自检**（在真实事务中采线电平，证明脚
+  确实在驱动总线）、**总线恢复**（`RESET` = 清计数器 + 9 个 SCL 脉冲）。
+
+### 实测（2026-10-02，AT24Cxx EEPROM）
+
+| 项 | 结果 |
+| --- | --- |
+| 总线扫描 | 扫到 **0x50** |
+| 页写 → 回读 | **逐字节一致** |
+| 54 B 块读 @ 100 kHz | **5243 µs** |
+| 54 B 块读 @ 400 kHz | **1309 µs**（档位 ×4、耗时 ÷4，线性） |
+| `eeprom` 门禁连跑 10 遍 | **10/10 通过，探针健在** |
+
+### 用自检工具跑一遍
+
+```powershell
+cd script_test
+python i2c_bridge_test.py info                 # 探针支持 0x36 吗、当前档位与状态
+python i2c_bridge_test.py scan                 # 扫总线找从机
+python i2c_bridge_test.py pintest              # 总线/引脚自检
+python i2c_bridge_test.py eeprom               # AT24C02：页写 → 回读校验（数据面门禁）
+python i2c_bridge_test.py eeprom --dev 0x50 --n 8
+1..10 | % { python i2c_bridge_test.py eeprom } # 挂死类问题要连跑
+python i2c_bridge_test.py rd 0x50 0x00 54      # 直接读 54 B
+```
+
+> 🚨 **改这块代码前必读** [`docs/usb-i2c-bridge-plan.md`](docs/usb-i2c-bridge-plan.md) §8：
+> 曾经「**收到第一条 0x36 就把整个探针挂死**」—— 枚举正常、EP0 能读描述符，但 HID 一个
+> 命令不回、CDC 打不开，**只能拔插**。真因是 `ib_status_word()` 无条件读 `IB_I2C->STATUS`，
+> 而 `init_board_clock()` 里**没有 `clock_i2c3`** ⇒ 给"没开时钟的 IP"发一次 AHB 读，
+> 事务可能永远不完成 ⇒ CPU 停在 USB 中断里。现在的规矩：上电即
+> `clock_add_to_group(clock_i2c3, 0)`，**未使能时一个寄存器都不读**。
+> 同处还记着三个"探针哑了"的假象（浏览器 WebHID 抢应答、HID 报文长度字段写 0 被丢、
+> Windows 侧管道卡住只能拔插）。
+
+
 ## 文档
 
 | 文档 | 内容 |
@@ -1304,11 +1413,13 @@ python spi_bridge_test.py dbg             # SPI 寄存器现场快照（卡在�
 | [`docs/hpm6800evk-jtag.md`](docs/hpm6800evk-jtag.md) | **HPM6800EVK（HPM6880，RISC-V）用本探针调 JTAG 的完整记录**：接线坑、启动头真相、DMI/SBA 引擎与专用汇编、三个 DTM 时序坑、RTT 交付率与跨后端极性 bug、TCK 频率上限 |
 | [`docs/HPM5301EVKLite_port.md`](docs/HPM5301EVKLite_port.md) | EVKLite 移植说明：引脚映射、构建、烧录、自调试、验证清单 |
 | [`docs/HANDOVER-evklite-20260927.md`](docs/HANDOVER-evklite-20260927.md) | 移植过程交接记录（含 CDC 回环故障的根因与修复） |
-| [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议（0x31 RTT / 0x32 SCOPE / 0x33 RISCV / 0x34 BRIDGE） |
+| [`firmware/application_5301/Custom HID Protocol.md`](firmware/application_5301/Custom%20HID%20Protocol.md) | HID 配置协议（0x31 RTT / 0x32 SCOPE / 0x33 RISCV / 0x34 BRIDGE / 0x35 SPI / 0x36 I2C） |
 | [`docs/web-handoff-riscv-scope.md`](docs/web-handoff-riscv-scope.md) | **给网页侧的最小改动说明**：波形页采 RISC-V 需要的三个新位、哪些 SWD 专属控件该藏、按后端分档的采样率提示 |
 | [`docs/代码审查报告.md`](docs/代码审查报告.md) | 两轮代码审查全文 + 逐条处置结论（修复/上板验证/判定不修的理由） |
 | [`docs/web-handoff-spi-bridge.md`](docs/web-handoff-spi-bridge.md) | **USB→SPI/QSPI 桥的主机侧实现说明**：HID 0x35 全部动作、bulk 帧格式与流程、面板初始化表怎么搬、排坑清单、实测性能 |
 | [`docs/usb-spi-bridge-plan.md`](docs/usb-spi-bridge-plan.md) | USB→SPI/QSPI 桥方案 + P1~P4 上板实测记录（含四条硬件硬约束与四个真坑） |
+| [`docs/web-handoff-i2c-bridge.md`](docs/web-handoff-i2c-bridge.md) | **USB→I2C 桥的主机侧实现说明**：HID 0x36 全部动作、事务与状态字格式、引脚与三档速率、排坑清单、AT24Cxx 实测 |
+| [`docs/usb-i2c-bridge-plan.md`](docs/usb-i2c-bridge-plan.md) | USB→I2C 桥方案 + 上板实测与「第一条命令就整机挂死」结案（含三个"探针哑了"的假象） |
 | [`script_test/stm32f103_scope/`](script_test/stm32f103_scope) | J-Scope 的靶子固件（F103C8/ZE，96 MHz，10 kHz 契约波形）+ `check.py` 客观验收 |
 | [`firmware/application_5301/Flash_Memory_Map.md`](firmware/application_5301/Flash_Memory_Map.md) | Flash 布局 |
 | [`firmware/application_5301/Firmware_Integrity_Plan.md`](firmware/application_5301/Firmware_Integrity_Plan.md) | 固件头/CRC 校验设计 |
