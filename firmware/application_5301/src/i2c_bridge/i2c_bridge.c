@@ -651,10 +651,20 @@ uint8_t i2c_bridge_owns_pad(uint16_t pad)
 static uint32_t ib_status_word(void)
 {
     uint32_t w = 0U;
-    uint32_t st = IB_I2C->STATUS;
 
+    /* 🚨 只有**使能之后**才允许碰 I2C 的寄存器。
+     * 原因（2026-10-02 用 J-Link 抓到的现场）：`init_board_clock()` 里没有
+     * `clock_i2c3` —— 上电时 I2C3 的 IP 时钟是**关着**的。而本函数每次 HID 命令
+     * 都会被调到（`ib_put_status()` → 每条 0x36 都走），它以前**无条件**读
+     * `IB_I2C->STATUS`：给没开时钟的 IP 发 AHB 读，事务可能永远不完成 ⇒ CPU 就
+     * 停在 ISR 里 ⇒ EP0/HID/CDC 一起哑掉，只能断电或复位恢复。表现就是"发一条
+     * 0x36 命令，整个探针死掉"（main 分支没有 0x36 处理，所以看起来只有本分支会死）。
+     * 现在双保险：① `i2c_bridge_init()` 里上电就把 IP 时钟打开；② 这里没使能就
+     * 一个寄存器都不读。 */
     if (s_enabled != 0U)
     {
+        uint32_t st = IB_I2C->STATUS;
+
         w |= I2C_ST_ENABLED;
         if ((st & I2C_STATUS_BUSBUSY_MASK) == 0U)
         {
@@ -863,6 +873,13 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
 
     case I2C_ACT_DBG:
     {
+        /* 未使能时寄存器还没配过，读它没有意义（而且历史上这正是那个"挂死总线"
+         * 的路径）—— 直接回 DISABLED，别碰寄存器。 */
+        if (s_enabled == 0U)
+        {
+            rc = I2C_E_DISABLED;
+            break;
+        }
         ib_put32(&res_hid[IB_RES_OFF + 4U], IB_I2C->CTRL);
         ib_put32(&res_hid[IB_RES_OFF + 8U], IB_I2C->STATUS);
         ib_put32(&res_hid[IB_RES_OFF + 12U], IB_I2C->ADDR);
@@ -969,6 +986,11 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
 
 void i2c_bridge_init(void)
 {
+    /* 上电就把 I2C3 的 IP 时钟打开：`init_board_clock()` 里没有它，不打开的话
+     * 这个 IP 的寄存器是"没时钟的"——从 ISR 里读它有可能把 AHB 事务挂死
+     * （见 ib_status_word() 的说明）。打开后所有寄存器访问都是安全的。 */
+    clock_add_to_group(IB_I2C_CLK, 0);
+
     memset(&s_cfg, 0, sizeof(s_cfg));
     s_cfg.scl_hz = 0U;                             /* 0 = 默认 100 kHz 档 */
     s_cfg.pullup = 0U;                             /* 依赖外部上拉 */
