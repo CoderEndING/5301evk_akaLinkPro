@@ -104,6 +104,8 @@ uint8_t i2c_bridge_owns_pad(uint16_t pad)
 #define IB_REQ_XFER    1U
 #define IB_REQ_SCAN    2U
 #define IB_REQ_RECOVER 3U
+/* USB 总线复位：让挂起的请求作废（由 i2c_bridge_usb_reset() 在中断里置位） */
+#define IB_REQ_CANCEL  4U
 
 /* XFER 参数区副本长度（req[4..63]） */
 #define IB_REQ_BYTES 60U
@@ -138,7 +140,6 @@ static volatile uint32_t s_done_cnt;             /* 已完成事务计数 */
 static uint32_t s_ok, s_err_cnt, s_tx_bytes, s_rx_bytes;
 static uint32_t s_nack_addr, s_nack_data, s_timeouts, s_recover, s_busy_rej;
 static uint32_t s_last_ticks;
-static volatile uint8_t s_usb_reset_req;
 
 static void ib_hw_init(void);
 
@@ -595,13 +596,19 @@ static uint8_t ib_exec_recover(void)
 
 void i2c_bridge_poll(void)
 {
-    if (s_usb_reset_req != 0U)
+    /* 🚨 热路径：这个函数在主循环里**每圈**都跑，探针的 DAP/SCOPE 吞吐直接吃它的开销。
+     * 所以只留**一次** volatile 读 + 一条分支 —— USB 复位的作废请求被编码成
+     * `IB_REQ_CANCEL`（见 i2c_bridge_usb_reset()），不再单独查一个标志位
+     * （实测两个标志 1.7% 的采样率，合并后回到 main 的水平）。 */
+    uint8_t kind = s_req_kind;
+
+    if (kind == IB_REQ_NONE)
     {
-        s_usb_reset_req = 0U;
-        s_req_kind = IB_REQ_NONE;      /* 主机重新枚举：挂起的请求作废 */
+        return;
     }
-    if (s_req_kind == IB_REQ_NONE)
+    if (kind == IB_REQ_CANCEL)
     {
+        s_req_kind = IB_REQ_NONE;      /* 主机重新枚举：挂起的请求作废 */
         return;
     }
     if (s_enabled == 0U)
@@ -610,7 +617,7 @@ void i2c_bridge_poll(void)
         return;
     }
 
-    switch (s_req_kind)
+    switch (kind)
     {
     case IB_REQ_XFER:
         ib_exec_xfer();
@@ -629,7 +636,8 @@ void i2c_bridge_poll(void)
 
 void i2c_bridge_usb_reset(void)
 {
-    s_usb_reset_req = 1U;
+    /* 中断上下文：一条字节写即原子。挂起的请求直接作废（与旧行为一致）。 */
+    s_req_kind = IB_REQ_CANCEL;
 }
 
 uint8_t i2c_bridge_is_enabled(void)

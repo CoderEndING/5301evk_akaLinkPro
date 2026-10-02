@@ -718,14 +718,6 @@ CMSIS-DAP 硬件 I/O 和 LED 引脚通过函数 \ref DAP_SETUP 进行初始化�
 */
 __STATIC_INLINE void DAP_SETUP(void)
 {
-#if defined(DIAG_KEEP_JTAG)
-    /* ⚠️ 仅用于诊断（2026-10-02）：**不动** PA04~PA07 —— 那正是 HPM5301 芯片自身的
-     * JTAG 脚（J5）。把它们复用成 DAP 的 SWD 输出之后，J-Link 就再也连不上芯片了
-     * （"APP 运行时芯片自身 JTAG 不可用"，docs/HPM5301EVKLite_port.md §4）。
-     * 定义 DIAG_KEEP_JTAG 时这里直接返回，好处是 APP 跑着也能被 J-Link halt 住看现场。
-     * 正常构建**不定义**这个宏，行为与原来逐字节一致。 */
-    return;
-#endif
 #ifdef BOARD_JTAG_PARK_PIN
     HPM_IOC->PAD[BOARD_JTAG_PARK_PIN].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
     HPM_IOC->PAD[BOARD_JTAG_PARK_PIN].PAD_CTL =

@@ -63,15 +63,6 @@ static void dfu_key_poll(void)
     if (mchtmr_freq == 0U)
     {
         mchtmr_freq = clock_get_frequency(clock_mchtmr0);
-        /* 🚨 本 SoC 上 `clock_get_frequency(clock_mchtmr0)` **返回 0**（没有兜底），
-         * 于是"按住 1 秒"的阈值变成 1×0=0 —— 按键按一下就会立刻进 DFU。
-         * 现场表现：手按住 USER 键（或它被压住）时，APP 起来枚举完就被复位打断，
-         * 看起来像"USB 在了但 HID/CDC 全哑"。mchtmr 是 osc24m 硬连的 24 MHz，
-         * 直接兜一个常数（工程里 scope/rtt/riscv/spi_bridge 都是这么写的）。 */
-        if (mchtmr_freq == 0U)
-        {
-            mchtmr_freq = 24000000UL;
-        }
     }
 
     if (now_pressed && !pressed)

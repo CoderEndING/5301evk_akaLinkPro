@@ -112,15 +112,6 @@ endif()
 
 # sdk_compile_definitions(-DCONFIG_NDEBUG_CONSOLE=1)
 
-# ---------------------------------------------------------------- 诊断开关 ----
-# 设了环境变量 DIAG_KEEP_JTAG=1 时，DAP_SETUP() 不再把 PA04~PA07 复用成 DAP 的
-# SWD 输出 —— 那几根正是芯片自身的 JTAG（J5），复用掉之后 J-Link 就 attach 不上。
-# **只用于诊断**（要在 APP 跑着的时候 halt 看现场）；正常构建不设该变量，产物与原来一致。
-if(DEFINED ENV{DIAG_KEEP_JTAG})
-    sdk_compile_definitions(-DDIAG_KEEP_JTAG=1)
-    message(STATUS "DIAG_KEEP_JTAG=1: DAP_SETUP() 保留芯片自身 JTAG 引脚")
-endif()
-
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/dfu)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/usb)
 sdk_inc(${CMAKE_CURRENT_SOURCE_DIR}/src/dap)

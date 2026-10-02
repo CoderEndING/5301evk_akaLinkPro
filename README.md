@@ -66,6 +66,25 @@ akaLinkPro 是一个基于 HPM5301 的高性能 CMSIS-DAP 调试器。同一套�
 
 ## 最新进展（2026-10-02）
 
+### USB→I2C 桥：修掉「收到第一条 0x36 命令就把整个探针挂死」（`a4d5205`）
+
+**症状**：只有 I2C 分支会出现——探针照样枚举、EP0 还能读描述符，但 HID 一个命令也不回、
+CDC 端口打不开，**只能拔插/复位**；main 上怎么折腾都不出现（所以一开始误判成"新功能把 USB 搞坏了"）。
+
+**真因**：`ib_status_word()` 被**每条** 0x36 命令调到，而它以前**无条件**读 `IB_I2C->STATUS`；
+可 `init_board_clock()` 里**没有 `clock_i2c3`** ⇒ 上电时 I2C3 的 IP 时钟关着，只有 `ENABLE` 才打开。
+**给"没开时钟的 IP"发一次 AHB 读，事务可能永远不完成** ⇒ CPU 停在 USB 中断里 ⇒ 全机哑掉。
+它时好时坏，所以早先 15 轮压测复现不出来（压测时桥是已使能的，时钟开着，根本踩不到）。
+
+**修法**（双保险）：`i2c_bridge_init()` 上电即 `clock_add_to_group(clock_i2c3, 0)`；
+`ib_status_word()` / `DBG` **未使能时一个寄存器都不读**。
+**验证**：`info/enable/pintest/scan(0x50)/eeprom/err` 门禁全过，`eeprom` 连跑 **10 遍 10/10**，之后探针健在。
+
+**排查时踩到的三个"假象"**（详见 [`docs/usb-i2c-bridge-plan.md`](docs/usb-i2c-bridge-plan.md) §8）：
+① 浏览器 **WebHID 会抢 HID IN 的应答**（页面开着时命令行测什么都像"HID 死了"）；
+② HID 报文的 **`req[1]`（长度）写 0 会被当空请求丢掉**；
+③ **Windows 侧 USB 管道卡住**时报 EP0 `Pipe error` / CDC "设备没有发挥作用"，只有拔插能清。
+
 ### 第三轮代码审查处置 + 探针侧发送队列（N1）：吞吐反而涨了
 
 完整处置表见 [`docs/代码审查报告.md`](docs/代码审查报告.md)。本轮修掉两条 P1/P2，外加把
