@@ -227,7 +227,7 @@ Byte[0x03-0x3F] = Command data（可选）
                   4=原始 DAP 透传（调试用），5=读探针自身内存（调试用），6=取透传结果，
                   7=运行时调参，8=纯 SWD 基准，9=取基准结果，
                   **10=切换目标类型**（Byte[0x04]：0=SWD/ARM，1=RISC-V/JTAG，
-                  见下方第 16 条）
+                  见下方第 17 条）
     Byte[0x04-0x07] = 目标地址（action=1 时可选，0 = 用默认搜索区间；
                                 action=8 时为目标地址）
     Byte[0x08-0x0B] = 搜索长度（action=1 时可选，0 = 默认；
@@ -276,7 +276,7 @@ Byte[0x03-0x3F] = Command data（可选）
     回写 RdOff）两边完全一样，只有底下三个原语分派不同 —— 读/RdOff 写走
     `src/riscv/` 的 DMI+SBA 引擎，初始化走 `riscv_jtag_open()`（TAP 复位 + 加载
     `IR=0x11` + 唤醒 DM）。此时 action 7 的"SWD 时钟 Hz"对 RISC-V 无意义，只有
-    <256 的值会被当成 DMI 的 idle 周期数（默认 8，见第 16 条）。
+    <256 的值会被当成 DMI 的 idle 周期数（默认 8，见第 17 条）。
     实测 HPM6800EVK 交付 **1105~1165 KB/s 且字节级零丢包**，
     测速脚本 `script_test/hpm6800_rtt_delivery.py` / `hpm6800_rtt_loss.py`。
 
@@ -345,7 +345,7 @@ Byte[0x03-0x3F] = Command data（可选）
            bit6 **目标是 RISC-V/JTAG**（不带这一位时跟随全局目标类型，见下）
 
     **目标类型与 RISC-V/JTAG 后端**（HPM6800EVK 这类只有 JTAG 的 RISC-V 目标）：
-    采样器的传输后端 = 全局目标类型（第 15 条 action 10，与 RTT 桥同一个开关），
+    采样器的传输后端 = 全局目标类型（第 13 条 action 10，与 RTT 桥同一个开关），
     flags bit6 可以**强制**本会话走 RISC-V。DEF 包里回报的是**生效值**，所以主机看到
     bit6 = 1 就说明这次确实走 JTAG 路径 —— 网页不改也能用（先切全局目标类型即可），
     想做得干净就在配置里带上 bit6。
@@ -441,7 +441,7 @@ Byte[0x03-0x3F] = Command data（可选）
     主机发送 request
     Byte[0x00] = 0x01 // Report ID
     Byte[0x01] = 0x0E // Data Length（最多 1+1+4+4+4+2）
-    Byte[0x02] = 0x32 // Command type
+    Byte[0x02] = 0x33 // Command type
     Byte[0x03] = action
     Byte[0x04-0x07] = 目标地址
     Byte[0x08-0x0B] = 参数 1
@@ -463,7 +463,7 @@ Byte[0x03-0x3F] = Command data（可选）
     设备回应 response
     Byte[0x00] = 0x02 // Report ID
     Byte[0x01] = 0x32 // Data Length = 1(回显 action) + 1 + 48(12 个状态字)
-    Byte[0x02] = 0x32 // Command type
+    Byte[0x02] = 0x33 // Command type
     Byte[0x03] = **回显 action**（注意不是返回码，返回码在状态字 [0] 的 bit16-23）
     Byte[0x04..0x33] = 12 个 32 位小端状态字
 
@@ -523,8 +523,9 @@ Byte[0x03-0x3F] = Command data（可选）
 
     说明与约束：
     - **探针必须先切到 `output_mode=1`（SWD+JTAG）**，`output_mode=0` 会拒绝 JTAG；
-      该设置只在 RAM 里，探针复位/重插即丢。见第 9 条 `CMD_SET_CONFIG`。
-      ⚠️ 把全局目标类型切回 SWD/ARM（第 16 条里 scope 的 `--swd`）会**顺带**把端口
+      该设置只在 RAM 里，探针复位/重插即丢。见第 2 条 `CMD_SET_CONFIG`。
+      ⚠️ 把全局目标类型切回 SWD/ARM（**第 13 条 action 10**；`scope_hss_test.py --swd`
+      走的就是这个开关）会**顺带**把端口
       模式改成 SWD-only，此后 OpenOCD 报 `CMSIS-DAP: JTAG not supported` /
       `Unsupported DTM version: -1`，要用 `CMD_SET_CONFIG` 切回 1 才恢复。
     - **RISC-V 引擎开着的时候会一直占着 TAP**（`open=1`）；要让 OpenOCD/DFU 用这条
@@ -564,6 +565,11 @@ Byte[0x03-0x3F] = Command data（可选）
       就够了（网页只要在已有的 CONFIG 报文里加一位，不必自己管状态）；本命令是给面板
       做**显式勾选框**用的。自动暂停只恢复"自己关过的那一次"，不会覆盖手动关掉的状态。
     - 关着的时候别去开 RTT —— 桥被关了，RTT 的数据没有出口。
+
+    > 📌 **0x35（USB→SPI/QSPI 转发桥）不在这份文档里** —— 它的形状与 0x34/0x36 差别较大
+    > （配置走 HID、数据面走另一对 bulk：OUT `0x0B` / IN `0x8B`，帧格式见
+    > `src/spi_bridge/spi_bridge_proto.h`），完整说明在 **`docs/web-handoff-spi-bridge.md`**。
+    > 这里留一行只为免得照编号找的人以为漏了。
 
 19. USB→I2C 转发桥指令 0x36（分支 `feature/usb-i2c-bridge`，**仅 HPM5301EVKLite**）
     把探针当"USB 转 I2C 主机"用。I2C 慢、事务小，所以**控制面与数据面都在这一条 HID
