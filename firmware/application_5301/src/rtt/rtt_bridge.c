@@ -112,6 +112,7 @@ static uint8_t s_discard;
 static uint8_t s_swd_ready;
 static uint8_t s_delay_override = 0xFFU; /* 0xFF = 用 Set_Clock_Delay() 的档位值 */
 static uint8_t s_rescans_since_step;     /* 攒够次数自动降档，见 rtt_bridge_poll */
+static uint8_t s_stop_pending;           /* HID 请求的"停桥"，由主循环执行（要补写 RdOff） */
 
 static uint32_t s_drained;
 static uint32_t s_polls;
@@ -495,23 +496,33 @@ static int rtt_clock_step_down(void)
     return 0;
 }
 
-/* 链路上的"重来一次"。
- *   SWD    —— 降一档再初始化（高频档抖了就往稳的档退）。
+/* 链路上的"重来一次"（导出给 scope 的验收读用，见 rtt_bridge.h）。
+ *   SWD    —— 能降就降一档（高频档抖了就往稳的档退）+ 清 sticky + 重新初始化。
+ *             已经在最低档时没有档可降，但**照样要重新初始化**：实测换挡后的瞬态读失败
+ *             光重试/光清 sticky 都不恢复（0~100 ms 连探都读不动），只有重走
+ *             rtt_swd_init()（JTAG2SWD + DP 上电 + 斜坡换挡）才回来。
  *   RISC-V —— 没有档位可降：DMI 一旦不应答，唯一的出路是重走 TAP 复位并把
- *             IR 重新加载成 DMI，而 riscv_jtag_open() 干的正好是这件事。 */
-static void rtt_link_recover(void)
+ *             IR 重新加载成 DMI，而 riscv_jtag_open() 干的正好是这件事。
+ * 返回 0 = 重新初始化成功。 */
+int rtt_bridge_link_recover(void)
 {
     if (s_target == 1U)
     {
         s_swd_ready = 0U;
-        (void)rtt_swd_init();
-        return;
+        return rtt_swd_init();
     }
-    if (rtt_clock_step_down())
+    if (rtt_clock_step_down() == 0)
     {
-        s_swd_ready = 0U;
-        (void)rtt_swd_init();
+        rtt_clear_link_errors();
     }
+    s_swd_ready = 0U;
+    return rtt_swd_init();
+}
+
+/* 桥自己的自愈入口（rtt_bridge_poll 里那两处调用） */
+static void rtt_link_recover(void)
+{
+    (void)rtt_bridge_link_recover();
 }
 
 /* ------------------------------------------------------------------ */
@@ -602,6 +613,43 @@ int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* 收尾补写：把还没落地的 RdOff 写回去                                   */
+/* ------------------------------------------------------------------ */
+
+/* 为什么必须补：RdOff 写失败的兜底是"记 pending、下一轮幂等补写"（rtt_poll_once
+ * 开头）。但如果是**会话收尾**那一笔失败，就再也没人补了 —— 目标侧 RdOff 停在
+ * "少 ≤RTT_MAX_DRAIN 一段"的位置，下一次启动桥会把这段**重读一遍**：字节一个不少，
+ * 但流里多出 ≤2 KB 重复（实测：固定图案的完整性检查把接缝看成"丢几个字节"，
+ * 带序号靶子看到的是记录号回退）。
+ *
+ * 所以 STOP 不能在 USB 中断里直接落地：那里不能碰 SWD。改成排队，由主循环执行
+ * 这个补写（幂等，最多 4 次 + 清 sticky；失败就放弃 —— 只是重读，不会丢数据）。 */
+static void rtt_bridge_flush_pending_rd(void)
+{
+    if (!s_rd_pending_valid) { return; }
+
+    for (uint32_t i = 0U; i < 4U; i++)
+    {
+        if (rtt_write_word(s_up_addr + RTT_UP_RDOFF_OFF, s_rd_pending) == 0)
+        {
+            s_rd_pending_valid = 0U;
+            return;
+        }
+        /* 这一笔多半是踩到换挡/链路瞬态：清掉 AP 上的 sticky 错误再补一次。
+         * 换个节拍再来 —— 连 100 ms 都读不动的瞬态也见过，所以不要死磕。 */
+        rtt_clear_link_errors();
+        clock_cpu_delay_ms(2U);
+    }
+    s_write_err++;
+    s_rd_pending_valid = 0U;   /* 补不上就放弃：目标侧落后只会导致下次重读 */
+}
+
+void rtt_bridge_request_stop(void)
+{
+    s_stop_pending = 1U;
+}
+
 void rtt_bridge_stop(void)
 {
     if (s_running)
@@ -681,6 +729,10 @@ void rtt_bridge_note_dap_activity(void)
     /* 主机用过 DAP（例如 OpenOCD 刚连过），DP 的时钟档/供电状态就不再由我们
      * 掌握：下次启动或基准测试必须重新初始化，不能复用旧状态。 */
     s_swd_ready = 0U;
+    /* 那份"待补写的 RdOff"同理不再可信：主机可能刚把目标复位/重烧过，控制块是全新的
+     * （RdOff 归零），把上一轮的旧位置写进去会让采样位置凭空前进一段 = **真丢数据**。
+     * 宁可放弃补写（代价只是下次会话重读 ≤2 KB）。 */
+    s_rd_pending_valid = 0U;
     /* 同理，swd_host 对 AP/DP 的影子寄存器缓存（SELECT / CSW / TAR）也会失真 ——
      * 主机那条路走 SWD_Read/SWD_Write，完全绕过 swd_host。不清掉的话，
      * scope 采样器可能拿着"CSW 还是自增"的旧认知去读**别的地址**。 */
@@ -961,6 +1013,16 @@ static void rtt_bridge_run_bench(void)
 /* Runs from the main loop: performs any queued SWD work. */
 static void rtt_bridge_service_requests(void)
 {
+    /* 停桥排在最前面（它要补写 RdOff，且 scope 的 START 依赖"桥已经停了"才独占 SWD）。 */
+    if (s_stop_pending)
+    {
+        s_stop_pending = 0U;
+        if (s_running)
+        {
+            rtt_bridge_flush_pending_rd();
+        }
+        rtt_bridge_stop();
+    }
     if (s_raw_pending)
     {
         s_raw_pending = 0U;
@@ -987,6 +1049,13 @@ static void rtt_bridge_service_requests(void)
     if (s_start_pending)
     {
         s_start_pending = 0U;
+        /* 重启前也把没落地的 RdOff 补一笔：语义与"停桥"一样（幂等、RdOff 是绝对值），
+         * 但只有**会话还活着**（s_running）时才能做 —— 主机碰过 DAP 的话，pending 已经
+         * 在 rtt_bridge_note_dap_activity() 里作废了（目标可能刚被复位/重烧）。 */
+        if (s_running)
+        {
+            rtt_bridge_flush_pending_rd();
+        }
         s_start_rc = (int8_t)rtt_bridge_start(s_req_addr, s_req_size, s_req_channel);
     }
     if (s_bench_pending)

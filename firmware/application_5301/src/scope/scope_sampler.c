@@ -753,8 +753,24 @@ static int scope_link_try(uint8_t be)
     scope_req_init();                            /* 批量路径的请求模板（当前作为对照保留） */
 
     /* 先做一次真实读：既是"链路真的读得动"的验收，也把目标 AP 的 CSW 落到硬件上
-     * （32 位自增）—— 逐字路径自己会写 CSW，但如果以后重新启用批量路径，那次写是不做的。 */
-    if (rtt_bridge_read(s_span[0].start, s_stage, 4U) != 0) { s_swd_ready = 0U; return -4; }
+     * （32 位自增）—— 逐字路径自己会写 CSW，但如果以后重新启用批量路径，那次写是不做的。
+     *
+     * 🚨 失败要**重新初始化**再读一次，不能只重试：换挡后的第一次 AP 访问会瞬态失败
+     * （实测 60 MHz 档约 13% 的 START 踩到、45 MHz 及以下 0/301；同一档位稳定跑起来
+     * 之后不再出现），而光重试没用 —— 失败后 0/2/5/10/20/50/100 ms 连探 18/18 全失败
+     * （清 sticky 也不够），只有重走 rtt_swd_init() 才恢复。桥那边的 CB 扫描/bench
+     * 早就是"清错 + 重试"的写法，这里漏了，于是瞬态直接冒成 -4 把整轮编排打断。 */
+    if (rtt_bridge_read(s_span[0].start, s_stage, 4U) != 0)
+    {
+        if ((rtt_bridge_link_recover() != 0) ||
+            (rtt_bridge_read(s_span[0].start, s_stage, 4U) != 0))
+        {
+            s_swd_ready = 0U;
+            return -4;
+        }
+        /* 恢复路径可能降了一档：状态字要报**实际**生效的档位，不然网页会以为还是原档。 */
+        s_clock_hz = rtt_bridge_swd_clock_hz();
+    }
 
     s_swd_ready = 1U;
     return 0;

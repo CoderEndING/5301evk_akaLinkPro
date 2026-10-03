@@ -262,7 +262,8 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
         switch (req_hid[3])
         {
         case RTT_ACT_STOP:
-            rtt_bridge_stop();
+            /* 排队到主循环：收尾要把没落地的 RdOff 补写回去（USB 中断里不能碰 SWD） */
+            rtt_bridge_request_stop();
             break;
         case RTT_ACT_START:
         {
@@ -465,7 +466,10 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
             scope_sampler_stop();
             break;
         case SCOPE_ACT_START:
-            rtt_bridge_stop();                 /* 互斥：桥和采样器都要独占 SWD */
+            /* 互斥：桥和采样器都要独占 SWD。停桥走排队（主循环里先补写 RdOff），
+             * 而采样器的启动本来也是排队的，且 rtt_bridge_poll() 排在
+             * scope_sampler_poll() 之前 —— 所以这一拍一定是"桥先停、采样器后启"。 */
+            rtt_bridge_request_stop();
             scope_sampler_request_start();
             break;
         case SCOPE_ACT_CLOCK:

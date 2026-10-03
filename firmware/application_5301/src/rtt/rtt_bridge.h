@@ -71,6 +71,12 @@ uint8_t rtt_bridge_target_is_riscv(void);
 /* Stop bridging (the CDC keeps working as the UART bridge). */
 void rtt_bridge_stop(void);
 
+/* 同上，但**排队到主循环执行**：收尾时要把还没落地的 RdOff 补写回去，而补写要碰 SWD
+ * —— HID 命令是在 USB 中断上下文里跑的，位翻转引擎绝不能在那儿驱动。
+ * HID 的 STOP / scope 的 START 都走这个（见 api_param.c），语义与 rtt_bridge_stop()
+ * 一致，只是最多晚一个主循环节拍。 */
+void rtt_bridge_request_stop(void);
+
 int rtt_bridge_is_running(void);
 
 /* Call from the main loop. Does nothing unless the bridge is running and the
@@ -128,5 +134,13 @@ uint32_t rtt_bridge_swd_clock_hz(void);
  * 跳回快档时第一次访问就 -4，因为少了 rtt_swd_init() 里那段 20 MHz 斜坡。
  * 所以换挡一律走"下次重新初始化"，斜坡也就跟着走了。 */
 void     rtt_bridge_request_swd_clock(uint32_t hz);
+
+/* 链路"重来一次"：SWD 侧 = 能降就降一档 + 清 sticky + 重新初始化（含 20 MHz 斜坡），
+ * RISC-V 侧 = 重开 TAP/DM。返回 0 = 重新初始化成功。
+ *
+ * 给 scope 的验收读用：换挡后的第一次 AP 访问会瞬态失败（实测 60 MHz 档约 13% 的
+ * START 会踩到，45 MHz 及以下 0/301），而**光重试没有用**（失败后 0~100 ms 连探
+ * 都读不动，清 sticky 也不够）——只有重新初始化才恢复。桥自己的自愈走的就是这条。 */
+int      rtt_bridge_link_recover(void);
 
 #endif /* __RTT_BRIDGE_H__ */
