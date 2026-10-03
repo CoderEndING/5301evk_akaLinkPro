@@ -1536,6 +1536,21 @@ ATTR_RAMFUNC uint8_t SWD_Read(uint32_t request, uint32_t *data)
 {
     uint8_t header = 0x81 | ((request & 0x0F) << 1) | (((request ^ (request >> 1) ^ (request >> 2) ^ (request >> 3)) & 1) << 5);
 
+    /* data == NULL 表示"读了就扔"（dummy read），主机路径会这么调：
+     *   - DAP.c 的 posted AP read（每条 AP 读都要先投递一次）与最后的写确认 RDBUFF 读；
+     *   - rtt_bridge 的 raw 通道经 DAP_ExecuteCommand 也走同一条路。
+     * 而各档读 blob 收完数据后是**无条件** `sw a5, 0(a1)`（SW_DP_GPIO_ASM_*.S），
+     * 照原样把 NULL 传下去 = 往地址 0x00000000 写 4 字节 —— 那正是 __vector_table[0]，
+     * 里面存的是异常入口 irq_handler_trap 的地址（map/ELF 实证）。一旦被目标数据覆盖，
+     * 之后**任何**异常都会跳到随机地址，而不是进 SDK 的 trap 处理（平时完全看不出来）。
+     * swd_host 的胶水层早已换成 dummy（swd_host_port.c），主机路径当初漏了，这里补上：
+     * 只多一次可预测分支，相对于一次 AP 读的几十个 SWD 位时间，代价可忽略。 */
+    uint32_t dummy;
+    if (data == NULL)
+    {
+        data = &dummy;
+    }
+
     uint8_t ack = read_func(header, data, DAP_Data.clock_delay);
     if (request & DAP_TRANSFER_TIMESTAMP)
     {

@@ -511,6 +511,16 @@ static volatile uint16_t USB_ResponseCountI = 0; // Response Count In
 static volatile uint16_t USB_ResponseCountO = 0; // Response Count Out
 static volatile uint8_t USB_ResponseIdle = 1;    // Response Idle  Flag
 
+/* USB 复位代数：每次 USBD_EVENT_RESET +1（总线复位时在飞传输被硬件作废、回调不会再来）。
+ *
+ * 为什么需要它：`chry_dap_handle()` 的排空循环靠 `CountI != CountO` 判断还有没有命令。
+ * 若总线复位**正好插在"取出命令执行"和"记账"之间**，复位中断会把四个计数清零，而主循环
+ * 随后照样把 CountO 加一 —— 于是 CountO = CountI + 1。这个差再也不会自己归位
+ * （CountO 每圈 +1，CountI 只跟着主机的新命令走），循环会一路空转、把请求缓冲里的
+ * **陈旧命令**反复执行（其中可能有对目标的写），直到 16 位计数回绕（65536 次）才停。
+ * 有了代数，主循环在记账前比一次：变了就整轮作废，让计数停在 ISR 清零后的相等状态。 */
+static volatile uint16_t USB_ResetGen = 0;
+
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Request[DAP_PACKET_COUNT][DAP_XFER_SIZE];  // Request  Buffer
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Response[DAP_PACKET_COUNT][DAP_XFER_SIZE]; // Response Buffer
 static uint16_t USB_RespSize[DAP_PACKET_COUNT];                                                        // Response Size
@@ -539,6 +549,8 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
     switch (event)
     {
     case USBD_EVENT_RESET:
+        /* 先记代数：主循环据此判断"我手上这条命令是不是已经被复位作废了" */
+        USB_ResetGen++;
         usbrx_idle_flag = 0;
         usbtx_idle_flag = 0;
         uarttx_idle_flag = 0;
@@ -870,6 +882,10 @@ void chry_dap_handle(void)
 
     // Process pending requests
     while (USB_RequestCountI != USB_RequestCountO) {
+        /* 本轮命令的复位代数：执行完再比一次，变了说明这条命令已被总线复位作废
+         * （索引/计数/在飞状态都被 ISR 归零了）。见 USB_ResetGen 的说明。 */
+        uint16_t gen = USB_ResetGen;
+
         /* The probe-side RTT bridge shares the SWD bus, so tell it that the
          * DAP is busy again. */
         rtt_bridge_note_dap_activity();
@@ -896,6 +912,17 @@ void chry_dap_handle(void)
         /* Bring-up debugging: record the host's DAP bytes (see rtt_bridge.c). */
         rtt_bridge_trace_dap(USB_Request[USB_RequestIndexO], USB_Response[USB_ResponseIndexI]);
 
+        /* ---- 记账：必须在关中断下与复位代数一起原子完成 ----
+         * 复位中断可能插在"执行命令"和"记账"之间。它把四个计数清零了，我们要是照样
+         * 加一，CountO 就永远比 CountI 大 1 —— 这个差不会再归位，while 会一路空转、
+         * 反复执行缓冲里的陈旧命令（可能含对目标的写），直到 16 位回绕才停。
+         * 代数变了 → 本轮作废：不加计数，while 条件立刻为假（两个计数都是 0），干净退出。 */
+        uint32_t irq_level = disable_global_irq(CSR_MSTATUS_MIE_MASK);
+        if (USB_ResetGen != gen) {
+            restore_global_irq(irq_level);
+            continue;
+        }
+
         // Update Request Index and Count
         USB_RequestIndexO++;
         if (USB_RequestIndexO == DAP_PACKET_COUNT) {
@@ -916,6 +943,8 @@ void chry_dap_handle(void)
             USB_ResponseIndexI = 0U;
         }
         USB_ResponseCountI++;
+
+        restore_global_irq(irq_level);
 
         if (USB_ResponseIdle) {
             if (USB_ResponseCountI != USB_ResponseCountO) {

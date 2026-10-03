@@ -42,6 +42,7 @@
 #include "hpm_gpiom_drv.h"
 #include "pinmux.h"
 #include "i2c_bridge.h"
+#include "spi_bridge.h"   /* 引脚仲裁：SPI 桥先占的辅助脚不能被 I2C 抢 */
 
 #if !defined(BOARD_HAS_I2C_BRIDGE) || (BOARD_HAS_I2C_BRIDGE == 0)
 
@@ -119,8 +120,9 @@ uint8_t i2c_bridge_owns_pad(uint16_t pad)
 #define IB_RES_OFF 4U
 #define IB_RES_LEN_BASE 8U   /* res[0..3]（id/len/cmd/action）+ res[4..7]（状态字） */
 
-/* 状态字里"本命令结果码"的位置（见 proto） */
-#define I2C_ST_SHIFT_CMD 24U
+/* 状态字的位偏移一律以 i2c_bridge_proto.h 为唯一真源（i2c_bridge.h 已包含它）。
+ * 这里原来又定义了一份 I2C_ST_SHIFT_CMD —— 两处同值时看不出问题，
+ * 一旦只改一处就会静默错位。 */
 
 /* ============================== 状态 ============================== */
 
@@ -354,6 +356,134 @@ static void ib_probe_watch(uint8_t dev, uint8_t *scl_low, uint8_t *sda_low)
     }
 }
 
+/* I2C 控制器的 FIFO 深度。I2C_CFG.FIFOSIZE 是硬件只读字段（2/4/8/16 四档），
+ * SDK 里没有写死本 SoC 的值，取文档里的**最小值**做保守判据：只要写串超过它，
+ * 就不能再走"一口气塞 FIFO"的老路。 */
+#define IB_FIFO_DEPTH 4U
+
+/* "写串（子地址 + 写数据）→ repeated START → 读回"，中间不发 STOP。
+ *
+ * 为什么不用 SDK 的 i2c_master_address_read：它在 ISSUE 之前就把 addr_size 个字节
+ * 一口气写进 FIFO，**且不查 FIFOFULL** —— FIFO 只有 4 字节深（对照：SDK 的
+ * i2c_master_write 是查的，见 hpm_i2c_drv.c 里 pump 数据的那两段），写串超过 4 字节
+ * 时多出来的字节直接丢：从机收到半截写、接着超时、SCL 被拽住，只能靠 RESET 恢复。
+ * 这里照 SDK i2c_master_write 的正确节奏 —— 先 ISSUE，再按 FIFOFULL 逐字节泵。
+ * 读帧与 SDK 的读帧逐位一致（START+STOP+ADDR+DATA / DIR=MASTER_READ）；因为写帧
+ * 没有发 STOP，这里的 START 天然就是 repeated START。
+ * 返回值语义与 SDK 一致（hpm_stat_t），交给 ib_map_status 统一映射。 */
+static hpm_stat_t ib_write_then_read(uint16_t dev, const uint8_t *wbuf, uint32_t wlen,
+                                     uint8_t *rbuf, uint32_t rlen)
+{
+    uint32_t left;
+    uint32_t retry;
+
+    if ((wlen == 0U) || (rlen == 0U))
+    {
+        return status_invalid_argument;
+    }
+
+    /* 总线必须是空闲的：上一次事务可能没走干净（比如刚好超时退出） */
+    retry = 0U;
+    while ((IB_I2C->STATUS & I2C_STATUS_BUSBUSY_MASK) != 0U)
+    {
+        if (++retry > IB_WAIT_MAX) { return status_i2c_bus_busy; }
+    }
+
+    /* ---------------- 写帧：START + ADDR + DATA，不发 STOP ---------------- */
+    IB_I2C->STATUS = I2C_STATUS_CMPL_MASK | I2C_STATUS_ADDRHIT_MASK; /* W1C */
+    IB_I2C->CMD = I2C_CMD_CLEAR_FIFO;
+    IB_I2C->CTRL = I2C_CTRL_PHASE_START_MASK | I2C_CTRL_PHASE_ADDR_MASK |
+                   I2C_CTRL_PHASE_DATA_MASK | I2C_CTRL_DIR_SET(I2C_DIR_MASTER_WRITE) |
+#ifdef I2C_CTRL_DATACNT_HIGH_MASK
+                   I2C_CTRL_DATACNT_HIGH_SET(I2C_DATACNT_MAP(wlen) >> 8U) |
+#endif
+                   I2C_CTRL_DATACNT_SET(I2C_DATACNT_MAP(wlen));
+    IB_I2C->ADDR = I2C_ADDR_ADDR_SET(dev);
+    IB_I2C->CMD = I2C_CMD_ISSUE_DATA_TRANSMISSION;
+
+    retry = 0U;
+    while (i2c_is_addrhit(IB_I2C) == false)
+    {
+        if (++retry > IB_WAIT_MAX) { return status_i2c_no_addr_hit; }
+    }
+    IB_I2C->STATUS = I2C_STATUS_ADDRHIT_MASK;
+
+    /* 按 FIFOFULL 的节奏泵：控制器一边移位一边腾空 FIFO */
+    left = wlen;
+    retry = 0U;
+    while (left != 0U)
+    {
+        if ((IB_I2C->STATUS & I2C_STATUS_FIFOFULL_MASK) == 0U)
+        {
+            IB_I2C->DATA = *wbuf++;
+            left--;
+            retry = 0U;
+        }
+        else if (++retry > IB_WAIT_MAX)
+        {
+            return status_timeout;
+        }
+        else
+        {
+            /* 等 FIFO 腾位 */
+        }
+    }
+
+    retry = 0U;
+    while ((IB_I2C->STATUS & I2C_STATUS_CMPL_MASK) == 0U)
+    {
+        if (++retry > IB_WAIT_MAX) { return status_timeout; }
+    }
+    IB_I2C->STATUS = I2C_STATUS_CMPL_MASK; /* W1C：不清的话读帧的 CMPL 判据会立刻为真 */
+
+    /* ---------------- 读帧：repeated START + ADDR + DATA + STOP ---------------- */
+    IB_I2C->CMD = I2C_CMD_CLEAR_FIFO;
+    IB_I2C->CTRL = I2C_CTRL_PHASE_START_MASK | I2C_CTRL_PHASE_STOP_MASK |
+                   I2C_CTRL_PHASE_ADDR_MASK | I2C_CTRL_PHASE_DATA_MASK |
+                   I2C_CTRL_DIR_SET(I2C_DIR_MASTER_READ) |
+#ifdef I2C_CTRL_DATACNT_HIGH_MASK
+                   I2C_CTRL_DATACNT_HIGH_SET(I2C_DATACNT_MAP(rlen) >> 8U) |
+#endif
+                   I2C_CTRL_DATACNT_SET(I2C_DATACNT_MAP(rlen));
+    IB_I2C->CMD = I2C_CMD_ISSUE_DATA_TRANSMISSION;
+
+    retry = 0U;
+    while (i2c_is_addrhit(IB_I2C) == false)
+    {
+        if (++retry > IB_WAIT_MAX) { return status_i2c_no_addr_hit; }
+    }
+    IB_I2C->STATUS = I2C_STATUS_ADDRHIT_MASK;
+
+    left = rlen;
+    retry = 0U;
+    while (left != 0U)
+    {
+        if ((IB_I2C->STATUS & I2C_STATUS_FIFOEMPTY_MASK) == 0U)
+        {
+            *rbuf++ = (uint8_t)IB_I2C->DATA;
+            left--;
+            retry = 0U;
+        }
+        else if (++retry > IB_WAIT_MAX)
+        {
+            return status_timeout;
+        }
+        else
+        {
+            /* 等下一个字节到达 */
+        }
+    }
+
+    retry = 0U;
+    while ((IB_I2C->STATUS & I2C_STATUS_CMPL_MASK) == 0U)
+    {
+        if (++retry > IB_WAIT_MAX) { return status_timeout; }
+    }
+    IB_I2C->STATUS = I2C_STATUS_CMPL_MASK;
+
+    return status_success;
+}
+
 /* 一次完整事务（不带重试）。wlen/rlen 的组合决定线序，见 proto 的说明。 */
 static uint8_t ib_transfer_once(uint8_t dev, const uint8_t *wb, uint32_t wlen, uint32_t rlen)
 {
@@ -371,10 +501,18 @@ static uint8_t ib_transfer_once(uint8_t dev, const uint8_t *wb, uint32_t wlen, u
     {
         st = i2c_master_read(IB_I2C, dev, s_res_data, rlen);
     }
+    else if (wlen > IB_FIFO_DEPTH)
+    {
+        /* 写串超过 FIFO 深度：SDK 的 i2c_master_address_read 会丢字节（见函数注释），
+         * 走自己的两段式。 */
+        st = ib_write_then_read(dev, wb, wlen, s_res_data, rlen);
+    }
     else
     {
         /* 子地址 + 数据 = 同一串字节先写出去，再 repeated START 读回来。
-         * 这就是"写寄存器地址再读"的标准线序（中间不发 STOP）。 */
+         * 这就是"写寄存器地址再读"的标准线序（中间不发 STOP）。
+         * 写串 ≤ FIFO 深度时 SDK 那条路是对的（它一次性预装 FIFO 正好装得下），
+         * 实测也一直是绿的，保持不动。 */
         st = i2c_master_address_read(IB_I2C, dev, (uint8_t *)(uintptr_t)wb, wlen, s_res_data, rlen);
     }
 
@@ -473,7 +611,6 @@ static uint8_t ib_gpio_level(uint16_t pad)
 static uint32_t ib_bitbang_probe(uint8_t dev, uint8_t *ack)
 {
     uint32_t bits = 0U;
-    uint8_t buf[4] = {0U, 0U, 0U, 0U};
 
     ib_pad_as_gpio_od_output(BOARD_I2C_BRIDGE_SDA_PAD);
     ib_pad_as_gpio_od_output(BOARD_I2C_BRIDGE_SCL_PAD);
@@ -539,7 +676,6 @@ static uint32_t ib_bitbang_probe(uint8_t dev, uint8_t *ack)
     bits |= (uint32_t)((gpio_read_pin(HPM_GPIO0, GPIO_GET_PORT_INDEX(BOARD_I2C_BRIDGE_SCL_PAD),
                                       GPIO_GET_PIN_INDEX(BOARD_I2C_BRIDGE_SCL_PAD)) != 0U) ? 1U : 0U) << 10;
 
-    (void)buf;
     init_i2c_bridge_pins(s_cfg.pullup);          /* 装回 I2C 复用 */
     return bits;
 }
@@ -772,7 +908,29 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
     }
 
     case I2C_ACT_ENABLE:
-        ib_enable((p[0] != 0U) ? 1U : 0U);
+        if (i2c_bridge_req_kind != IB_REQ_NONE)
+        {
+            /* 事务在跑（含 RECOVER 打节拍）：此刻重新初始化控制器会把线序打断；
+             * 而且在打拍期间收到 ENABLE=0 时，主循环随后会把这两根脚复用回 I2C，
+             * 但 s_enabled 已经是 0 —— SPI 桥会以为这两根脚可以拿去用。 */
+            rc = I2C_E_BUSY;
+            s_busy_rej++;
+        }
+        else if ((p[0] != 0U) &&
+                 ((spi_bridge_owns_pad(BOARD_I2C_BRIDGE_SDA_PAD) != 0U) ||
+                  (spi_bridge_owns_pad(BOARD_I2C_BRIDGE_SCL_PAD) != 0U)))
+        {
+            /* 反方向的引脚仲裁：SPI 桥已经把 PA28/PA29 配成辅助脚了，
+             * I2C 再使能就会把那两根脚抢过来（原来只查了 SPI 抢 I2C 这一个方向）。
+             * 报 E_BUSY 而不是新错误码：主机侧语义就是"资源被占，先让开再重试"，
+             * 不需要动协议。 */
+            rc = I2C_E_BUSY;
+            s_busy_rej++;
+        }
+        else
+        {
+            ib_enable((p[0] != 0U) ? 1U : 0U);
+        }
         break;
 
     case I2C_ACT_RESET:
@@ -794,6 +952,14 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
     case I2C_ACT_SET_CFG:
     {
         i2c_cfg_t c;
+        if (i2c_bridge_req_kind != IB_REQ_NONE)
+        {
+            /* 事务在跑：下面会把引脚/时钟/档位全部重新落地，事务中途改这些会把
+             * 线序打断（也和 ENABLE 一样会踩到"引脚归属"的竞态）。等它做完再配。 */
+            rc = I2C_E_BUSY;
+            s_busy_rej++;
+            break;
+        }
         memcpy(&c, p, sizeof(c));
         if ((c.flags != 0U) || (c.pullup > 1U) || (c.retries > 8U))
         {

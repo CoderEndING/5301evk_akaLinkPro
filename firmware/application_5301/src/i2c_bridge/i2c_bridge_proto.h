@@ -54,7 +54,9 @@ typedef enum
 /* u32 小端 */
 #define I2C_ST_ENABLED (1U << 0)   /* 桥已使能（引脚已被 I2C 占用） */
 #define I2C_ST_PENDING (1U << 1)   /* 有一次请求已登记、还没执行完（主机应轮询 RESULT） */
-#define I2C_ST_BUS_OK (1U << 2)    /* 总线空闲：控制器不在忙、也没有挂起请求 */
+#define I2C_ST_BUS_OK (1U << 2)    /* 控制器不在忙（BUSBUSY = 0）。注意：它**不**表示"没有挂起请求" ——
+                                    * 那一位看 I2C_ST_PENDING。原注释写成"总线空闲：控制器不在忙、
+                                    * 也没有挂起请求"，与实现不符，2026-10-03 按实现订正。 */
 #define I2C_ST_SDA (1U << 3)       /* SDA 线电平（控制器 LINESDA 感知，事务中读也安全） */
 #define I2C_ST_SCL (1U << 4)       /* SCL 线电平（LINESCL） */
 #define I2C_ST_SHIFT_ERR 8U        /* bit8..15：最近一次**完成**事务的错误码 */

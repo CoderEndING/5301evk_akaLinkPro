@@ -48,4 +48,8 @@ void spi_bridge_usb_reset(void);
 /* 状态查询（给 HID STATUS 用；也便于单测）。 */
 uint8_t spi_bridge_is_enabled(void);
 
+/* 这根 pad 是否正被本桥当辅助脚占用（供 I2C 桥做反方向的引脚仲裁）。
+ * pad 用 IOC_PAD_xx；返回 1 = 占用，别抢。 */
+uint8_t spi_bridge_owns_pad(uint16_t pad);
+
 #endif /* __SPI_BRIDGE_H__ */

@@ -2068,6 +2068,23 @@ uint8_t spi_bridge_is_enabled(void)
     return s_enabled;
 }
 
+/* 这根 pad 现在是否被本桥当成辅助脚占着（DC / RST / CS_AUX / BL / TE 任一个）。
+ *
+ * 给 I2C 桥用：I2C 使能要占 PA28/PA29，而这两根也在本桥的辅助脚候选表里，
+ * 若先被本桥配成辅助脚，I2C 就不该再抢 —— 原来只有"SPI 问 I2C"这一个方向
+ * （sb_pad_usable → i2c_bridge_owns_pad），反方向是漏的，注释里写的
+ * "谁后配谁赢"在 I2C 先使能、SPI 后配的情况下成立，反过来就变成 I2C 硬抢。
+ * 关桥时这些变量被清零（且 s_enabled = 0），所以"桥没开"自然返回 0。 */
+uint8_t spi_bridge_owns_pad(uint16_t pad)
+{
+    if ((s_enabled == 0U) || (pad == 0U))
+    {
+        return 0U;
+    }
+    return ((pad == s_pad_dc) || (pad == s_pad_rst) || (pad == s_pad_bl) ||
+            (pad == s_pad_te) || (pad == s_cs_pad)) ? 1U : 0U;
+}
+
 /* ============================== 上板诊断：跳线通断 ============================== */
 
 static void sb_pin_settle(void)
