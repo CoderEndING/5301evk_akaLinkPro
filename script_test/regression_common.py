@@ -9,8 +9,10 @@
      全程预算超时（--budget）⇒ 硬退出（防卡死），退出码 3；
   4. 结果持久化：build/regression/<family>.log（人读）+ .jsonl（机读，逐条 JSON）。
 
-子进程输出按 UTF-8 读（子脚本自己会 reconfigure stdout），本模块的 stdout 也
-reconfigure 成 UTF-8/replace，GBK 控制台不会被打崩。
+子进程输出按 UTF-8 读；为防"子脚本没 reconfigure stdout 就用控制台代码页写中文"
+导致的假失败，启动子进程时统一注入 `PYTHONIOENCODING=utf-8:replace`
+（见 child_env()），本模块的 stdout 也 reconfigure 成 UTF-8/replace，
+GBK 控制台不会被打崩。
 """
 import json
 import os
@@ -33,6 +35,30 @@ OUTDIR = os.path.join(REPO, "build", "regression")
 VID, PID = 0x0D28, 0x0204
 SDK_ENV = os.environ.get("HPM_SDK_ENV_DIR", r"E:\sdk_env_v1.11.0")
 OPENOCD = os.environ.get("OPENOCD_EXE", os.path.join(SDK_ENV, "tools", "openocd", "openocd.exe"))
+
+
+def child_env():
+    """给子脚本的环境变量：强制它的 stdout/stderr 也用 UTF-8。
+
+    为什么必须在编排层兜住：本模块按 `encoding="utf-8"` 读子进程输出，而子脚本
+    `print()` 中文时用的是**控制台代码页**（本机 cp936）—— 中文于是变成乱码，
+    脚本里按字面中文写的正则（例如 regression_riscv.py 的
+    `sticky 错误事件 = (\\d+)`、`整块重读 = (\\d+)`）匹配不上、取默认值 -1，
+    表现为"探针明明回了正确值，却报 sticky_events=-1 FAIL"的假失败。
+    （2026-10-03 实测：make regression-riscv 在 P1.sbastat 假红，手工设
+    PYTHONUTF8/PYTHONIOENCODING 后立刻全绿。）
+
+    约定本来是子脚本自己 `sys.stdout.reconfigure(encoding="utf-8")`，但 script_test
+    下还有十几个脚本没写这行（hpm6800_riscv/probe/selfcheck、sram_speed_test、
+    rtt_probe_bridge …），逐个补既琐碎、新脚本还会再忘 —— 干脆在唯一的启动点上
+    兜住。只设 PYTHONIOENCODING（管 stdin/stdout/stderr 的编码），**不设
+    PYTHONUTF8**：后者会连带改掉子脚本 open() 的默认编码，副作用更大。
+    errors 用 replace：个别脚本会 print 无法编码的字符，宁可显示成 ? 也不能让
+    子进程抛 UnicodeEncodeError 把整轮回归带崩。
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8:replace"
+    return env
 
 FAILS = []          # 本进程内累积的失败描述（阶段结束后由调用方决定停不停）
 RESULTS = []        # 全部阶段结果（内存 + jsonl）
@@ -97,7 +123,8 @@ class Regression:
         t0 = time.time()
         p = subprocess.Popen(argv, cwd=cwd or REPO, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
-                             encoding="utf-8", errors="replace", bufsize=1)
+                             encoding="utf-8", errors="replace", bufsize=1,
+                             env=child_env())
         tail = []
         try:
             for ln in p.stdout:
