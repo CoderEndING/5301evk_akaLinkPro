@@ -163,6 +163,7 @@ typedef enum
     SB_ACT_ABORT = 6,        /* 丢弃未处理帧与 IN 队列 */
     SB_ACT_SET_PROFILE = 7,  /* req[4..] = 面板档块 */
     SB_ACT_GET_PROFILE = 8,  /* res[4..] = 面板档块 */
+    SB_ACT_DRAIN = 9,        /* req[4]=1..16：在 EP11 回短应答，收尾主机挂起的 IN 读 */
     SB_ACT_DBG = 10,         /* 上板诊断：res[4..] = 12 × u32 SPI 寄存器现场快照 */
     SB_ACT_PINTEST = 11,     /* 上板诊断：把 MOSI/MISO 当普通 GPIO 验跳线通断 */
     SB_ACT_WIGGLE = 12,      /* 上板诊断：在 SCLK/CS/MOSI 脚上发慢方波（给 LA 看接线） */

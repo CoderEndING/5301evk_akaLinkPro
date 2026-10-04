@@ -247,6 +247,7 @@ static sb_state_t s_st;
 #define s_reset_req (s_st.reset_req)
 #define s_usb_reset_req (s_st.usb_reset_req)
 #define s_abort_req (s_st.abort_req)
+static volatile uint8_t s_drain_reads;
 #define s_hw_req (s_st.hw_req)
 #define s_cs_pad (s_st.cs_pad)
 #define s_cs_asserted (s_st.cs_asserted)
@@ -1679,6 +1680,18 @@ static void sb_process_packets(void)
     }
 }
 
+/* EP11-only teardown: one short response completes one host IN request.
+ * Runs while disabled too; no SPI transfer, target access, GPIO or USB reset. */
+static void sb_drain_pending_reads(void)
+{
+    if (s_drain_reads == 0U) { return; }
+    uint8_t *slot = sb_in_alloc();
+    if (slot == NULL) { return; }
+    sb_rsp_init(slot, SB_R_EVT, SB_OK, 0xFFFFU);
+    sb_in_commit(0U);
+    s_drain_reads--;
+}
+
 void spi_bridge_poll(void)
 {
     if (s_usb_reset_req != 0U)
@@ -1687,6 +1700,7 @@ void spi_bridge_poll(void)
          * 所以这里必须把在飞标志清掉，否则桥从此再也不武装端点。
          * 代数 +1 是为了让万一迟到的回调被识别成旧包丢弃。 */
         s_usb_reset_req = 0U;
+        s_drain_reads = 0U;
         s_out_gen++;
         s_in_gen++;
         s_out_w = 0U;
@@ -1751,6 +1765,11 @@ void spi_bridge_poll(void)
         s_pkt_len = 0U;
         s_delay_active = 0U;
         s_rst_state = 0U;
+    }
+
+    if (s_drain_reads != 0U)
+    {
+        sb_drain_pending_reads();
     }
 
     if (s_enabled == 0U)
@@ -2041,6 +2060,7 @@ void spi_bridge_init(void)
     s_in_gen = 0U;
     s_in_armed_gen = 0U;
     s_usb_reset_req = 0U;
+    s_drain_reads = 0U;
     s_delay_active = 0U;
     s_rst_state = 0U;
     s_rst_post_ms = 0U;
@@ -2381,6 +2401,13 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
         res_hid[1] = 8U;
         break;
     }
+
+    case SB_ACT_DRAIN:
+        s_drain_reads = (req_hid[4] > 16U) ? 16U : req_hid[4];
+        wr_u32(&res_hid[4], sb_status_word());
+        wr_u32(&res_hid[8], 0x314E5244U); /* DRN1: old firmware cannot claim support */
+        res_hid[1] = 12U;
+        break;
 
     case SB_ACT_ABORT:
         s_abort_req = 1U;
