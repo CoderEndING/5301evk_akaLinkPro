@@ -19,6 +19,8 @@
  * web-serial-rtt-tools 的 docs/scope-page.md。字节布局改一边必须改另一边。
  */
 
+#define SCOPE_TIME_HZ      24000000UL /* v2 时间戳和周期单位：MCHTMR tick */
+
 #define SCOPE_MAX_VARS   8U     /* 8 个变量正好装进一条 63 B 的 HID 配置报文 */
 #define SCOPE_PACKET     512U   /* HS bulk 的 wMaxPacketSize（也是 DAP_PACKET_SIZE） */
 #define SCOPE_TX_BUFS    8U     /* 在飞的包缓冲数。512 B × 8 = 4 KB（DLM 现在很紧，别再加）。
@@ -60,6 +62,8 @@ typedef struct
  * 返回 0 = 已采纳；-6 = 整包拒绝（变量宽度不是 1/2/4/8，见 scope_sampler.c 的说明）。
  * 被拒时**不采纳任何字段**、变量表清空；判定经 res[2] / 状态字 10 回报（0 或 -6）。 */
 int scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars);
+/* HID action 10：周期以 24 MHz tick 配置，发 v2 包（时间戳/DEF/STAT 周期均为 tick）。 */
+int scope_sampler_configure_ticks(uint32_t period_ticks, uint8_t flags, uint8_t nvars, const scope_var_t *vars);
 
 /* HID 0x32 action 3：设 SWD 时钟（Hz，走 RTT 桥那套斜坡换挡）。0 = 不动。 */
 void scope_sampler_set_clock(uint32_t hz);

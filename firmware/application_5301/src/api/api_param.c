@@ -80,6 +80,7 @@
 #define SCOPE_ACT_CLOCK 3U
 #define SCOPE_ACT_TRIGGER 4U      /* v2：探针侧触发，当前主机侧触发已够用 */
 #define SCOPE_ACT_CONFIG 7U
+#define SCOPE_ACT_CONFIG_TICKS 10U
 #define SCOPE_ACT_BENCH 8U
 #define SCOPE_ACT_BENCH_RESULT 9U
 
@@ -477,6 +478,7 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
                                     ((uint32_t)req_hid[6] << 16) | ((uint32_t)req_hid[7] << 24));
             break;
         case SCOPE_ACT_CONFIG:
+        case SCOPE_ACT_CONFIG_TICKS:
         {
             /* data 段：action(1) period_us(4) flags(1) nvars(1) n×(addr4,size1,type1)
              * 8 个变量 = 55 B，一条 HID 报文（上限 61 B）正好装下。 */
@@ -498,7 +500,14 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
             }
             /* 返回码经 res[2]（start_result）与状态字 10 回报：-6 = 变量宽度非法整包拒绝。
              * 被拒时变量表会被清空，主机随后发 START 会拿到 -3，不会拿旧计划偷偷跑。 */
-            (void)scope_sampler_configure(period, flags, n, vars);
+            if (req_hid[3] == SCOPE_ACT_CONFIG_TICKS)
+            {
+                (void)scope_sampler_configure_ticks(period, flags, n, vars);
+            }
+            else
+            {
+                (void)scope_sampler_configure(period, flags, n, vars);
+            }
             break;
         }
         case SCOPE_ACT_BENCH:

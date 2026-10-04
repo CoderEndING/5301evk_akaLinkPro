@@ -37,7 +37,7 @@
 
 /* ------------------------------------------------------------------ 常量 */
 
-#define SCOPE_MCHTMR_HZ   24000000UL          /* MCHTMR = osc24m（与 rtt_bridge.c 一致） */
+#define SCOPE_MCHTMR_HZ   SCOPE_TIME_HZ          /* MCHTMR = osc24m（与 rtt_bridge.c 一致） */
 #define SCOPE_HDR         16U
 #define SCOPE_PAYLOAD     (SCOPE_PACKET - SCOPE_HDR)   /* 496 */
 
@@ -53,6 +53,7 @@
 _Static_assert((SCOPE_MAX_VARS * 8U) <= SCOPE_PAYLOAD, "帧装不进一个包");
 #define SCOPE_MAGIC       0x4A53U             /* 'J','S'（小端下发：53 4A） */
 #define SCOPE_VER         1U
+#define SCOPE_VER_TICKS   2U
 #define SCOPE_KIND_DEF    1U
 #define SCOPE_KIND_DATA   2U
 #define SCOPE_KIND_STAT   3U
@@ -90,6 +91,8 @@ static uint16_t s_frame_bytes;
 static uint8_t  s_per_packet;                 /* floor(496 / frame_bytes) */
 static uint16_t s_frame_off[SCOPE_MAX_VARS];  /* 每个变量在帧内的偏移 */
 static uint32_t s_period_us = 100U;
+static uint32_t s_time_step = 100U; /* v1: µs；v2: 24 MHz ticks，热路径只做加法 */
+static uint8_t s_time_version = SCOPE_VER;
 static uint8_t  s_flags;
 
 typedef struct
@@ -123,7 +126,7 @@ static uint16_t s_fill_n;                     /* 已经填了几个样本 */
 static uint32_t s_fill_t0;                    /* 本包第一个样本的 t_us */
 
 static uint32_t s_seq;
-static uint32_t s_t_us;                       /* 名义时间轴（µs）：每拍 +period，跳拍照样推进 */
+static uint32_t s_t_time;                       /* 名义时间轴：v1 µs / v2 ticks，跳拍照样推进 */
 static uint32_t s_next_tick;                  /* 下一次该采样的 MCHTMR 时刻 */
 
 static uint32_t s_produced;                   /* 采到的样本数（含没推出去的） */
@@ -308,7 +311,7 @@ static uint8_t *scope_pkt_header(uint8_t kind, uint16_t n, uint16_t aux)
 {
     uint8_t *p = s_pkt[s_fill_buf];
     put16(p, SCOPE_MAGIC);
-    p[2] = SCOPE_VER;
+    p[2] = s_time_version;
     p[3] = kind;
     put32(p + 4U, s_seq);
     put32(p + 8U, s_hdr_t);          /* DATA 包这里是**首个**样本的时刻（主机按它建时间轴） */
@@ -437,11 +440,11 @@ static void scope_push_def(void)
     uint8_t buf = scope_alloc_buf();
     if (buf == 0xFFU) { return; }
     s_fill_buf = buf;
-    s_hdr_t = s_t_us;
+    s_hdr_t = s_t_time;
     uint8_t *p = scope_pkt_header(SCOPE_KIND_DEF, 0U, s_nvars);
     uint8_t *q = p + SCOPE_HDR;
     put32(q, s_clock_hz);
-    put32(q + 4U, s_period_us);
+    put32(q + 4U, s_time_step);
     put16(q + 8U, (uint16_t)(s_flags |
                              ((s_backend == SCOPE_BE_RISCV) ? SCOPE_FLAG_RISCV : 0U)));
     q[10] = s_nvars;
@@ -471,7 +474,7 @@ static void scope_push_stat(void)
     uint8_t buf = scope_alloc_buf();
     if (buf == 0xFFU) { return; }
     s_fill_buf = buf;
-    s_hdr_t = s_t_us;
+    s_hdr_t = s_t_time;
     uint8_t *p = scope_pkt_header(SCOPE_KIND_STAT, 0U, 0U);
     uint8_t *q = p + SCOPE_HDR;
     put32(q, s_produced);
@@ -479,7 +482,7 @@ static void scope_push_stat(void)
     put32(q + 8U, s_pkts);
     put16(q + 12U, (uint16_t)(s_usb_drop & 0xFFFFU));
     put16(q + 14U, (uint16_t)(s_swd_err & 0xFFFFU));
-    put32(q + 16U, s_period_us);
+    put32(q + 16U, s_time_step);
     q[20] = (uint8_t)(s_clock_hz / 1000000UL);   /* 当前 SWD 档位（MHz） */
     q[21] = (uint8_t)((s_flags & SCOPE_FLAG_DISCARD) ? 1U : 0U);
     s_seq++;
@@ -666,7 +669,7 @@ static int scope_sample_once(void)
     if (s_fill_buf >= SCOPE_TX_BUFS)
     {
         s_usb_drop++;
-        s_t_us += s_period_us;             /* 时间轴照常推进：主机看到的是"有洞"，不是"被压缩" */
+        s_t_time += s_time_step;             /* 时间轴照常推进：主机看到的是"有洞"，不是"被压缩" */
         /* 掉拍会把流水线撕开一个口子：下一次读回来的值属于**掉拍之前**那一拍，
          * 而那一拍的槽位可能已经在飞的包里了 —— 写进去就是篡改已提交的包。
          * 清空管线，让下一拍把它的读结果丢掉、重新起链（丢一拍的值，符合这里的语义）。
@@ -686,10 +689,10 @@ static int scope_sample_once(void)
      * 上一拍的槽位，而上一拍的值永远收不回来。 */
     if (scope_sample_bytes(dst) != 0) { s_pipe_dst = NULL; return -1; }
 
-    if (s_fill_n == 0U) { s_fill_t0 = s_t_us; }
+    if (s_fill_n == 0U) { s_fill_t0 = s_t_time; }
     s_fill_n++;
     s_produced++;
-    s_t_us += s_period_us;                 /* 名义时间轴：跳拍也要推进，否则主机的轴会压缩 */
+    s_t_time += s_time_step;                 /* 名义时间轴：跳拍也要推进，否则主机的轴会压缩 */
 
     if (s_fill_n >= s_per_packet)
     {
@@ -817,7 +820,7 @@ static int scope_start_now(void)
     int rc = scope_be_link_ready();
     if (rc != 0) { s_swd_ready = 0U; return rc; }
 
-    s_seq = 0U; s_t_us = 0U; s_produced = 0U; s_dropped = 0U; s_usb_drop = 0U;
+    s_seq = 0U; s_t_time = 0U; s_produced = 0U; s_dropped = 0U; s_usb_drop = 0U;
     s_swd_err = 0U; s_yield = 0U; s_pkts = 0U; s_bytes = 0U; s_discard_pkts = 0U;
     s_last_sample_ticks = 0U;
     s_if_head = 0U; s_if_count = 0U;
@@ -1004,7 +1007,7 @@ void scope_sampler_poll(void)
     {
         s_next_tick += s_period_ticks;
         s_dropped++;
-        s_t_us += s_period_us;
+        s_t_time += s_time_step;
     }
 }
 
@@ -1023,7 +1026,7 @@ static void scope_stop_for_reconfig(void)
     }
 }
 
-int scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars)
+static int scope_configure(uint32_t period, uint8_t version, uint8_t flags, uint8_t nvars, const scope_var_t *vars)
 {
     if (nvars > SCOPE_MAX_VARS) { nvars = SCOPE_MAX_VARS; }
 
@@ -1046,11 +1049,15 @@ int scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, co
         }
     }
 
-    if (period_us < SCOPE_MIN_PERIOD_US) { period_us = SCOPE_MIN_PERIOD_US; }
-    if (period_us > SCOPE_MAX_PERIOD_US) { period_us = SCOPE_MAX_PERIOD_US; }
-    s_period_us = period_us;
-    /* 每拍都要用；一次 64 位除法的代价不该落在热路径上 */
-    s_period_ticks = us_to_ticks(period_us);
+    /* 必须先停止旧采样，再安装新单位/周期/变量表。 */
+    scope_stop_for_reconfig();
+    uint32_t scale = (version == SCOPE_VER_TICKS) ? (SCOPE_TIME_HZ / 1000000UL) : 1U;
+    if (period < SCOPE_MIN_PERIOD_US * scale) { period = SCOPE_MIN_PERIOD_US * scale; }
+    if (period > SCOPE_MAX_PERIOD_US * scale) { period = SCOPE_MAX_PERIOD_US * scale; }
+    s_time_version = version;
+    s_time_step = period;
+    s_period_us = (period + scale - 1U) / scale; /* 仅旧状态显示用，采样不取这个近似值 */
+    s_period_ticks = (version == SCOPE_VER_TICKS) ? period : us_to_ticks(period);
     s_flags = flags;
     s_nvars = nvars;
     for (uint8_t i = 0U; i < nvars; i++) { s_var[i] = vars[i]; }
@@ -1101,6 +1108,16 @@ int scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, co
      * 主机读到的就是陈旧值 —— 验收脚本里当场抓到过。 */
     s_start_rc = 0;
     return 0;
+}
+
+int scope_sampler_configure(uint32_t period_us, uint8_t flags, uint8_t nvars, const scope_var_t *vars)
+{
+    return scope_configure(period_us, SCOPE_VER, flags, nvars, vars);
+}
+
+int scope_sampler_configure_ticks(uint32_t period_ticks, uint8_t flags, uint8_t nvars, const scope_var_t *vars)
+{
+    return scope_configure(period_ticks, SCOPE_VER_TICKS, flags, nvars, vars);
 }
 
 void scope_sampler_set_clock(uint32_t hz)
@@ -1206,6 +1223,7 @@ uint32_t scope_sampler_status(uint32_t *out, uint32_t words)
 {
     if (words < 12U) { return 0U; }
     out[0] = (uint32_t)(s_running ? 1U : 0U) |
+             (1U << 2) | /* 支持 action 10 / v2 tick 时间轴 */
              ((uint32_t)((s_backend == SCOPE_BE_RISCV) ? 1U : 0U) << 1) |   /* bit1 = 生效后端是 RISC-V */
              ((uint32_t)s_nspans << 8) |
              ((uint32_t)(s_swd_ready ? 1U : 0U) << 16) |
@@ -1220,7 +1238,8 @@ uint32_t scope_sampler_status(uint32_t *out, uint32_t words)
     out[8] = scope_sampler_plan_hash();
     out[9] = (s_last_cmd & 0xFFU) | ((s_last_rsp & 0xFFU) << 8) | ((s_tx_done & 0xFFFFU) << 16);
     out[10] = (uint32_t)(int32_t)s_start_rc;
-    out[11] = (s_period_us & 0xFFFFU) |
+    out[11] = (s_time_step & 0xFFFFU) |
+              ((uint32_t)(s_time_version == SCOPE_VER_TICKS) << 17) |
               ((uint32_t)((s_flags & SCOPE_FLAG_DISCARD) ? 1U : 0U) << 16) |
               ((uint32_t)(s_clock_hz / 1000000UL) << 24);
     return 12U;
