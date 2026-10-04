@@ -8,10 +8,11 @@ CDC/串口桥开关走 HID **0x34**（`--bridge`），也可以让固件在采�
 用法:
   python scope_hss_test.py status [--bridge on|off]
   python scope_hss_test.py bench  [--set pack|cross|one] [--clock 45000000] [--iters 2000]
+  python scope_hss_test.py discard --set one --period 2.5 --secs 5 --flags 0xA1
   python scope_hss_test.py run    [--set pack|cross|one] [--period 100] [--secs 3] [--flags 0x20]
 
   --flags 位: 0x01 允许 60 MHz / 0x02 丢弃(只采样不推 USB) / 0x08 不让路
-              0x10 SWD 空闲拍压 0 / **0x20 采样期间自动关 CDC 桥**
+              0x10 SWD 空闲拍压 0 / 0x20 采样期间自动关 CDC 桥 / 0x80 单字短批次
   常用组合: 0x20 = 最快端到端；0x22 = 只量探针本体（丢包就全是探针 CPU 的账）
 
 靶子固件: web-serial-rtt-tools/tools/target-firmware/stm32f103_scope（10 kHz 契约波形）
@@ -32,9 +33,10 @@ import struct
 import threading
 import time
 
-import hid
-import usb.core
-import usb.util
+import math
+
+# Hardware dependencies are loaded in main, so protocol/window tests need no device.
+hid = usb = None
 
 VID, PID = 0x0D28, 0x0204
 EP_IN = 0x83
@@ -42,7 +44,7 @@ HID_CMD = 0x32
 CMD_BRIDGE = 0x34
 
 ACT = {'STOP': 0, 'START': 1, 'STATUS': 2, 'CLOCK': 3, 'TRIGGER': 4,
-       'CONFIG': 7, 'BENCH': 8, 'BENCH_RESULT': 9}
+       'CONFIG': 7, 'BENCH': 8, 'BENCH_RESULT': 9, 'CONFIG_TICKS': 10, 'METRICS': 11}
 
 BRIDGE = {'STATUS': 0, 'SET': 1}
 
@@ -179,23 +181,124 @@ def status(dev):
     w = [int.from_bytes(bytes(r[3 + i * 4:7 + i * 4]), "little") for i in range(12)]
     return {
         'startRc': s8(r[2]), 'running': w[0] & 1, 'riscv': (w[0] >> 1) & 1,
-        'spans': (w[0] >> 8) & 0xFF,
+        'supportsTicks': bool(w[0] & 4), 'supportsBatch': bool(w[0] & 8),
+        'supportsMetrics': bool(w[0] & 16), 'spans': (w[0] >> 8) & 0xFF,
         'swdReady': (w[0] >> 16) & 1, 'nvars': (w[0] >> 24) & 0xFF,
         'swdHz': w[1], 'produced': w[2], 'dropped': w[3],
         'swdErr': w[5] & 0xFFFF, 'yield': w[5] >> 16, 'seq': w[6],
-        'planHash': w[8], 'periodUs': w[11] & 0xFFFF, 'discard': bool(w[11] & (1 << 16)),
+        'planHash': w[8], 'periodUs': (w[11] & 0xFFFF) / (24.0 if w[11] & (1 << 17) else 1), 'discard': bool(w[11] & (1 << 16)),
         'swdMhz': (w[11] >> 24) & 0xFF, 'raw': w,
     }
 
 
-def do_config(dev, period_us, vars_, flags=0):
-    d = [ACT['CONFIG']]
-    d += list(struct.pack('<I', period_us)) + [flags & 0xFF, len(vars_)]
+def config_data(period_us, vars_, flags=0):
+    period_us = float(period_us)
+    if not math.isfinite(period_us) or not 2 <= period_us <= 1000000:
+        raise ValueError('period must be finite, 2..1000000 us')
+    ticks = not period_us.is_integer()
+    period = int(math.floor(period_us * 24 + 0.5)) if ticks else int(period_us)
+    d = [ACT['CONFIG_TICKS'] if ticks else ACT['CONFIG']]
+    d += list(struct.pack('<I', period)) + [flags & 0xFF, len(vars_)]
     for _, addr, size, typ in vars_:
         d += list(struct.pack('<I', addr)) + [size, typ]
-    assert len(d) <= 61, "配置报文 %d B 超上限" % len(d)
+    if len(d) > 61:
+        raise ValueError('configuration exceeds HID report')
+    return d
+
+
+def do_config(dev, period_us, vars_, flags=0):
+    d = config_data(period_us, vars_, flags)
+    if d[0] == ACT['CONFIG_TICKS'] or flags & 0x80:
+        st = status(dev)
+        if not st or (d[0] == ACT['CONFIG_TICKS'] and not st['supportsTicks']):
+            raise RuntimeError('firmware does not support tick periods')
+        if flags & 0x80 and not st['supportsBatch']:
+            raise RuntimeError('firmware does not support FAST_BATCH; upgrade or clear flags bit7')
     r = hid_xfer(dev, d)
-    return bool(r)
+    if not r or s8(r[2]) < 0:
+        raise RuntimeError('configuration rejected: %s' % (None if not r else s8(r[2])))
+    return True
+
+
+def u32_delta(after, before):
+    return (after - before) & 0xffffffff
+
+
+def snapshot(dev, modern):
+    before = time.perf_counter()
+    if modern:
+        r = hid_xfer(dev, [ACT['METRICS']])
+        after = time.perf_counter()
+        if not r or len(r) < 51:
+            raise RuntimeError('metrics response missing/truncated')
+        w = struct.unpack_from('<12I', bytes(r), 3)
+        if w[0] != 0x31535348 or w[2] != 24000000:
+            raise RuntimeError('invalid metrics magic/frequency')
+        return dict(tick=w[1], hz=w[2], produced=w[3], skipped=w[4], usb=w[5],
+                    swd=w[6], yield_=w[7], tx=w[8], bytes=w[9], period_ticks=w[10],
+                    host=(before+after)/2, uncertainty=(after-before)/2)
+    st = status(dev)
+    after = time.perf_counter()
+    if not st:
+        raise RuntimeError('status response missing')
+    return dict(produced=st['produced'], dropped=st['dropped'], usb=st['raw'][4] >> 16,
+                host=(before+after)/2, uncertainty=(after-before)/2)
+
+
+def snapshot_delta(begin, end):
+    if 'tick' in begin:
+        dt = u32_delta(end['tick'], begin['tick']) / begin['hz']
+        return dict(dt=dt, produced=u32_delta(end['produced'], begin['produced']),
+                    skipped=u32_delta(end['skipped'], begin['skipped']),
+                    usb=u32_delta(end['usb'], begin['usb']),
+                    swd=u32_delta(end['swd'], begin['swd']),
+                    yield_=u32_delta(end['yield_'], begin['yield_']))
+    return dict(dt=end['host']-begin['host'],
+                produced=u32_delta(end['produced'], begin['produced']),
+                dropped=u32_delta(end['dropped'], begin['dropped']),
+                usb=(end['usb']-begin['usb']) & 0xffff)
+
+
+def print_probe_window(delta):
+    drop = delta.get('dropped', delta.get('skipped', 0) + delta['usb'])
+    dt, produced = delta['dt'], delta['produced']
+    rate = produced / dt / 1000 if dt > 0 else 0
+    print('探针快照窗口 %.6f s：产 %d 拍 = %.1f kHz；丢 %d 拍 = %.2f%%；USB 缓冲耗尽 %d 拍'
+          % (dt, produced, rate, drop, 100*drop/max(produced+drop, 1), delta['usb']))
+    if 'skipped' in delta:
+        print('  scheduler skip=%d SWD errors=%d DAP yields=%d'
+              % (delta['skipped'], delta['swd'], delta['yield_']))
+    else:
+        print('  旧固件：HID 往返中点估计窗口；USB 计数仅16位，超过65535拍无法精确还原。')
+
+
+def arrival_window(raw, begin, end):
+    return b''.join(b for arrived, b in raw if begin <= arrived < end)
+
+
+def wait_started(dev):
+    hid_xfer(dev, [ACT['START']])
+    for _ in range(20):
+        time.sleep(0.12)
+        st = status(dev)
+        if st and st['startRc'] != -100:
+            if st['startRc'] != 0:
+                raise RuntimeError('START failed rc=%d' % st['startRc'])
+            return st
+    raise RuntimeError('START timeout')
+
+
+def run_discard(dev, secs, modern):
+    try:
+        wait_started(dev)
+        begin = snapshot(dev, modern)
+        time.sleep(secs)
+        end = snapshot(dev, modern)
+    finally:
+        hid_xfer(dev, [ACT['STOP']])
+    print_probe_window(snapshot_delta(begin, end))
+    print('DISCARD：未认领 USB 数据接口；只测完整采样器，不是 M0 紧循环。')
+    return 0
 
 
 def do_bench(dev, iters=2000):
@@ -262,9 +365,11 @@ class PktStream:
             del self.buf[:PACKET]
             self.pkts += 1
             out.append({
+                'version': p[2],
                 'kind': p[3],
                 'seq': int.from_bytes(p[4:8], "little"),
-                't_us': int.from_bytes(p[8:12], "little"),
+                't_raw': int.from_bytes(p[8:12], "little"),
+                't_us': int.from_bytes(p[8:12], "little") / (24.0 if p[2] == 2 else 1),
                 'n': int.from_bytes(p[12:14], "little"),
                 'aux': int.from_bytes(p[14:16], "little"),
                 'payload': p[HEADER:],
@@ -425,10 +530,11 @@ def verify_rv(samples):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['status', 'bench', 'run'])
+    global hid, usb
+    ap.add_argument('cmd', choices=['status', 'bench', 'run', 'discard'])
     ap.add_argument('--set', dest='vset', default='pack', choices=['pack', 'cross', 'one', 'mixed', 'two', 'rv'])
     ap.add_argument('--clock', type=int, default=0, help='SWD Hz，0=不动')
-    ap.add_argument('--period', type=int, default=100, help='采样周期 us')
+    ap.add_argument('--period', type=float, default=100, help='采样周期 us')
     ap.add_argument('--iters', type=int, default=2000)
     ap.add_argument('--flags', type=lambda s: int(s, 0), default=0, help='flags 位（0x10 = clock_delay 压 0）')
     ap.add_argument('--secs', type=float, default=3.0)
@@ -450,6 +556,14 @@ def main():
     ap.add_argument('--base', type=lambda s: int(s, 0), default=0,
                     help='用 8 个连续 u32（base+0..28）替掉整个变量表 —— 量多通道/一个多字 span 用')
     a = ap.parse_args()
+    if not math.isfinite(a.secs) or not 0 < a.secs < 170:
+        ap.error('--secs must be >0 and <170 (u32 timer wrap)')
+    config_data(a.period, []) # Validate before touching hardware.
+    import hid
+    if a.cmd == 'discard': a.flags |= 0x02
+    if a.cmd == 'run' and not a.flags & 0x02:
+        import usb.core
+        import usb.util
 
     vars_ = {'pack': V_PACK, 'cross': V_CROSS, 'one': V_ONE, 'mixed': V_MIXED, 'two': V_TWO,
              'rv': V_RV}[a.vset]
@@ -499,7 +613,7 @@ def main():
     do_config(dev, a.period, vars_, a.flags)
     st = status(dev)
     expect = {'pack': 1, 'one': 1, 'cross': 3, 'mixed': 2, 'two': 2, 'rv': 1}[a.vset]
-    print("配置: %d 变量, period=%d us, 探针算出 %d 个 span (本地期望 %s)"
+    print("配置: %d 变量, period=%g us, 探针算出 %d 个 span (本地期望 %s)"
           % (len(vars_), a.period, st['spans'], expect))
     if st['spans'] != expect:
         print("⚠️ span 数与本地计划不一致 —— 检查合并规则/地址")
@@ -518,6 +632,12 @@ def main():
               % (it, us, ticks / 24.0 / 1000.0, 1000.0 / us, blob, BLOB_TIER.get(blob, '?')))
         return 0
 
+    if a.flags & 0x02:
+        try:
+            return run_discard(dev, a.secs, st['supportsMetrics'])
+        finally:
+            if a.bridge == 'off': bridge_set(dev, True)
+
     # ---- run：启动推流 + 读 0x83 ----
     ud, intf, ep = find_ep83()
     try:
@@ -528,12 +648,10 @@ def main():
     usb.util.claim_interface(ud, intf)
 
     st = status(dev)
-    dropped0, seq0 = st['dropped'], st['seq']
     stream = PktStream()
     chunks = []
     raw = []
     stop = threading.Event()
-    nb = {'bytes': 0}
 
     # 🚨 读线程必须在 START **之前**起来，否则启动后那段没人读的时间（下面等 rc 的
     #    轮询至少 120 ms）里探针会把包缓冲填满并开始丢拍 —— 实测 period=40us 时
@@ -552,58 +670,43 @@ def main():
                 continue
             except Exception:
                 break
-            raw.append(b)
-            nb['bytes'] += len(b)
+            raw.append((time.perf_counter(), b))
 
     th = threading.Thread(target=reader, daemon=True)
     th.start()
 
-    hid_xfer(dev, [ACT['START']])
-    rc = -100
-    for _ in range(20):
-        time.sleep(0.12)
-        st = status(dev)
-        rc = st['startRc']
-        if rc != -100:
-            break
-    print("启动 rc=%d (0=ok, -1 时钟, -2 初始化, -3 变量表空, -4 该档不可用)" % rc)
-    if rc != 0:
-        stop.set()
+    try:
+        st = wait_started(dev)
+    except Exception:
+        hid_xfer(dev, [ACT['STOP']])
+        stop.set(); th.join(timeout=1.5)
         usb.util.dispose_resources(ud)
-        return 1
+        raise
+    print('启动 rc=0')
 
-    # 从这一刻起才计入速率与丢包统计（启动瞬态已经过去）
-    nb['bytes'] = 0
-    raw.clear()
-    st_begin = status(dev)          # 窗口起点的计数器快照，用来分离「探针丢」与「USB 丢」
+    # Arrival window and counter window are separately bracketed; never include drain.
+    st_begin = snapshot(dev, st['supportsMetrics'])
     t0 = time.perf_counter()
     time.sleep(a.secs)
-    dt = time.perf_counter() - t0
-    stop.set()
-    th.join(timeout=1.5)
-    total = nb['bytes']
-    # 🚨 窗口内实收的字节数 —— 只有这一段能算进"端到端速率"。drain 阶段（下面那 0.4 s）
-    #    读回来的数据是窗口之后才产生的，混进去会把速率算高：读缓冲开得越大虚高越多
-    #    （262144 B 时能虚高到 349 kHz，而探针只产了 339 kHz）。
-    win_bytes = total
-    st = status(dev)
-
+    t_end = time.perf_counter()
+    st_end = snapshot(dev, st['supportsMetrics'])
+    st = status(dev) # diagnostic only; do not use these later counters in the rate
     hid_xfer(dev, [ACT['STOP']])
-    time.sleep(0.15)
-    # 停流后把在飞的读收干净
+    stop.set(); th.join(timeout=1.5)
+    if th.is_alive():
+        raise RuntimeError('USB reader failed to settle')
+    window_bytes = arrival_window(raw, t0, t_end)
+    dt = t_end - t0
+    total = len(window_bytes)
+    # Drain after STOP for endpoint hygiene. It never enters window_bytes or delta.
     t1 = time.perf_counter()
     while time.perf_counter() - t1 < 0.4:
         try:
-            b = bytes(ep.read(16384, timeout=120))
+            ep.read(16384, timeout=120)
         except usb.core.USBTimeoutError:
             break
-        total += len(b)
-        raw.append(b)
-    st = status(dev)
     usb.util.dispose_resources(ud)
-
-    # 只解析窗口内那 win_bytes 字节（reader 是按顺序追加的，前 win_bytes 就是窗口内的）
-    chunks = stream.push(b"".join(raw)[:win_bytes])
+    chunks = stream.push(window_bytes)
     raw.clear()
 
     if a.bridge == 'off' or (a.flags & 0x20):
@@ -626,8 +729,8 @@ def main():
     print("包类型: %s" % kinds)
     if defs:
         d = defs[0]['payload']
-        print("DEF: swd=%d Hz period=%d us flags=0x%X nvars=%d spans=%d"
-              % (int.from_bytes(d[0:4], 'little'), int.from_bytes(d[4:8], 'little'),
+        print("DEF: swd=%d Hz period=%g us flags=0x%X nvars=%d spans=%d"
+              % (int.from_bytes(d[0:4], 'little'), int.from_bytes(d[4:8], 'little') / (24.0 if defs[0]['version'] == 2 else 1),
                  int.from_bytes(d[8:10], 'little'), d[10], d[11]))
     print("probe: produced=%d dropped=%d swdErr=%d yield=%d seq=%d 后端=%s"
           % (st['produced'], st['dropped'], st['swdErr'], st['yield'], st['seq'],
@@ -671,16 +774,11 @@ def main():
 
     # ★ 端到端速率：窗口内**主机实收**的样本数 ÷ 窗口时长。探针侧的 produced 增量
     #   用来把「探针自己跳拍」和「USB 没送到」分开 —— 两者看着都是掉数据，成因差很远。
-    dprod = st['produced'] - st_begin['produced']
-    ddrop = st['dropped'] - st_begin['dropped']
-    # w4 高 16 位 = s_usb_drop（缓冲耗尽而丢的），低 16 位 = s_bytes。
-    # 必须取**窗口增量**：累计值把启动瞬态也算进去，会把结论带偏。
-    dusb = (st['raw'][4] >> 16) - (st_begin['raw'][4] >> 16)
     if dt > 0:
-        print("★ 端到端 %.1f kHz（主机实收 %d 样本 / %.3f s）" % (len(samples) / dt / 1000.0, len(samples), dt))
-        print("  探针窗口内产 %d 拍（%.1f kHz），丢 %d 拍 = %.1f%%（其中 USB 缓冲耗尽 %d 拍 = 丢包的 %.0f%%）"
-              % (dprod, dprod / dt / 1000.0, ddrop, 100.0 * ddrop / max(dprod + ddrop, 1),
-                 dusb, 100.0 * dusb / max(ddrop, 1)))
+        print('★ 端到端 %.1f kHz（主机到达窗口 %d 样本 / %.6f s）'
+              % (len(samples) / dt / 1000.0, len(samples), dt))
+    print_probe_window(snapshot_delta(st_begin, st_end))
+    print('  主机窗口按 USB 返回时刻；探针窗口按快照 tick，边界有 HID/在飞包偏差。')
     # 校验按"这组里实际有哪些变量"自适应 —— 单选一个 g_tick 时没有 i_tick/u_hi
     if a.vset == 'rv' and samples and not verify_rv(samples):
         return 1
