@@ -50,8 +50,19 @@ COM_ARG = $(if $(COMREG),--port $(COMREG))
         regression-swd regression-swd-bg regression-swd-log regression-swd-jsonl \
         regression-riscv regression-riscv-bg regression-riscv-log regression-riscv-jsonl \
         panel panel-red panel-green panel-blue panel-gradient panel-checker panel-le \
-        spi-loop spi-frames spi-pintest spi-dbg spi-bench spi-info
+        spi-loop spi-frames spi-pintest spi-dbg spi-bench spi-info test-host test-jtag-host
 all: help
+
+# Production C regression models; these targets do not touch attached boards.
+test-jtag-host:
+	$(PYTHON) script_test/riscv_jtag_host_test.py
+
+test-host: test-jtag-host
+	$(PYTHON) script_test/scope_host_test.py
+	$(PYTHON) script_test/rtt_stop_host_test.py
+	$(PYTHON) script_test/spi_drain_host_test.py
+	$(PYTHON) script_test/target_switch_host_test.py
+	$(PYTHON) script_test/test_scope_hss_test.py
 
 build: build-boot build-app
 
