@@ -85,6 +85,8 @@ void scope_sampler_poll(void);
 
 /* 状态字（12 个 u32，位域见 docs/scope-page.md §7.1）。返回写入的字数。 */
 uint32_t scope_sampler_status(uint32_t *out, uint32_t words);
+/* action 11: atomic timer/full-width counters, layout in docs/hss-tick-protocol.md */
+uint32_t scope_sampler_metrics(uint32_t *out, uint32_t words);
 
 /* HID 0x32 action 8/9：用当前计划空跑 iters 次，回报 MCHTMR ticks（24 MHz）。
  * 这是 M0 标定：拿到真实的 µs/样本，而不是模型估算。 */

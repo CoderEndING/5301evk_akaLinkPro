@@ -40,3 +40,30 @@ The single-word sample path also bypasses the generic span loop. Posted reads st
 write the previous slot, and the last slot is flushed before handing a packet to USB.
 Host tests cover stop/error, packet boundaries, and the 32-bit timer wrap. Target
 instruction timing, ISR latency and throughput require an on-board measurement.
+
+## Measurement snapshot (HID 0x32 action 11)
+
+STATUS word0 bit4 advertises this action. Response envelope and length match STATUS,
+but the following 12 little-endian u32 words have a separate layout:
+
+| Word | Meaning |
+| --- | --- |
+| 0 | Magic `0x31535348` (HSS1) |
+| 1 | Hardware timer tick, u32 wrap |
+| 2 | Timer frequency, 24000000 Hz |
+| 3 | Produced samples |
+| 4 | Scheduler skipped samples |
+| 5 | USB buffer exhaustion samples |
+| 6 | SWD errors |
+| 7 | DAP yield events |
+| 8 | USB TX completions |
+| 9 | Formatted bytes (includes discarded packets in DISCARD mode) |
+| 10 | Full sampling period in ticks |
+| 11 | Flags bits0..7; running bit8 |
+
+Timer and counters are captured in a short critical section. Counters are full u32;
+use modulo subtraction across rollover. At 24 MHz a timer window must be shorter
+than 179 seconds. A USB completion counts a packet; it does not certify application
+receipt. Host receipt uses its own monotonic arrival window. Startup and post-STOP
+drain must be excluded from both rates. The two windows have small HID boundary
+skew, so their difference alone cannot be interpreted as an exact loss count.

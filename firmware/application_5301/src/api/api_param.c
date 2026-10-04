@@ -81,6 +81,7 @@
 #define SCOPE_ACT_TRIGGER 4U      /* v2：探针侧触发，当前主机侧触发已够用 */
 #define SCOPE_ACT_CONFIG 7U
 #define SCOPE_ACT_CONFIG_TICKS 10U
+#define SCOPE_ACT_METRICS 11U
 #define SCOPE_ACT_BENCH 8U
 #define SCOPE_ACT_BENCH_RESULT 9U
 
@@ -548,7 +549,10 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
 
         if (req_hid[3] != SCOPE_ACT_BENCH_RESULT)
         {
-            (void)scope_sampler_status(out, 12U);
+            if (req_hid[3] == SCOPE_ACT_METRICS)
+                (void)scope_sampler_metrics(out, 12U);
+            else
+                (void)scope_sampler_status(out, 12U);
             res_hid[1] = 1U + 1U + 4U * 12U;
             res_hid[2] = CMD_SCOPE;
             res_hid[3] = (uint8_t)(int8_t)scope_sampler_start_result();   /* 网页在 res[2] 读它 */

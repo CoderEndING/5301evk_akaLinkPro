@@ -1250,6 +1250,7 @@ uint32_t scope_sampler_status(uint32_t *out, uint32_t words)
     out[0] = (uint32_t)(s_running ? 1U : 0U) |
              (1U << 2) | /* 支持 action 10 / v2 tick 时间轴 */
              (1U << 3) | /* 支持 flags bit7 短批次 */
+             (1U << 4) | /* 支持 action 11 完整计数快照 */
              ((uint32_t)((s_backend == SCOPE_BE_RISCV) ? 1U : 0U) << 1) |   /* bit1 = 生效后端是 RISC-V */
              ((uint32_t)s_nspans << 8) |
              ((uint32_t)(s_swd_ready ? 1U : 0U) << 16) |
@@ -1268,5 +1269,27 @@ uint32_t scope_sampler_status(uint32_t *out, uint32_t words)
               ((uint32_t)(s_time_version == SCOPE_VER_TICKS) << 17) |
               ((uint32_t)((s_flags & SCOPE_FLAG_DISCARD) ? 1U : 0U) << 16) |
               ((uint32_t)(s_clock_hz / 1000000UL) << 24);
+    return 12U;
+}
+
+/* Control-plane only: snapshot timer and counters in one short critical section.
+ * No diagnostic timer reads are added to the per-sample path. */
+uint32_t scope_sampler_metrics(uint32_t *out, uint32_t words)
+{
+    if (words < 12U) { return 0U; }
+    uint32_t lvl = scope_irq_save();
+    out[0] = 0x31535348U; /* HSS1 */
+    out[1] = mchtmr_now();
+    out[2] = SCOPE_TIME_HZ;
+    out[3] = s_produced;
+    out[4] = s_dropped;
+    out[5] = s_usb_drop;
+    out[6] = s_swd_err;
+    out[7] = s_yield;
+    out[8] = s_tx_done;
+    out[9] = s_bytes;
+    out[10] = s_period_ticks;
+    out[11] = (uint32_t)s_flags | ((uint32_t)s_running << 8);
+    scope_irq_restore(lvl);
     return 12U;
 }

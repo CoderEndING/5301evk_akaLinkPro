@@ -62,6 +62,14 @@ int main(void)
     assert(scope_sampler_configure_ticks(96, SCOPE_FLAG_DISCARD | SCOPE_FLAG_FAST_BATCH, 1, &one) == 0);
     assert(scope_start_now() == 0); test_clock = s_next_tick; scope_sampler_poll();
     assert(s_produced == 1);
+    s_produced = 100000; s_dropped = 80000; s_usb_drop = 70000;
+    s_swd_err = 90000; s_yield = 65536; test_clock = UINT32_MAX - 10;
+    assert(scope_sampler_metrics(status_words, 11) == 0);
+    assert(scope_sampler_metrics(status_words, 12) == 12);
+    assert(status_words[0] == 0x31535348 && status_words[1] == UINT32_MAX - 10);
+    assert(status_words[2] == 24000000 && status_words[3] == 100000);
+    assert(status_words[4] == 80000 && status_words[5] == 70000 && status_words[6] == 90000);
+    assert(status_words[7] == 65536 && status_words[10] == 96);
     one.size = 255;
     assert(scope_sampler_configure_ticks(60, 0, 1, &one) == -6 && s_nvars == 0);
     puts("scope host tests: protocol units, pipeline, packet boundary, limits, bounded batching, stop/error, rollover PASS");
