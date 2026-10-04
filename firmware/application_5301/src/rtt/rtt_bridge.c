@@ -1017,6 +1017,11 @@ static void rtt_bridge_service_requests(void)
     if (s_stop_pending)
     {
         s_stop_pending = 0U;
+        /* STOP cancels a START queued before it. Otherwise this same service
+         * pass would stop the engine and immediately start it again below.
+         * Publish completion from the main loop, after deferred work is safe. */
+        s_start_pending = 0U;
+        s_start_rc = 0;
         if (s_running)
         {
             rtt_bridge_flush_pending_rd();
