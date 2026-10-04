@@ -5,7 +5,7 @@ static void reset_test(void)
     scope_sampler_stop();
     scope_usb_reset_apply();
     test_clock = test_previous = test_calls = test_last_dap = 0;
-    test_fail_read = 0; test_cdc = 1; test_read_cost = 36;
+    test_fail_read = 0; test_stop_call = 0; test_cdc = 1; test_read_cost = 36;
 }
 int main(void)
 {
@@ -36,8 +36,34 @@ int main(void)
     assert((status_words[11] & 0xffff) == 60 && (status_words[11] & (1U<<17)));
     assert(scope_sampler_configure_ticks(1, 0, 1, &one) == 0 && s_period_ticks == 48);
     assert(scope_sampler_configure_ticks(UINT32_MAX, 0, 1, &one) == 0 && s_period_ticks == 24000000);
+    reset_test();
+    assert(scope_sampler_configure_ticks(54, SCOPE_FLAG_DISCARD | SCOPE_FLAG_FAST_BATCH, 1, &one) == 0);
+    assert(scope_start_now() == 0);
+    test_clock = s_next_tick;
+    scope_sampler_poll();
+    assert(s_produced == 16 && s_t_time == 16 * 54 && s_dropped == 0);
+    for (unsigned i = 0; i < 7; i++) { test_clock = s_next_tick; scope_sampler_poll(); }
+    assert(s_produced == 124 && s_pkts == 2 && s_fill_n == 0);
+    test_clock = s_next_tick;
+    test_stop_call = test_calls + 3;
+    scope_sampler_poll();
+    assert(!s_running && s_produced == 127);
+    reset_test();
+    assert(scope_sampler_configure_ticks(54, SCOPE_FLAG_DISCARD | SCOPE_FLAG_FAST_BATCH, 1, &one) == 0);
+    assert(scope_start_now() == 0);
+    test_fail_read = 1; test_clock = s_next_tick;
+    scope_sampler_poll();
+    assert(s_swd_err == 1 && s_produced == 0 && s_pipe_dst == NULL);
+    /* Timer rollover must not stall the bounded wait. */
+    test_clock = s_next_tick = UINT32_MAX - 100;
+    scope_sampler_poll();
+    assert(s_produced == 16);
+    /* A slow period always returns after one sample. */
+    assert(scope_sampler_configure_ticks(96, SCOPE_FLAG_DISCARD | SCOPE_FLAG_FAST_BATCH, 1, &one) == 0);
+    assert(scope_start_now() == 0); test_clock = s_next_tick; scope_sampler_poll();
+    assert(s_produced == 1);
     one.size = 255;
     assert(scope_sampler_configure_ticks(60, 0, 1, &one) == -6 && s_nvars == 0);
-    puts("scope host tests: protocol units, pipeline, packet boundary, limits PASS");
+    puts("scope host tests: protocol units, pipeline, packet boundary, limits, bounded batching, stop/error, rollover PASS");
     return 0;
 }

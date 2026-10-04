@@ -25,3 +25,18 @@ w11 低 16 位为周期原始单位；与旧状态一样，长周期在这个紧
 离线验证：`python script_test/scope_host_test.py` 编译实际 sampler C，替换 SDK 外设和 timer MMIO；
 覆盖旧/新单位、posted read 值连续性、满包 flush、周期限幅、非法变量宽度。
 完整 HPM 固件编译需原有 SDK/工具链，吞吐、采样抖动、USB 并发需上板验证。
+
+## Bounded single-word batches
+
+STATUS word 0 bit 3 advertises `SCOPE_FLAG_FAST_BATCH` (configuration flags bit 7).
+When requested for a direct single-word SWD plan at <=72 ticks (3 µs), one poll
+handles at most 16 samples, still waiting for each deadline. It returns at a packet
+boundary, buffer starvation, error, or control request. Interrupts remain enabled;
+main-loop services can be delayed by roughly 16 periods plus sample/interrupt cost.
+JTAG, multi-span, and slower plans retain the scalar scheduler. Disable bit 7 for
+A/B measurements. This changes service cadence, not the nominal sampling period.
+
+The single-word sample path also bypasses the generic span loop. Posted reads still
+write the previous slot, and the last slot is flushed before handing a packet to USB.
+Host tests cover stop/error, packet boundaries, and the 32-bit timer wrap. Target
+instruction timing, ISR latency and throughput require an on-board measurement.

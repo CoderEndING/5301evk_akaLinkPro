@@ -9,6 +9,8 @@
 static uint32_t test_clock, test_read_cost = 36U, test_previous, test_calls;
 static uint32_t test_last_dap;
 static int test_fail_read;
+static uint32_t test_stop_call;
+void scope_sampler_stop(void);
 static uint8_t test_cdc = 1;
 static uint32_t test_clock_read(void) { return test_clock++; }
 static uint32_t disable_global_irq(uint32_t m) { (void)m; return 1; }
@@ -21,6 +23,7 @@ static uint8_t swd_read_word_pipe(uint32_t *v)
     if (test_fail_read) { test_fail_read = 0; return 0; }
     if (v) *v = test_previous;
     test_previous = ++test_calls;
+    if (test_stop_call && test_calls == test_stop_call) scope_sampler_stop();
     test_clock += test_read_cost;
     return 1;
 }

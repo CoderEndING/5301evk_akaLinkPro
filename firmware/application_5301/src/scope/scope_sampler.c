@@ -614,6 +614,15 @@ static inline void scope_copy_var(uint8_t *dst, const uint8_t *src, uint8_t size
  * 返回 0 = 成功；-1 = 某个 span 读失败（这一拍作废，计入 swd_err）。 */
 static int scope_sample_bytes(uint8_t *dst)
 {
+    /* Single-word plans have one aligned direct span. Avoid the generic span loop. */
+    if (s_pipe_ok)
+    {
+        uint32_t v;
+        if (!scope_be_hold_prepare(s_span[0].start) || !scope_be_pipe_read(&v)) { return -1; }
+        if (s_pipe_dst != NULL) { put32(s_pipe_dst, v); }
+        s_pipe_dst = dst;
+        return 0;
+    }
     for (uint8_t sp = 0U; sp < s_nspans; sp++)
     {
         const scope_span_t *s = &s_span[sp];
@@ -983,32 +992,48 @@ void scope_sampler_poll(void)
         }
     }
 
-    if (scope_sample_once() != 0)
+    /* Keep interrupts enabled. Only amortize main-loop services for an explicitly
+     * enabled, bounded single-word session; slower/multi-span/JTAG plans stay scalar.
+     * STOP/configuration/reset requests interrupt the deadline wait. Packet boundaries
+     * return promptly so other bridges and queued DAP commands are serviced. */
+    uint8_t budget = ((s_flags & SCOPE_FLAG_FAST_BATCH) && s_pipe_ok &&
+                      s_backend == SCOPE_BE_SWD && s_period_ticks <= 72U) ? 16U : 1U;
+    while (budget-- != 0U)
     {
-        s_swd_err++;
-        s_next_tick = now + s_period_ticks;
-        /* RISC-V 引擎被主机关掉时自愈重连（recheck 只在引擎确实关了时才清标志，
-         * SWD 的瞬态读错误不受影响）；不这么做的话每个 tick 都空转报错。 */
-        scope_be_recheck();
-        if (!s_swd_ready)
+        if (scope_sample_once() != 0)
         {
-            (void)scope_be_link_ready();
+            s_swd_err++;
+            s_next_tick = now + s_period_ticks;
+            /* RISC-V 引擎被主机关掉时自愈重连（recheck 只在引擎确实关了时才清标志，
+             * SWD 的瞬态读错误不受影响）；不这么做的话每个 tick 都空转报错。 */
+            scope_be_recheck();
+            if (!s_swd_ready)
+            {
+                (void)scope_be_link_ready();
+            }
+            return;
         }
-        return;
+
+        /* 追不上就跳拍：把 next_tick 推到将来，并把**真正跳过**的整拍数计入 dropped。
+         * 🚨 这里必须只算整拍：早先写成 `(now-next)/period + 1`，于是"晚 1 个 tick（42 ns）"
+         *    也被记成丢了 1 拍 —— 实测 10 kHz 采样下 produced=31222、dropped=31174，
+         *    界面上会显示成丢了一半，而 seq 缺口是 0、实际速率也正好 10 kHz。
+         *    现在用 while 逐拍推进，只有 now 真的越过了下一拍的时刻才算丢。 */
+        s_next_tick += s_period_ticks;
+        while ((int32_t)(now - s_next_tick) > 0)
+        {
+            s_next_tick += s_period_ticks;
+            s_dropped++;
+            s_t_time += s_time_step;
+        }
+        if (budget == 0U || s_fill_n == 0U || s_fill_buf >= SCOPE_TX_BUFS) { return; }
+        do
+        {
+            if (!s_running || s_usb_reset_req || s_start_req || s_bench_req) { return; }
+            now = mchtmr_now();
+        } while ((int32_t)(now - s_next_tick) < 0);
     }
 
-    /* 追不上就跳拍：把 next_tick 推到将来，并把**真正跳过**的整拍数计入 dropped。
-     * 🚨 这里必须只算整拍：早先写成 `(now-next)/period + 1`，于是"晚 1 个 tick（42 ns）"
-     *    也被记成丢了 1 拍 —— 实测 10 kHz 采样下 produced=31222、dropped=31174，
-     *    界面上会显示成丢了一半，而 seq 缺口是 0、实际速率也正好 10 kHz。
-     *    现在用 while 逐拍推进，只有 now 真的越过了下一拍的时刻才算丢。 */
-    s_next_tick += s_period_ticks;
-    while ((int32_t)(now - s_next_tick) > 0)
-    {
-        s_next_tick += s_period_ticks;
-        s_dropped++;
-        s_t_time += s_time_step;
-    }
 }
 
 /* ------------------------------------------------------------------ 控制面 */
@@ -1224,6 +1249,7 @@ uint32_t scope_sampler_status(uint32_t *out, uint32_t words)
     if (words < 12U) { return 0U; }
     out[0] = (uint32_t)(s_running ? 1U : 0U) |
              (1U << 2) | /* 支持 action 10 / v2 tick 时间轴 */
+             (1U << 3) | /* 支持 flags bit7 短批次 */
              ((uint32_t)((s_backend == SCOPE_BE_RISCV) ? 1U : 0U) << 1) |   /* bit1 = 生效后端是 RISC-V */
              ((uint32_t)s_nspans << 8) |
              ((uint32_t)(s_swd_ready ? 1U : 0U) << 16) |
