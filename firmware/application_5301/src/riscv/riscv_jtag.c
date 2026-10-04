@@ -325,18 +325,10 @@ static int dmi_write(uint32_t addr, uint32_t data)
 
 /* --------------------------------------------------------------- SBA ---- */
 
-static uint32_t sba_clear_errors(void)
+/* Consume a captured SBCS without issuing another read. The block-read
+ * pipeline uses this after collecting its final posted status response. */
+static uint32_t sba_clear_snapshot(uint32_t sbcs)
 {
-    uint32_t sbcs = 0U;
-
-    if (dmi_read(DM_SBCS, &sbcs) != 0)
-    {
-        s_sbcs_valid = 0U;
-        s_hold_ok = 0U;
-        s_sba_failed = 1U;
-        s_last_sbcs = UINT32_MAX;      /* unknown, never report a clean SBCS */
-        return UINT32_MAX;
-    }
     s_last_sbcs = sbcs;
 
     if ((sbcs & (SBCS_SBBUSYERROR | SBCS_SBERROR)) != 0U)
@@ -358,6 +350,20 @@ static uint32_t sba_clear_errors(void)
         }
     }
     return sbcs;
+}
+
+static uint32_t sba_clear_errors(void)
+{
+    uint32_t sbcs = 0U;
+    if (dmi_read(DM_SBCS, &sbcs) != 0)
+    {
+        s_sbcs_valid = 0U;
+        s_hold_ok = 0U;
+        s_sba_failed = 1U;
+        s_last_sbcs = UINT32_MAX;      /* unknown, never report a clean SBCS */
+        return UINT32_MAX;
+    }
+    return sba_clear_snapshot(sbcs);
 }
 
 /* 🚨 读块之后必须核对 SBA 的 sticky 错误位 —— **DMI 应答是 SUCCESS 并不代表
@@ -729,24 +735,26 @@ int riscv_jtag_write_word(uint32_t addr, uint32_t val)
  *
  * sbreadondata makes every read of sbdata0 start the next system bus read, so
  * the loop below keeps exactly one read in flight and the DMI pipeline (one
- * deep) supplies the previous word in the same scan. */
+ * deep) supplies the previous word in the same scan. The final data response
+ * is collected while posting READ SBCS; the next NOP collects that status.
+ * Cached, error-free N-word reads therefore cost N+4 scans, not N+6. */
 int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
 {
     uint32_t first;
     uint32_t words;
     uint32_t head;
-    uint32_t *out = (uint32_t *)(void *)dst;
-    uint8_t tail[4];
+    uint32_t done = 0U;
     uint32_t i;
 
-    if ((s_open == 0U) || (len == 0U))
+    if ((s_open == 0U) || (dst == NULL) || (len == 0U) ||
+        (((uint64_t)addr + len) > (1ULL << 32)))
     {
         return -1;
     }
 
     first = addr & ~0x3U;
     head = addr - first;
-    words = (head + len + 3U) / 4U;
+    words = (uint32_t)(((uint64_t)head + len + 3U) / 4U);
 
     if (sba_config(SBCS_SBREADONADDR | SBCS_SBREADONDATA) != 0)
     {
@@ -760,94 +768,49 @@ int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
     /* Kick the pipeline: the response to this request is the first word. */
     (void)dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
 
-    if (head == 0U)
+    for (i = 0U; i < words; i++)
     {
-        for (i = 0U; i < words; i++)
+        uint32_t next_reg = (i + 1U == words) ? DM_SBCS : DM_SBDATA0;
+        uint64_t resp = dmi_post(DMI_OP_READ, next_reg, 0U);
+        if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
         {
-            uint64_t resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
-
-            if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
-            {
-                /* Reposting SBDATA0 can advance the SBA address and skip a word.
-                 * Recover the DTM, then let read() restart the entire block. */
-                (void)dmi_recover(dmi_resp_op(resp));
-                s_last_sbcs = sba_clear_errors();
-                s_sba_failed = 1U;
-                return -4;
-            }
-            out[i] = dmi_resp_data(resp);
+            /* Never continue an auto-increment stream after a lost response. */
+            (void)dmi_recover(dmi_resp_op(resp));
+            s_last_sbcs = sba_clear_errors();
+            s_sba_failed = 1U;
+            return -4;
         }
-    }
-    else
-    {
-        uint32_t w = 0U;
-
-        for (i = 0U; i < words; i++)
+        uint32_t w = dmi_resp_data(resp);
+        uint32_t offset = (i == 0U) ? head : 0U;
+        uint32_t count = 4U - offset;
+        if (count > len - done) { count = len - done; }
+        if ((offset == 0U) && (count == 4U) &&
+            (((uintptr_t)(dst + done) & 3U) == 0U))
         {
-            uint64_t resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
-
-            if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
-            {
-                (void)dmi_recover(dmi_resp_op(resp));
-                s_last_sbcs = sba_clear_errors();
-                s_sba_failed = 1U;
-                return -4;
-            }
-            w = dmi_resp_data(resp);
-            if (i == 0U)
-            {
-                uint8_t *p = (uint8_t *)&w;
-                uint32_t n = 4U - head;
-
-                if (n > len)
-                {
-                    n = len;
-                }
-                for (uint32_t k = 0U; k < n; k++)
-                {
-                    dst[k] = p[head + k];
-                }
-            }
-            else if (i == (words - 1U))
-            {
-                uint8_t *p = (uint8_t *)&w;
-                uint32_t done = 4U - head + (i - 1U) * 4U;
-                uint32_t n = len - done;
-
-                if (n > 4U)
-                {
-                    n = 4U;
-                }
-                for (uint32_t k = 0U; k < n; k++)
-                {
-                    dst[done + k] = p[k];
-                }
-            }
-            else
-            {
-                uint32_t done = 4U - head + (i - 1U) * 4U;
-                for (uint32_t k = 0U; k < 4U; k++)
-                {
-                    dst[done + k] = ((uint8_t *)&w)[k];
-                }
-            }
+            *(uint32_t *)(void *)(dst + done) = w;
         }
+        else
+        {
+            for (uint32_t k = 0U; k < count; k++)
+                dst[done + k] = (uint8_t)(w >> (8U * (offset + k)));
+        }
+        done += count;
     }
 
-    /* Drain the extra request that is still in flight. */
-    (void)dmi_post(DMI_OP_NOP, 0U, 0U);
-    (void)tail;
-
-    /* 🚨 必须核对 sticky 错误：DMI 应答 SUCCESS 只说明"这次 DMI 传输没问题"，
-     * SBA 侧可能整块都被静默忽略了（详见 sba_check_errors）。出错就让调用方重读。 */
-    if (sba_check_errors() != 0)
+    uint64_t status = dmi_post(DMI_OP_NOP, 0U, 0U);
+    if (dmi_resp_op(status) != DMI_OP_STATUS_SUCCESS)
+    {
+        (void)dmi_recover(dmi_resp_op(status));
+        s_last_sbcs = UINT32_MAX;
+        s_sba_failed = 1U;
+        return -5;
+    }
+    uint32_t sbcs = sba_clear_snapshot(dmi_resp_data(status));
+    if ((sbcs == UINT32_MAX) || (sbcs & (SBCS_SBBUSYERROR | SBCS_SBERROR)))
     {
         s_sba_failed = 1U;
         return -5;
     }
-
-    /* 🚨 成功路径**不**再读一遍 SBCS 清错（那是 2 次扫描的纯开销）：出错时上面各
-     * 分支已经清过，下一次 sba_config() 也会因为 s_sba_failed 再清一次。 */
     return 0;
 }
 

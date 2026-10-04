@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory(prefix='jtag-host-') as directory:
     support = (root / 'script_test/host/riscv_jtag_test_support.h').read_text(encoding='utf-8')
     cases = (root / 'script_test/host/riscv_jtag_test_cases.c').read_text(encoding='utf-8')
     (path / 'test.c').write_text(support + '\n' + source + '\n' + cases, encoding='utf-8')
+    extra = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if os.environ.get('JTAG_HOST_SANITIZE') == '1' else []
     subprocess.run([os.environ.get('CC', 'gcc'), '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
-                    '-Wno-unused-function', str(path / 'test.c'), '-o', str(path / 'test')], check=True)
+                    '-Wno-unused-function', *extra, str(path / 'test.c'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)

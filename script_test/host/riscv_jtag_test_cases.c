@@ -143,6 +143,46 @@ int main(void)
     s_hold_reads = 31; value = 0xBADBADU;
     inject(DM_SBCS, DMI_OP_READ, 0, 3, 1);
     assert(riscv_jtag_hold_read(&value) < 0 && value == 0xBADBADU && !s_hold_ok);
+    /* Both target and host pointers can be unaligned. Guard bytes ensure the
+     * last partial word never writes beyond the requested destination. */
+    for (uint32_t head = 0; head < 4; head++) {
+        for (uint32_t host = 0; host < 4; host++) {
+            for (uint32_t len = 1; len <= 67; len++) {
+                uint8_t storage[80]; setup(); memset(storage, 0xCD, sizeof(storage));
+                uint8_t *dst = storage + 4 + host;
+                assert(riscv_jtag_read_once(0x1000U + head, dst, len) == 0);
+                assert(memcmp(dst, (uint8_t *)memory + head, len) == 0);
+                for (uint32_t k = 0; k < 4 + host; k++) assert(storage[k] == 0xCD);
+                for (uint32_t k = 4 + host + len; k < sizeof(storage); k++) assert(storage[k] == 0xCD);
+                uint32_t words = (head + len + 3U) / 4U;
+                assert(scans == words + 6U); /* includes first SBCS configuration */
+                assert(sbcs_reads == 1U);
+            }
+        }
+    }
+    for (uint32_t n = 1; n <= 256; n++) {
+        uint32_t block[256]; setup();
+        assert(riscv_jtag_read_once(0x1000U, (uint8_t *)block, 4) == 0);
+        uint32_t before = scans, checks = sbcs_reads;
+        assert(riscv_jtag_read_once(0x1000U, (uint8_t *)block, n * 4) == 0);
+        assert(memcmp(block, memory, n * 4) == 0);
+        assert(scans - before == n + 4U && sbcs_reads - checks == 1U);
+    }
+    for (uint32_t status = 1; status <= 3; status++) {
+        setup(); inject(DM_SBCS, DMI_OP_READ, 0, status, 1);
+        assert(riscv_jtag_read_once(0x1000U, (uint8_t *)out, sizeof(out)) < 0);
+        assert(s_sba_failed && s_last_sbcs == UINT32_MAX);
+    }
+    setup(); assert(riscv_jtag_read_once(0x1000U, (uint8_t *)out, sizeof(out)) == 0);
+    model_sbcs |= SBCS_SBBUSYERROR;
+    assert(riscv_jtag_read_once(0x1000U, (uint8_t *)out, sizeof(out)) < 0);
+    assert(s_sba_failed && !(model_sbcs & SBCS_SBBUSYERROR) && s_sba_err_events == 1);
+    assert(riscv_jtag_read(0x1000U, (uint8_t *)out, sizeof(out)) == 0);
+    assert(memcmp(out, memory, sizeof(out)) == 0);
+    setup(); uint32_t before = scans;
+    assert(riscv_jtag_read_once(UINT32_MAX - 1U, (uint8_t *)out, 8) < 0);
+    assert(riscv_jtag_read_once(0x1000U, NULL, 8) < 0 && scans == before);
+    puts("JTAG block pipeline: 1072 target/host alignment and guarded-length cases, 256 cached scan-count cases, N+4 scans, final SBCS errors rejected PASS");
     puts("JTAG production C: sticky DTM recovery, no write replay, unknown SBCS rejected, block restart and 32-sample pipeline boundaries PASS");
     return 0;
 }
