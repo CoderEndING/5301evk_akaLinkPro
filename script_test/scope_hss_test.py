@@ -685,27 +685,39 @@ def main():
     print('启动 rc=0')
 
     # Arrival window and counter window are separately bracketed; never include drain.
-    st_begin = snapshot(dev, st['supportsMetrics'])
-    t0 = time.perf_counter()
-    time.sleep(a.secs)
-    t_end = time.perf_counter()
-    st_end = snapshot(dev, st['supportsMetrics'])
-    st = status(dev) # diagnostic only; do not use these later counters in the rate
-    hid_xfer(dev, [ACT['STOP']])
-    stop.set(); th.join(timeout=1.5)
-    if th.is_alive():
-        raise RuntimeError('USB reader failed to settle')
+    try:
+        try:
+            st_begin = snapshot(dev, st['supportsMetrics'])
+            t0 = time.perf_counter()
+            time.sleep(a.secs)
+            t_end = time.perf_counter()
+            st_end = snapshot(dev, st['supportsMetrics'])
+            st = status(dev) # diagnostic only; never used in the rate delta
+        finally:
+            try:
+                hid_xfer(dev, [ACT['STOP']])
+            finally:
+                stop.set(); th.join(timeout=1.5)
+        if th.is_alive():
+            raise RuntimeError('USB reader failed to settle')
+    except BaseException:
+        usb.util.dispose_resources(ud)
+        if a.bridge == 'off': bridge_set(dev, True)
+        raise
     window_bytes = arrival_window(raw, t0, t_end)
     dt = t_end - t0
     total = len(window_bytes)
     # Drain after STOP for endpoint hygiene. It never enters window_bytes or delta.
     t1 = time.perf_counter()
-    while time.perf_counter() - t1 < 0.4:
-        try:
-            ep.read(16384, timeout=120)
-        except usb.core.USBTimeoutError:
-            break
-    usb.util.dispose_resources(ud)
+    try:
+        while time.perf_counter() - t1 < 0.4:
+            try:
+                ep.read(16384, timeout=120)
+            except usb.core.USBTimeoutError:
+                break
+    finally:
+        usb.util.dispose_resources(ud)
+        if a.bridge == 'off': bridge_set(dev, True)
     chunks = stream.push(window_bytes)
     raw.clear()
 

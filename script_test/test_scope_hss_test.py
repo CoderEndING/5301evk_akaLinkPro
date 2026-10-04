@@ -49,6 +49,12 @@ class MeasurementTest(unittest.TestCase):
         with patch.object(hss,'hid_xfer',return_value=[51,0x32,250]):
             with self.assertRaises(RuntimeError): hss.do_config(None,3,hss.V_ONE)
 
+    def test_discard_stops_when_snapshot_fails(self):
+        with patch.object(hss,'wait_started'), patch.object(hss,'snapshot',side_effect=RuntimeError('snapshot')), \
+             patch.object(hss,'hid_xfer') as xfer:
+            with self.assertRaises(RuntimeError): hss.run_discard(None,5,True)
+            xfer.assert_called_once_with(None,[hss.ACT['STOP']])
+
     def test_v2_packet_units(self):
         packet = struct.pack('<HBBIIHH',0x4a53,2,2,1,60,1,4)+struct.pack('<I',0xffffffff)+bytes(492)
         stream = hss.PktStream()
