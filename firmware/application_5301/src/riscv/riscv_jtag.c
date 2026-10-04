@@ -16,7 +16,8 @@
 #define DMI_OP_WRITE 2U
 
 #define DMI_OP_STATUS_SUCCESS  0U
-#define DMI_OP_STATUS_BUSY     1U
+#define DMI_OP_STATUS_FAILED   2U
+#define DMI_OP_STATUS_BUSY     3U
 
 /* Debug Module registers (RISC-V Debug Specification 1.0) */
 #define DM_DATA0      0x04U
@@ -63,7 +64,7 @@ static uint8_t s_hold_ok;
 static uint32_t s_hold_reads;      /* 本段"抱住"里读了多少拍（用于摊薄错误检查） */
 
 /* 单字流水路径上每这么多拍回读一次 SBCS 查 sticky 错误。
- * 32 拍 = 2 次扫描的检查摊到 32 次扫描上，开销 ~6%；期间最多 32 拍可能是坏值
+ * 保持流水的检查每 32 拍多一次扫描，扫描数开销约 3.1%；期间最多 32 拍可能是坏值
  * （J-Scope 300 kHz 下约 0.1 ms），换来的是"错误不会永久静默"。 */
 #define SBA_ERR_CHECK_PERIOD 32U
 
@@ -116,8 +117,8 @@ static uint8_t sba_cfg_stale(void)
 /* Run-Test/Idle TCK cycles inserted before every DR scan. This is not optional
  * on the HPM6880's DTM: dtmcs.idle reads 7, and without idle clocks the DTM
  * silently stops accepting requests - the response freezes at op = 3 (which
- * looks exactly like "dmcontrol writes are rejected"). 4 clocks already work;
- * 8 keeps a margin, and the cost is ~17% of one 46-clock DMI access. */
+ * looks exactly like "dmcontrol writes are rejected"). The regression record
+ * requires 8 clocks; reduced values failed sustained testing. */
 static uint32_t s_delay = 8U;
 
 /* Bring-up diagnostics: the raw 41-bit DR values of the last few DMI scans. */
@@ -257,6 +258,30 @@ static uint32_t dmi_resp_data(uint64_t resp)
     return (uint32_t)((resp >> 2) & 0xFFFFFFFFULL);
 }
 
+/* BUSY/FAILED are sticky at the DTM, not SBA errors. Clear the transport
+ * before another operation and discard the old posted-response ownership.
+ * Do not replay writes here: a previous operation may already have executed. */
+static int dmi_recover(uint32_t status)
+{
+    s_sbcs_valid = 0U;
+    s_hold_ok = 0U;
+    s_sba_failed = 1U;
+    if ((status != DMI_OP_STATUS_BUSY) && (status != DMI_OP_STATUS_FAILED))
+    {
+        return -1;                    /* reserved response is not BUSY */
+    }
+    if (status == DMI_OP_STATUS_BUSY)
+    {
+        s_delay = (s_delay > 253U) ? 255U : s_delay + 2U;
+        DAP_Data.clock_delay = (uint8_t)s_delay;
+    }
+    tap_load_ir(IR_DTMCS);
+    (void)tap_dr_scan(32U, 1UL << 16); /* dtmcs.dmireset, not dmactive reset */
+    tap_load_ir(IR_DMI);
+    (void)dmi_post(DMI_OP_NOP, 0U, 0U);
+    return dmi_resp_op(dmi_post(DMI_OP_NOP, 0U, 0U)) == DMI_OP_STATUS_SUCCESS ? 0 : -1;
+}
+
 /* Synchronous DMI read (2 scans). Retries while the DM reports BUSY. */
 static int dmi_read(uint32_t addr, uint32_t *val)
 {
@@ -275,7 +300,9 @@ static int dmi_read(uint32_t addr, uint32_t *val)
             }
             return 0;
         }
-        if (dmi_resp_op(resp) != DMI_OP_STATUS_BUSY)
+        uint32_t status = dmi_resp_op(resp);
+        if ((dmi_recover(status) != 0) || (status != DMI_OP_STATUS_BUSY) ||
+            (addr == DM_SBDATA0))
         {
             return -1;
         }
@@ -291,7 +318,9 @@ static int dmi_write(uint32_t addr, uint32_t data)
     (void)dmi_post(DMI_OP_WRITE, addr, data);
     resp = dmi_post(DMI_OP_NOP, 0U, 0U);
 
-    return (dmi_resp_op(resp) == DMI_OP_STATUS_SUCCESS) ? 0 : -1;
+    if (dmi_resp_op(resp) == DMI_OP_STATUS_SUCCESS) { return 0; }
+    (void)dmi_recover(dmi_resp_op(resp));
+    return -1;
 }
 
 /* --------------------------------------------------------------- SBA ---- */
@@ -302,7 +331,11 @@ static uint32_t sba_clear_errors(void)
 
     if (dmi_read(DM_SBCS, &sbcs) != 0)
     {
-        return 0U;
+        s_sbcs_valid = 0U;
+        s_hold_ok = 0U;
+        s_sba_failed = 1U;
+        s_last_sbcs = UINT32_MAX;      /* unknown, never report a clean SBCS */
+        return UINT32_MAX;
     }
     s_last_sbcs = sbcs;
 
@@ -317,8 +350,12 @@ static uint32_t sba_clear_errors(void)
             s_sba_err_sbcs = sbcs;   /* 留一份原始现场，别被后面的清错覆盖 */
         }
         s_sba_err_events++;
-        (void)dmi_write(DM_SBCS, sbcs | SBCS_SBBUSYERROR | SBCS_SBERROR);
         s_sbcs_valid = 0U;           /* 这次整字写回，保守点：下次重新配置 */
+        if (dmi_write(DM_SBCS, sbcs | SBCS_SBBUSYERROR | SBCS_SBERROR) != 0)
+        {
+            s_sba_failed = 1U;
+            return UINT32_MAX;
+        }
     }
     return sbcs;
 }
@@ -391,7 +428,7 @@ static int sba_config(uint32_t extra)
      * 安全性：各失败路径自己会清，块读外面还有 riscv_jtag_read() 的整块重试兜底。 */
     if (s_sba_failed)
     {
-        (void)sba_clear_errors();
+        if (sba_clear_errors() == UINT32_MAX) { return -1; }
         s_sba_failed = 0U;
     }
 
@@ -427,8 +464,8 @@ uint32_t riscv_jtag_last_dmstatus(void) { return s_last_dmstatus; }
 
 void riscv_jtag_set_delay(uint32_t delay)
 {
-    s_delay = delay;
-    DAP_Data.clock_delay = (uint8_t)delay;
+    s_delay = (delay > 255U) ? 255U : delay;
+    DAP_Data.clock_delay = (uint8_t)s_delay;
 }
 
 uint32_t riscv_jtag_get_delay(void)
@@ -499,6 +536,7 @@ int riscv_jtag_open(void)
 
     /* Clear sticky SBA errors from a previous session. */
     s_last_sbcs = sba_clear_errors();
+    if (s_last_sbcs == UINT32_MAX) { return -3; }
 
     s_open = 1U;
     return 0;
@@ -561,7 +599,7 @@ int riscv_jtag_hold_prepare(uint32_t addr)
     s_hold_ok = 0U;
     if (s_sba_failed)
     {
-        (void)sba_clear_errors();
+        if (sba_clear_errors() == UINT32_MAX) { return -2; }
         s_sba_failed = 0U;
     }
     if (sba_write_cfg(SBCS_SBACCESS32 | SBCS_SBREADONADDR | SBCS_SBREADONDATA) != 0)
@@ -633,22 +671,20 @@ int riscv_jtag_hold_read(uint32_t *val)
             /* 无错误：resp 已经是本拍样本，**不要再 post** —— 多 post 一拍会把
              * 下一拍的值提前消费掉，流水错位（这正是被换掉的老实现毁样本的根源）。 */
         }
-        /* SBCS 读本身没应答成功（偶发 BUSY）：本轮跳过检查，resp 里的样本照常
-         * 走下面的状态判定交付。 */
+        else
+        {
+            (void)dmi_recover(dmi_resp_op(sbcs_resp));
+            return -1;                 /* unknown SBA status is not a valid sample */
+        }
     }
     else
     {
         resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
     }
 
-    /* 目标全速运行时 DM 偶发 BUSY：同一个地址重读是幂等的，重发几次再判死
-     * （与块读同一策略，见 riscv_jtag_read_once）。 */
-    for (uint32_t r = 0U; (r < 4U) && (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS); r++)
-    {
-        resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
-    }
     if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
     {
+        (void)dmi_recover(dmi_resp_op(resp));
         s_last_sbcs = sba_clear_errors();
         s_sba_failed = 1U;
         s_hold_ok = 0U;              /* 出错后"抱住"不可信：下一次 prepare 重新配 */
@@ -732,25 +768,12 @@ int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
 
             if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
             {
-                /* 目标在跑时 DM 偶发 BUSY：把这一拍重发几次再判死，否则一个
-                 * 1 KB 块会因为一个字整块失败（实测每块必中，搬运几乎停摆）。 */
-                uint32_t ok = 0U;
-
-                for (uint32_t r = 0U; r < 4U; r++)
-                {
-                    resp = dmi_post(DMI_OP_READ, DM_SBDATA0, 0U);
-                    if (dmi_resp_op(resp) == DMI_OP_STATUS_SUCCESS)
-                    {
-                        ok = 1U;
-                        break;
-                    }
-                }
-                if (ok == 0U)
-                {
-                    s_last_sbcs = sba_clear_errors();
-                    s_sba_failed = 1U;
-                    return -4;
-                }
+                /* Reposting SBDATA0 can advance the SBA address and skip a word.
+                 * Recover the DTM, then let read() restart the entire block. */
+                (void)dmi_recover(dmi_resp_op(resp));
+                s_last_sbcs = sba_clear_errors();
+                s_sba_failed = 1U;
+                return -4;
             }
             out[i] = dmi_resp_data(resp);
         }
@@ -765,6 +788,7 @@ int riscv_jtag_read_once(uint32_t addr, uint8_t *dst, uint32_t len)
 
             if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
             {
+                (void)dmi_recover(dmi_resp_op(resp));
                 s_last_sbcs = sba_clear_errors();
                 s_sba_failed = 1U;
                 return -4;
@@ -858,7 +882,12 @@ int riscv_jtag_write(uint32_t addr, const uint8_t *src, uint32_t len)
 
         for (uint32_t i = 0U; i < words; i++)
         {
-            (void)dmi_post(DMI_OP_WRITE, DM_SBDATA0, in[i]);
+            uint64_t resp = dmi_post(DMI_OP_WRITE, DM_SBDATA0, in[i]);
+            if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
+            {
+                (void)dmi_recover(dmi_resp_op(resp));
+                return -4;
+            }
         }
     }
     else
@@ -898,7 +927,12 @@ int riscv_jtag_write(uint32_t addr, const uint8_t *src, uint32_t len)
                 done += n;
             }
 
-            (void)dmi_post(DMI_OP_WRITE, DM_SBDATA0, w);
+            uint64_t resp = dmi_post(DMI_OP_WRITE, DM_SBDATA0, w);
+            if (dmi_resp_op(resp) != DMI_OP_STATUS_SUCCESS)
+            {
+                (void)dmi_recover(dmi_resp_op(resp));
+                return -4;
+            }
 
             if (i == 0U)
             {
@@ -907,7 +941,12 @@ int riscv_jtag_write(uint32_t addr, const uint8_t *src, uint32_t len)
         }
     }
 
-    (void)dmi_post(DMI_OP_NOP, 0U, 0U); /* drain the stale response */
+    uint64_t last = dmi_post(DMI_OP_NOP, 0U, 0U); /* confirm the last write too */
+    if (dmi_resp_op(last) != DMI_OP_STATUS_SUCCESS)
+    {
+        (void)dmi_recover(dmi_resp_op(last));
+        return -4;
+    }
 
     /* 🚨 写路径同样会被 sticky 错误**静默**吞掉（DMI 应答 SUCCESS、数据没进内存），
      * 所以这里也要核对一次：RTT 桥的回写 RdOff 一旦被吞，下一块会重复搬旧数据。 */

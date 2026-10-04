@@ -65,9 +65,9 @@ int riscv_jtag_hold_read(uint32_t *val);
 int riscv_jtag_read(uint32_t addr, uint8_t *dst, uint32_t len);
 int riscv_jtag_write(uint32_t addr, const uint8_t *src, uint32_t len);
 
-/* Timing knob: 0 = Use the compiled-in fastest timing; 1..255 = extra TCK
- * half-period delay (the JTAG engine uses the same DAP_Data.clock_delay knob
- * the SWD blobs use). */
+/* Number of Run-Test/Idle TCKs before each DMI scan (clamped to 0..255).
+ * Default is 8; this does NOT shorten GPIO half-periods. BUSY recovery may
+ * increase it to give the DTM more completion time. */
 void riscv_jtag_set_delay(uint32_t delay);
 uint32_t riscv_jtag_get_delay(void);
 
@@ -85,7 +85,8 @@ uint32_t riscv_jtag_last_dmstatus(void);
  * This is the RISC-V counterpart of DAPLink's swd_clear_errors(): a transient
  * system-bus error otherwise latches and every later SBA access returns FAULT.
  * The two are NOT interchangeable - swd_clear_errors() drives the SWD engine on
- * the same pins and wrecks the TAP state machine. */
+ * the same pins and wrecks the TAP state machine. Returns UINT32_MAX if SBCS
+ * could not be read or cleared; callers must not interpret that as success. */
 uint32_t riscv_jtag_clear_errors(void);
 
 /* SBA sticky 错误（sbbusyerror / sberror）统计，诊断用：正常应当全 0。
