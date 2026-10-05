@@ -10,6 +10,7 @@
 #include "spi_bridge.h"
 #include "i2c_bridge.h"
 #include "bus_periodic.h"
+#include "adc_stream.h"
 
 #define CMSIS_DAP_INTERFACE_SIZE (9 + 7 + 7 + 7)
 #define CUSTOM_HID_LEN (9 + 9 + 7 + 7)
@@ -23,7 +24,11 @@
 #define SPI_BRIDGE_INTERFACE_SIZE (9 + 7 + 7)
 #define DFU_RUNTIME_INTERFACE_SIZE (9 + 9)
 
-#define HIDRAW_INTERVAL 10
+#ifdef CONFIG_USB_HS
+#define HIDRAW_INTERVAL 6 /* 2^(6-1) * 125 us = 4 ms */
+#else
+#define HIDRAW_INTERVAL 4 /* FS: milliseconds */
+#endif
 
 #define HID_CUSTOM_REPORT_DESC_SIZE 53
 
@@ -47,7 +52,7 @@
                                   USBD_WEBUSB_ENABLE * FUNCTION_SUBSET_LEN + \
                                   USBD_BULK_ENABLE * FUNCTION_SUBSET_LEN +   \
                                   SPI_BRIDGE_ENABLE * FUNCTION_SUBSET_LEN +  \
-                                  USBD_DFU_RUNTIME_ENABLE * FUNCTION_SUBSET_LEN)
+                                  USBD_DFU_RUNTIME_ENABLE * FUNCTION_SUBSET_LEN + FUNCTION_SUBSET_LEN)
 
 #define USBD_NUM_DEV_CAPABILITIES (USBD_WEBUSB_ENABLE + USBD_WINUSB_ENABLE)
 
@@ -73,9 +78,10 @@
                          SPI_BRIDGE_ENABLE * SPI_BRIDGE_INTERFACE_SIZE +        \
                          USBD_WEBUSB_ENABLE * 9 +                               \
                          USBD_DFU_RUNTIME_ENABLE * DFU_RUNTIME_INTERFACE_SIZE + \
-                         CONFIG_CHERRYDAP_USE_MSC * MSC_DESCRIPTOR_LEN)
+                         CONFIG_CHERRYDAP_USE_MSC * MSC_DESCRIPTOR_LEN + 16)
 
-#define INTF_NUM (1 + 2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID + SPI_BRIDGE_ENABLE + USBD_WEBUSB_ENABLE + USBD_DFU_RUNTIME_ENABLE + CONFIG_CHERRYDAP_USE_MSC)
+#define INTF_NUM (2 + 2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID + SPI_BRIDGE_ENABLE + USBD_WEBUSB_ENABLE + USBD_DFU_RUNTIME_ENABLE + CONFIG_CHERRYDAP_USE_MSC)
+#define ADC_INTF_NUM (INTF_NUM - 1)
 #define HID_INTF_NUM (2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID)
 #define SPI_INTF_NUM (HID_INTF_NUM + CONFIG_CHERRYDAP_USE_CUSTOM_HID)
 #define MSC_INTF_NUM (SPI_INTF_NUM + SPI_BRIDGE_ENABLE)
@@ -202,8 +208,21 @@ __ALIGN_BEGIN const uint8_t USBD_WinUSBDescriptorSetDescriptor[] = {
     '4', 0, 'E', 0, '9', 0, 'A', 0, '-', 0,
     'A', 0, 'C', 0, '1', 0, '5', 0, '-',
     0, '7', 0, 'D', 0, '2', 0, 'E', 0, '0', 0, 'B', 0, '6', 0, '9', 0, 'F', 0, '5', 0, 'C', 0, '3', 0,
-    '}', 0, 0, 0, 0, 0
+    '}', 0, 0, 0, 0, 0,
 #endif
+    /* Independent ADC interface: WinUSB binding (compatible ID only).
+     * Include a GUID property just like the other interfaces for Windows discovery. */
+    WBVAL(WINUSB_FUNCTION_SUBSET_HEADER_SIZE), WBVAL(WINUSB_SUBSET_HEADER_FUNCTION_TYPE), ADC_INTF_NUM, 0,
+    WBVAL(FUNCTION_SUBSET_LEN),
+    WBVAL(WINUSB_FEATURE_COMPATIBLE_ID_SIZE), WBVAL(WINUSB_FEATURE_COMPATIBLE_ID_TYPE),
+    'W','I','N','U','S','B',0,0, 0,0,0,0,0,0,0,0,
+    WBVAL(DEVICE_INTERFACE_GUIDS_FEATURE_LEN), WBVAL(WINUSB_FEATURE_REG_PROPERTY_TYPE),
+    WBVAL(WINUSB_PROP_DATA_TYPE_REG_MULTI_SZ), WBVAL(42),
+    'D',0,'e',0,'v',0,'i',0,'c',0,'e',0,'I',0,'n',0,'t',0,'e',0,'r',0,'f',0,'a',0,'c',0,'e',0,'G',0,'U',0,'I',0,'D',0,'s',0,0,0,
+    WBVAL(80),
+    '{',0,'A',0,'D',0,'C',0,'1',0,'0',0,'0',0,'0',0,'1',0,'-',0,
+    '5',0,'3',0,'0',0,'1',0,'-',0,'4',0,'0',0,'0',0,'0',0,'-',0,
+    '8',0,'0',0,'0',0,'0',0,'-',0,'0',0,'0',0,'0',0,'0',0,'0',0,'0',0,'0',0,'0',0,'0',0,'0',0,'0',0,'1',0,'}',0,0,0,0,0,
 };
 // clang-format on
 
@@ -328,6 +347,9 @@ static const struct
 static const uint8_t device_descriptor[] = {
     USB_DEVICE_DESCRIPTOR_INIT(USB_2_1, 0xEF, 0x02, 0x01, USBD_VID, USBD_PID, 0x0100, 0x01),
 };
+#define ADC_DESC() \
+    USB_INTERFACE_DESCRIPTOR_INIT(ADC_INTF_NUM, 0, 1, 0xFF, 0, 0, 0), \
+    USB_ENDPOINT_DESCRIPTOR_INIT(ADC_IN_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0)
 
 static const uint8_t config_descriptor[] = {
     USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE, INTF_NUM, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
@@ -366,6 +388,7 @@ static const uint8_t config_descriptor[] = {
     0x1A,
     0x01, /* bcdDFU = 1.1a */
 #endif
+    ADC_DESC(),
 };
 
 static const uint8_t other_speed_config_descriptor[] = {
@@ -405,6 +428,7 @@ static const uint8_t other_speed_config_descriptor[] = {
     0x1A,
     0x01, /* bcdDFU = 1.1a */
 #endif
+    ADC_DESC(),
 };
 
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
@@ -440,7 +464,7 @@ const uint8_t hid_custom_report_desc[HID_CUSTOM_REPORT_DESC_SIZE] = {
     0x96, 0x3f, 0x00, /*   REPORT_COUNT (63) */
     0xb1, 0x02,       /*   FEATURE (Data,Var,Abs) */
     /* USER CODE END 0 */
-    0xC0 /*     END_COLLECTION	             */
+    0xC0 /* END_COLLECTION */
 };
 // clang-format on
 #endif
@@ -578,10 +602,12 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
         /* USB→I2C 桥没有自己的端点，只有"登记了还没做完的那次事务"要作废 */
         i2c_bridge_usb_reset();
         bus_periodic_reset();
+        adc_stream_reset(0U);
         break;
     case USBD_EVENT_CONNECTED:
         break;
     case USBD_EVENT_DISCONNECTED:
+        adc_stream_reset(0U);
         bus_periodic_reset();
         break;
     case USBD_EVENT_RESUME:
@@ -589,6 +615,7 @@ void usbd_event_handler(uint8_t busid, uint8_t event)
     case USBD_EVENT_SUSPEND:
         break;
     case USBD_EVENT_CONFIGURED:
+        adc_stream_reset(1U);
         /* setup first out ep read transfer */
         USB_RequestIdle = 0U;
         usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_XFER_SIZE);
@@ -716,6 +743,11 @@ struct usbd_endpoint dap_in_ep = {
 struct usbd_endpoint swo_in_ep = {
     .ep_addr = SWO_IN_EP,
     .ep_cb = swo_in_callback};
+static void adc_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) {
+    (void)busid; (void)ep; (void)nbytes; adc_stream_complete();
+}
+static struct usbd_endpoint adc_in_ep = { .ep_addr = ADC_IN_EP, .ep_cb = adc_in_callback };
+static struct usbd_interface adc_intf;
 
 struct usbd_endpoint cdc_out_ep = {
     .ep_addr = CDC_OUT_EP,
@@ -842,6 +874,7 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base)
     usbd_add_endpoint(0, &dap_out_ep);
     usbd_add_endpoint(0, &dap_in_ep);
     usbd_add_endpoint(0, &swo_in_ep);
+    usbd_add_endpoint(0, &adc_in_ep);
 
     /*!< cdc acm */
     usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &cdc_intf1));
@@ -875,6 +908,8 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base)
     dfu_intf.intf_num = DFU_INTF_NUM;
 #endif
 
+    usbd_add_interface(0, &adc_intf);
+    adc_intf.intf_num = ADC_INTF_NUM;
     usbd_initialize(busid, reg_base, usbd_event_handler);
 }
 

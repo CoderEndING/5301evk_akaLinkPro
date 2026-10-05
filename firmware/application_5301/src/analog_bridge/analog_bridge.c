@@ -8,6 +8,7 @@
 #include "spi_bridge.h"
 #include "led_state.h"
 #include "analog_bridge.h"
+#include "adc_stream.h"
 /* Only board-confirmed inputs are advertised. Never commandeer debug/UART/LED pads. */
 #if BOARD_HAS_VREF_ADC
 #define ANALOG_CHANNEL 2U
@@ -21,6 +22,19 @@ void analog_bridge_hid(uint8_t *req, uint8_t *res) {
     res[1] = 8U; res[2] = ANALOG_CMD; res[3] = req[3];
     memset(res + 4, 0, 4);
     if (req[1] < 2U || req[1] > 62U) { res[4] = ANALOG_RANGE; return; }
+    if (req[3] >= ANALOG_STREAM_CAPS && req[3] <= ANALOG_STREAM_CLOSE) {
+        if (req[1] != 2U) { res[4] = ANALOG_RANGE; return; }
+        if (req[3] == ANALOG_STREAM_CAPS) {
+            memcpy(res + 8U, "ADB1", 4); res[12] = 0x8CU; res[13] = 1U;
+            res[14] = 0U; res[15] = 2U; res[1] = 16U;
+        } else if (req[3] == ANALOG_STREAM_OPEN) {
+            uint32_t token = 0U; res[4] = adc_stream_open(&token);
+            for (uint8_t i = 0; i < 4; i++) res[8U + i] = (uint8_t)(token >> (8U * i));
+            res[1] = 12U;
+        } else if (req[3] == ANALOG_STREAM_END) adc_stream_end();
+        else res[4] = adc_stream_close();
+        return;
+    }
     if (req[3] == ANALOG_DAC_CAPS) {
         if (req[1] != 2U) { res[4] = ANALOG_RANGE; return; }
         /* Versioned reservation, no buffers, pin writes, IRQs or clock setup. */

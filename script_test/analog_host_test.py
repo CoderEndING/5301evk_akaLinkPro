@@ -45,6 +45,9 @@ test = r'''
 #include "analog_bridge.h"
 ioc_t ioc;
 unsigned enabled,reads,clocks,inits,init_fail,channel_fail,read_fail;
+uint8_t adc_stream_open(uint32_t *token){*token=1;return 0;}
+uint8_t adc_stream_close(void){return 0;}
+void adc_stream_end(void){}
 uint8_t spi_bridge_is_enabled(void){return enabled;}
 uint8_t led_state_read_vref_raw(uint16_t *p){reads++;*p=0xabcd;return read_fail;}
 int adc16_get_oneshot_result(void *base,uint8_t channel,uint16_t *raw){
@@ -76,7 +79,9 @@ int main(void){
   req[1]=2;analog_bridge_hid(req,res);assert(res[4]==ANALOG_RANGE);
  }
  assert(!reads&&!clocks&&!inits);
- req[1]=2;req[3]=9;analog_bridge_hid(req,res);assert(res[4]==1);
+ req[1]=2;req[3]=255;analog_bridge_hid(req,res);assert(res[4]==1);
+ req[3]=ANALOG_STREAM_CAPS;analog_bridge_hid(req,res);assert(res[1]==16&&!memcmp(res+8,"ADB1",4)&&res[12]==0x8c);
+ req[3]=ANALOG_STREAM_OPEN;analog_bridge_hid(req,res);assert(res[1]==12&&res[8]==1);
  enabled=1;assert(analog_periodic_exec(p,2,data,&n)==2&&n==0&&!reads);enabled=0;
  assert(analog_periodic_check(p,1));p[1]=7;assert(analog_periodic_check(p,2));p[1]=16;
 #if !BOARD_HAS_VREF_ADC

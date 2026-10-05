@@ -4,6 +4,11 @@
 #include "bus_periodic.h"
 #include "i2c_bridge.h"
 #include "spi_bridge.h"
+#ifndef ADC_STREAM_HOST
+uint8_t adc_stream_enabled(void) { return 0U; }
+void adc_stream_started(void) {}
+void adc_stream_poll(void) {}
+#endif
 uint8_t analog_periodic_ready(void) { return 1U; }
 uint8_t analog_periodic_check(const uint8_t *p, uint16_t len) {
     return len != 2U || p[0] != 3U || (p[1] != 8U && p[1] != 10U && p[1] != 12U && p[1] != 16U);

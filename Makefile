@@ -59,12 +59,18 @@ test-jtag-host:
 
 test-host: test-jtag-host
 	$(PYTHON) script_test/analog_host_test.py
+	$(PYTHON) script_test/adc_stream_host_test.py
 	$(PYTHON) script_test/bus_periodic_host_test.py
 	$(PYTHON) script_test/scope_host_test.py
 	$(PYTHON) script_test/rtt_stop_host_test.py
 	$(PYTHON) script_test/spi_drain_host_test.py
 	$(PYTHON) script_test/target_switch_host_test.py
 	$(PYTHON) script_test/test_scope_hss_test.py
+
+# Requires HPM_SDK_BASE (or sibling hpm-sdk-reference); no hardware access.
+.PHONY: test-usb-descriptors
+test-usb-descriptors:
+	$(PYTHON) script_test/usb_adc_descriptor_test.py
 
 build: build-boot build-app
 

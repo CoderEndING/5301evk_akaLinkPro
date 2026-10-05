@@ -24,6 +24,7 @@
 
 #define HID_IN_EP  0x87
 #define HID_OUT_EP 0x08
+#define ADC_IN_EP  0x8C /* Dedicated ADC bulk stream, independent of scope 0x83. */
 
 #define MSC_IN_EP  0x89
 #define MSC_OUT_EP 0x0A
