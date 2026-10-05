@@ -32,6 +32,14 @@
 #include "swd_host.h"   /* ARM DAPLink 官方 SWD 访问层（见 src/swd_host/） */
 #include "hpm_clock_drv.h" /* clock_cpu_delay_ms() */
 
+/* Authoritative service flags: cold gate reads words, producers write bytes. */
+service_gate_t rtt_bridge_gate;
+#define s_bench_pending (rtt_bridge_gate.flag[4])
+#define s_raw_pending (rtt_bridge_gate.flag[3])
+#define s_stop_pending (rtt_bridge_gate.flag[2])
+#define s_start_pending (rtt_bridge_gate.flag[1])
+#define s_running (rtt_bridge_gate.flag[0])
+
 /* Debug port / AHB-AP 的寄存器与传输编码由官方 swd_host.c / debug_cm.h 负责，
  * 这里只留桥自己的配置常量。 */
 
@@ -92,7 +100,6 @@ typedef struct
     uint32_t flags;
 } rtt_up_desc_t;
 
-static volatile uint8_t s_running;
 static uint8_t s_channel;
 static uint32_t s_cb_addr;
 static uint32_t s_search_addr;
@@ -113,7 +120,7 @@ static uint8_t s_discard;
 static uint8_t s_swd_ready;
 static uint8_t s_delay_override = 0xFFU; /* 0xFF = 用 Set_Clock_Delay() 的档位值 */
 static uint8_t s_rescans_since_step;     /* 攒够次数自动降档，见 rtt_bridge_poll */
-static uint8_t s_stop_pending;           /* HID 请求的"停桥"，由主循环执行（要补写 RdOff） */
+/* STOP remains deferred to the main loop to flush RdOff before release. */
 
 static uint32_t s_drained;
 static uint32_t s_polls;
@@ -763,8 +770,6 @@ void rtt_bridge_trace_dap(const uint8_t *req, const uint8_t *resp)
 /* Deferred execution (never touch SWD from the USB interrupt)         */
 /* ------------------------------------------------------------------ */
 
-static volatile uint8_t s_start_pending;
-static volatile uint8_t s_raw_pending;
 static uint8_t s_raw_reject;        /* 1 = 入口挡下的请求（只回 DAP_ERROR，不执行） */
 static uint32_t s_req_addr, s_req_size;
 static uint8_t s_req_channel;
@@ -779,7 +784,7 @@ static volatile int8_t s_start_rc = -100;
 static uint32_t s_bench_addr;
 static uint32_t s_bench_bytes;
 static uint32_t s_bench_iters;
-static volatile uint8_t s_bench_pending;
+
 static volatile uint8_t s_bench_valid;
 static uint32_t s_bench_moved;
 static uint32_t s_bench_ticks;

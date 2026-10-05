@@ -20,6 +20,10 @@
 #include "hpm_ppor_drv.h"
 #include "easyflash.h"
 
+/* Authoritative service flags: cold gate reads words, producers write bytes. */
+service_gate_t api_param_gate;
+#define s_save_pending (api_param_gate.flag[0])
+
 /* Firmware metadata injected at build time by firmware/tools/pack.py.
  * See Firmware_Integrity_Plan.md for the layout. */
 #define APP_HEADER_BASE (0x80020000UL)
@@ -135,8 +139,6 @@ const api_param_t g_param_default = {
 };
 
 api_param_t g_param;
-
-static volatile uint8_t s_save_pending;
 
 static uint16_t clamp_vref(uint16_t v)
 {

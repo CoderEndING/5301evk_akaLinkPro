@@ -113,19 +113,34 @@ int main(void)
         {
             chry_dap_usb2uart_handle();
         }
-        api_param_poll();
+        if (api_param_needs_service())
+        {
+            api_param_poll();
+        }
         dfu_key_poll();
         /* Probe-side RTT bridge: polls the target itself (only while the DAP
          * is idle) and forwards the bytes over the CDC. */
-        rtt_bridge_poll();
+        if (rtt_bridge_needs_service())
+        {
+            rtt_bridge_poll();
+        }
         /* J-Scope HSS 采样器（探针自己按周期读目标 RAM，走 bulk IN 0x83）。
          * 与 RTT 桥互斥 —— 两边的 start 分支会互相 stop()。 */
-        scope_sampler_poll();
+        if (scope_sampler_needs_service())
+        {
+            scope_sampler_poll();
+        }
         /* Probe-side RISC-V engine (JTAG): queued memory access / benchmarks. */
-        riscv_svc_poll();
+        if (riscv_svc_needs_service())
+        {
+            riscv_svc_poll();
+        }
         /* USB→SPI/QSPI 转发桥（HID 0x35 控制面 + bulk 0x0B/0x8B 数据面）。
-         * 未使能时只有一条分支的开销；使能后每轮按预算处理若干帧。 */
-        spi_bridge_poll();
+         * 空闲时仅检查服务标志；使能后每轮按预算处理若干帧。 */
+        if (spi_bridge_needs_service())
+        {
+            spi_bridge_poll();
+        }
         /* USB→I2C 转发桥（HID 0x36）：执行主机登记的事务（最长几毫秒，所以
          * 绝不在 HID 中断里做）。🚨 先内联读标志再决定要不要进函数：poll 在
          * flash 里，每圈都调它的话那次 XPI 取指会摊进采样周期（实测 SCOPE

@@ -5,6 +5,10 @@
 #define __SCOPE_SAMPLER_H__
 
 #include <stdint.h>
+#include "service_gate.h"
+extern service_gate_t scope_sampler_gate;
+static inline uint8_t scope_sampler_needs_service(void) { return scope_sampler_gate.word[0] != 0U; }
+
 
 /* 探针侧 HSS 采样（给网页「J-Scope 波形」页用）。
  *

@@ -5,6 +5,10 @@
 #define __RTT_BRIDGE_H__
 
 #include <stdint.h>
+#include "service_gate.h"
+extern service_gate_t rtt_bridge_gate;
+static inline uint8_t rtt_bridge_needs_service(void) { return service_gate_pending(&rtt_bridge_gate); }
+
 
 /* Probe-side SEGGER RTT bridge.
  *

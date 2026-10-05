@@ -5,6 +5,9 @@
 #define __SPI_BRIDGE_H__
 
 #include <stdint.h>
+#include "service_gate.h"
+extern service_gate_t spi_bridge_gate;
+static inline uint8_t spi_bridge_needs_service(void) { return service_gate_pending(&spi_bridge_gate); }
 #include "spi_bridge_proto.h"
 
 /*
@@ -18,7 +21,7 @@
  * 典型用法（网页侧）：GET_CFG -> SET_CFG -> SET_PROFILE -> ENABLE 1
  *                      -> RESET/STEP 帧灌初始化序列 -> XFER 帧刷像素
  *
- * 主循环里调 spi_bridge_poll()；未使能时只有一条分支的开销。
+ * 主循环先检查 spi_bridge_needs_service()，无运行/控制/清理工作时不调用。
  */
 
 /* 一次性初始化（main() 里，board_init 之后）。只清状态，不动引脚。 */

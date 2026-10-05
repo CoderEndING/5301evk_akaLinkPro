@@ -7,12 +7,15 @@
 #include "board.h"
 #include "hpm_common.h"
 
+/* Authoritative service flags: cold gate reads words, producers write bytes. */
+service_gate_t riscv_svc_gate;
+#define s_pending (riscv_svc_gate.flag[0])
+
 /* MCHTMR runs at 24 MHz (osc24m) - same reference the RTT bridge bench uses. */
 #define RISCV_MCHTMR_HZ 24000000UL
 
 #define RISCV_STAGE_BYTES 1024U
 
-static uint32_t s_pending;
 static uint32_t s_action;
 static uint32_t s_addr;
 static uint32_t s_arg1;

@@ -11,6 +11,10 @@
 #define RISCV_SVC_H
 
 #include <stdint.h>
+#include "service_gate.h"
+extern service_gate_t riscv_svc_gate;
+static inline uint8_t riscv_svc_needs_service(void) { return riscv_svc_gate.word[0] != 0U; }
+
 
 /* Queued actions (mirrors the HID CMD_RISCV action byte). */
 #define RISCV_ACT_STOP    0U

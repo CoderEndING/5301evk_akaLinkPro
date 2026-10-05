@@ -5,6 +5,10 @@
 #define __API_PARAM_H__
 
 #include <stdint.h>
+#include "service_gate.h"
+extern service_gate_t api_param_gate;
+static inline uint8_t api_param_needs_service(void) { return api_param_gate.word[0] != 0U; }
+
 
 typedef struct _appiparam_t {
     uint32_t magic_number;

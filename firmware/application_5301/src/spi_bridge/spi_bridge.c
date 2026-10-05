@@ -38,6 +38,9 @@
 #include "bus_periodic.h"
 #include "adc_stream.h"
 
+/* Authoritative service flags: cold gate reads words, producers write bytes. */
+service_gate_t spi_bridge_gate;
+
 #if !defined(BOARD_HAS_SPI_BRIDGE) || (BOARD_HAS_SPI_BRIDGE == 0)
 
 /* ---------------------------------------------------------------------------
@@ -150,7 +153,6 @@ static uint8_t s_in_buf[SB_IN_SLOTS][SB_PKT_SIZE];
  */
 typedef struct
 {
-    volatile uint8_t enabled;
     sb_cfg_t cfg;
     sb_profile_t prof;
     sb_stats_t stats;
@@ -201,9 +203,7 @@ typedef struct
     uint8_t dma_ok;          /* 通道申请到了没有；没有就整体退回轮询 */
     uint32_t last_ticks;     /* 上一笔事务耗时（mchtmr tick，24 MHz）——给阈值定档用 */
 
-    volatile uint8_t reset_req;
-    volatile uint8_t usb_reset_req; /* 总线复位：在飞传输作废、回调不会来，必须清在飞标志 */
-    volatile uint8_t abort_req;
+    /* Service flags are in spi_bridge_gate (DLM); bulk state stays in AHB SRAM. */
     /* 硬件重初始化请求（ISR 置位、主循环执行）：ENABLE=1 与 enabled 状态下的
      * SET_CFG / SET_PROFILE 都要走一次 sb_spi_hw_init —— 时钟源扫描 + SPI 复位
      * 轮询 + DMA 申请，可达数百 µs。绝不能在 USB 中断里同步做：既长时间挡住
@@ -227,7 +227,7 @@ ATTR_PLACE_AT_WITH_ALIGNMENT(".ahb_sram", 8)
 static sb_state_t s_st;
 
 /* 代码里仍用原来的短名字（纯文本替换，逻辑不变） */
-#define s_enabled (s_st.enabled)
+#define s_enabled (spi_bridge_gate.flag[0])
 #define s_cfg (s_st.cfg)
 #define s_prof (s_st.prof)
 #define s_stats (s_st.stats)
@@ -259,10 +259,10 @@ static sb_state_t s_st;
 #define s_dma (s_st.dma)
 #define s_dma_ok (s_st.dma_ok)
 #define s_last_ticks (s_st.last_ticks)
-#define s_reset_req (s_st.reset_req)
-#define s_usb_reset_req (s_st.usb_reset_req)
-#define s_abort_req (s_st.abort_req)
-static volatile uint8_t s_drain_reads;
+#define s_reset_req (spi_bridge_gate.flag[1])
+#define s_usb_reset_req (spi_bridge_gate.flag[2])
+#define s_abort_req (spi_bridge_gate.flag[3])
+#define s_drain_reads (spi_bridge_gate.flag[4])
 #define s_hw_req (s_st.hw_req)
 #define s_cs_pad (s_st.cs_pad)
 #define s_cs_asserted (s_st.cs_asserted)
@@ -272,7 +272,7 @@ static volatile uint8_t s_drain_reads;
 #define s_pad_te (s_st.pad_te)
 #define s_format (s_st.format)
 #define s_fmt_addr_len (s_st.fmt_addr_len)
-static volatile uint8_t s_adc_owner;
+#define s_adc_owner (spi_bridge_gate.flag[5])
 uint8_t spi_bridge_adc_flags(void) {
     return (s_out_inflight ? 1U : 0U) | ((s_enabled || s_in_inflight || s_in_used ||
         s_out_used || s_pkt_active || s_hw_req || s_reset_req || s_usb_reset_req ||

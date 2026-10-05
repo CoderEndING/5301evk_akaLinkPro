@@ -5,10 +5,10 @@ import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[1]
 text = (root / 'firmware/application_5301/src/spi_bridge/spi_bridge.c').read_text()
-start = text.index('static volatile uint8_t s_adc_owner;')
+start = text.index('uint8_t spi_bridge_adc_flags(void)', text.index('#define s_adc_owner'))
 end = text.index('/* ============================== 小工具', start)
 helper = text[start:end]
-flags = ['s_out_inflight','s_enabled','s_in_inflight','s_in_used','s_out_used','s_pkt_active',
+flags = ['s_adc_owner','s_out_inflight','s_enabled','s_in_inflight','s_in_used','s_out_used','s_pkt_active',
          's_hw_req','s_reset_req','s_usb_reset_req','s_abort_req','s_drain_reads','s_cs_asserted']
 source = '#include <stdint.h>\n#include <assert.h>\n'
 source += 'static uint8_t '+','.join(flags)+';\n'

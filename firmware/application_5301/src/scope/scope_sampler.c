@@ -36,6 +36,13 @@
 #include "riscv_jtag.h"      /* RISC-V/JTAG 后端：riscv_jtag_read / hold_prepare / hold_read */
 #include "scope_sampler.h"
 
+/* Authoritative service flags: cold gate reads words, producers write bytes. */
+service_gate_t scope_sampler_gate;
+#define s_bench_req (scope_sampler_gate.flag[3])
+#define s_usb_reset_req (scope_sampler_gate.flag[2])
+#define s_start_req (scope_sampler_gate.flag[1])
+#define s_running (scope_sampler_gate.flag[0])
+
 /* ------------------------------------------------------------------ 常量 */
 
 #define SCOPE_MCHTMR_HZ   SCOPE_TIME_HZ          /* MCHTMR = osc24m（与 rtt_bridge.c 一致） */
@@ -80,8 +87,6 @@ _Static_assert((SCOPE_MAX_VARS * 8U) <= SCOPE_PAYLOAD, "帧装不进一个包");
 
 /* ------------------------------------------------------------------ 状态 */
 
-static volatile uint8_t s_running;
-static volatile uint8_t s_start_req;
 static volatile int8_t  s_start_rc = -100;    /* -100 = 还没启动过（与 RTT 桥同一哨兵） */
 static uint8_t  s_swd_ready;
 static uint8_t  s_backend;                    /* 0 = SWD/ARM、1 = RISC-V/JTAG（见 scope_be_* 分派） */
@@ -142,9 +147,9 @@ static uint32_t s_last_cmd, s_last_rsp;
 static uint32_t s_clock_hz;
 static uint32_t s_last_sample_ticks;          /* 最近一次采样的实际耗时（标称 vs 实际） */
 static uint32_t s_tx_done;                    /* USB 完成回调次数（诊断包缓冲为何耗尽） */
-static volatile uint8_t s_usb_reset_req;      /* USB 总线复位：ISR 置标志、主循环清账 */
+      /* USB 总线复位：ISR 置标志、主循环清账 */
 
-static uint32_t s_bench_req, s_bench_valid, s_bench_iters, s_bench_ticks;
+static uint32_t s_bench_valid, s_bench_iters, s_bench_ticks;
 static int32_t  s_bench_err;
 static uint32_t s_hdr_t;                      /* 正在组的那一包的时间戳（DATA 用首样本时刻） */
 static uint32_t s_period_ticks = 1U;          /* s_period_us 换算好的 MCHTMR tick 数（configure 时算一次） */
