@@ -35,6 +35,7 @@
 #include "usb_composite.h"
 #include "spi_bridge.h"
 #include "i2c_bridge.h"   /* 交叉检查：I2C 桥使能时占着 PA28/PA29，别当辅助脚用 */
+#include "bus_periodic.h"
 
 #if !defined(BOARD_HAS_SPI_BRIDGE) || (BOARD_HAS_SPI_BRIDGE == 0)
 
@@ -50,6 +51,14 @@ void spi_bridge_init(void)
 void spi_bridge_poll(void)
 {
 }
+uint8_t spi_bridge_periodic_ready(void) { return 0U; }
+uint8_t spi_bridge_periodic_check(const uint8_t *p, uint16_t len) {
+    (void)p; (void)len; return SB_E_DISABLED;
+}
+uint8_t spi_bridge_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, uint8_t *n) {
+    (void)p; (void)len; (void)data; *n = 0U; return SB_E_DISABLED;
+}
+void spi_bridge_periodic_release(void) {}
 
 void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
 {
@@ -1320,6 +1329,7 @@ static uint8_t sb_step_exec(uint8_t cmd, uint8_t nparams, const uint8_t *params)
 
 /* ============================== 帧执行 ============================== */
 
+static uint8_t s_periodic_executing;
 static uint8_t sb_exec_frame(const uint8_t *hdr, const uint8_t *pl, uint16_t plen,
                              uint8_t *rsp_payload, uint16_t *rsp_len)
 {
@@ -1328,6 +1338,7 @@ static uint8_t sb_exec_frame(const uint8_t *hdr, const uint8_t *pl, uint16_t ple
     uint8_t st = SB_OK;
 
     *rsp_len = 0U;
+    if (!s_periodic_executing && bus_periodic_owns(BP_SPI)) return SB_E_BUSY;
 
     switch (type)
     {
@@ -1550,6 +1561,41 @@ static void sb_out_release_front(void)
     s_pkt_off = 0U;
     s_pkt_len = 0U;
 }
+
+uint8_t spi_bridge_periodic_ready(void) {
+    return s_enabled && !s_hw_req && !s_reset_req && !s_abort_req && !s_usb_reset_req &&
+        !s_out_used && !s_pkt_active && !s_delay_active && !s_rst_state;
+}
+uint8_t spi_bridge_periodic_check(const uint8_t *p, uint16_t len) {
+    if (len < 8U || len > 128U || rd_u16(p) != SB_MAGIC || rd_u16(p + 6) != len - 8U ||
+        (p[3] & ~(SB_F_RSP | SB_F_CS_HOLD | SB_F_CS_OFF | SB_F_NO_DMA | SB_F_FORCE_DMA))) return SB_E_RANGE;
+    uint16_t size = (uint16_t)(len - 8U); const uint8_t *b = p + 8;
+    switch (p[2]) {
+    case SB_T_XFER:
+        if (size < 12U || size != 12U + rd_u16(b + 4) || rd_u16(b + 6) > BP_DATA ||
+            b[2] > 4U || b[3] > 4U || (b[1] & SB_TCFG_LINES_MASK) > SB_TCFG_LINES_4 ||
+            (rd_u16(b + 4) && rd_u16(b + 6) && rd_u16(b + 4) != rd_u16(b + 6))) return SB_E_RANGE;
+        break;
+    case SB_T_CS: if (size != 1U || b[0] > 1U) return SB_E_RANGE; break;
+    case SB_T_GPIO: if (size != 2U || b[0] > SB_LINE_BL || b[1] > 1U) return SB_E_RANGE; break;
+    case SB_T_PING: case SB_T_AUX_IN: if (size != 0U) return SB_E_RANGE; break;
+    default: return SB_E_RANGE; /* DELAY is a scheduler record, never a blocking SPI delay. */
+    }
+    return SB_OK;
+}
+uint8_t spi_bridge_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, uint8_t *n) {
+    *n = 0U;
+    if (!s_enabled || s_hw_req || s_usb_reset_req) return SB_E_DISABLED;
+    uint8_t err = spi_bridge_periodic_check(p, len); if (err) return err;
+    uint16_t count = 0U;
+    s_periodic_executing = 1U;
+    err = sb_exec_frame(p, p + 8, (uint16_t)(len - 8U), data, &count);
+    s_periodic_executing = 0U;
+    if ((p[3] & SB_F_CS_OFF) || err) sb_cs_release();
+    *n = (uint8_t)count;
+    return err;
+}
+void spi_bridge_periodic_release(void) { if (s_enabled) sb_cs_release(); }
 
 static void sb_process_packets(void)
 {
@@ -2280,6 +2326,13 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
 
     res_hid[2] = SB_HID_CMD;
     res_hid[3] = action;
+
+    if (bus_periodic_owns(BP_SPI) && action != SB_ACT_STATUS && action != SB_ACT_GET_CFG &&
+        action != SB_ACT_GET_PROFILE && action != SB_ACT_DBG && action != SB_ACT_DRAIN) {
+        wr_u32(res_hid + 4, sb_status_word() | ((uint32_t)SB_E_BUSY << SB_ST_SHIFT_ERR));
+        res_hid[1] = 8U;
+        return;
+    }
 
     switch (action)
     {

@@ -43,6 +43,10 @@
 #include "pinmux.h"
 #include "i2c_bridge.h"
 #include "spi_bridge.h"   /* 引脚仲裁：SPI 桥先占的辅助脚不能被 I2C 抢 */
+#include "bus_periodic.h"
+
+/* Shared wake gate is also available on boards without an I2C connector. */
+volatile uint8_t i2c_bridge_req_kind;
 
 #if !defined(BOARD_HAS_I2C_BRIDGE) || (BOARD_HAS_I2C_BRIDGE == 0)
 
@@ -57,6 +61,15 @@ void i2c_bridge_init(void)
 
 void i2c_bridge_poll(void)
 {
+    if (i2c_bridge_req_kind == BP_WAKE) bus_periodic_poll();
+}
+
+uint8_t i2c_bridge_periodic_ready(void) { return 0U; }
+uint8_t i2c_bridge_periodic_check(const uint8_t *p, uint16_t len) {
+    (void)p; (void)len; return I2C_E_DISABLED;
+}
+uint8_t i2c_bridge_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, uint8_t *n) {
+    (void)p; (void)len; (void)data; *n = 0U; return I2C_E_DISABLED;
 }
 
 void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
@@ -131,7 +144,6 @@ static uint8_t   s_enabled;
 static uint32_t  s_actual_scl_hz;
 
 /* 非 static：主循环用头文件里的 i2c_bridge_busy() 内联读它，避免为了看一眼标志就进 flash（见 i2c_bridge.h） */
-volatile uint8_t i2c_bridge_req_kind;              /* ≠0 = 有登记请求还没做完 */
 static uint8_t  s_req[IB_REQ_BYTES];             /* XFER 参数副本 */
 static uint8_t  s_scan_next;                     /* 扫描进度：下一个要探测的地址 */
 
@@ -533,7 +545,7 @@ static void ib_finish(uint8_t err, uint8_t len, uint32_t t0)
     s_last_ticks = (uint32_t)(mchtmr_now() - t0);
     if (err == I2C_OK) { s_ok++; } else { s_err_cnt++; }
     s_done_cnt++;
-    i2c_bridge_req_kind = IB_REQ_NONE;          /* ← 最后一步：主机据此判定"结果可用" */
+    if (i2c_bridge_req_kind != IB_REQ_CANCEL) i2c_bridge_req_kind = IB_REQ_NONE;
 }
 
 static void ib_exec_xfer(void)
@@ -739,6 +751,8 @@ void i2c_bridge_poll(void)
      * （实测两个标志 1.7% 的采样率，合并后回到 main 的水平）。 */
     uint8_t kind = i2c_bridge_req_kind;
 
+    if (kind == BP_WAKE) { bus_periodic_poll(); return; }
+
     if (kind == IB_REQ_NONE)
     {
         return;
@@ -746,6 +760,7 @@ void i2c_bridge_poll(void)
     if (kind == IB_REQ_CANCEL)
     {
         i2c_bridge_req_kind = IB_REQ_NONE;      /* 主机重新枚举：挂起的请求作废 */
+        bus_periodic_wake();
         return;
     }
     if (s_enabled == 0U)
@@ -769,6 +784,7 @@ void i2c_bridge_poll(void)
         i2c_bridge_req_kind = IB_REQ_NONE;
         break;
     }
+    bus_periodic_wake(); /* A nested timer IRQ may have arrived during a normal request. */
 }
 
 void i2c_bridge_usb_reset(void)
@@ -879,6 +895,23 @@ static uint8_t ib_xfer_check(const uint8_t *p)
     return I2C_OK;
 }
 
+uint8_t i2c_bridge_periodic_ready(void) {
+    return s_enabled && (i2c_bridge_req_kind == IB_REQ_NONE || i2c_bridge_req_kind == BP_WAKE);
+}
+uint8_t i2c_bridge_periodic_check(const uint8_t *p, uint16_t len) {
+    if (len < I2C_XFER_HDR || len > IB_REQ_BYTES || len != I2C_XFER_HDR + p[3]) return I2C_E_RANGE;
+    return ib_xfer_check(p);
+}
+uint8_t i2c_bridge_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, uint8_t *n) {
+    *n = 0U;
+    if (!i2c_bridge_periodic_ready()) return I2C_E_BUSY;
+    uint8_t err = i2c_bridge_periodic_check(p, len); if (err) return err;
+    memset(s_req, 0, sizeof(s_req)); memcpy(s_req, p, len);
+    i2c_bridge_req_kind = IB_REQ_XFER;
+    ib_exec_xfer(); *n = s_res_len; memcpy(data, s_res_data, *n);
+    return s_res_err;
+}
+
 void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
 {
     uint8_t action = req_hid[3];
@@ -888,6 +921,12 @@ void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
     res_hid[1] = IB_RES_LEN_BASE;                  /* 默认：只回状态字 */
     res_hid[2] = I2C_HID_CMD;
     res_hid[3] = action;
+
+    if (bus_periodic_owns(BP_I2C) && action != I2C_ACT_STATUS &&
+        action != I2C_ACT_GET_CFG && action != I2C_ACT_RESULT && action != I2C_ACT_DBG) {
+        ib_put_status(res_hid, I2C_E_BUSY);
+        return;
+    }
 
     switch (action)
     {

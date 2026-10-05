@@ -5,6 +5,7 @@
 #include "clock.h"
 #include "hpm_gpio_drv.h"
 #include "hpm_gptmr_drv.h"
+#include "bus_periodic.h"
 #include "hpm_adc16_drv.h"
 #include "hpm_interrupt.h"
 #include "led_state.h"
@@ -259,6 +260,9 @@ static void led_state_tick(void)
 SDK_DECLARE_EXT_ISR_M(LED_TICK_TIMER_IRQ, led_tick_isr)
 void led_tick_isr(void)
 {
+    if (gptmr_check_status(LED_TICK_TIMER, GPTMR_CH_RLD_STAT_MASK(BP_TIMER_CHANNEL))) {
+        bus_periodic_irq();
+    }
     if (!gptmr_check_status(LED_TICK_TIMER, GPTMR_CH_RLD_STAT_MASK(LED_TICK_TIMER_CH)))
     {
         return;

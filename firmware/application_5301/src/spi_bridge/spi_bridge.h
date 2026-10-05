@@ -26,6 +26,10 @@ void spi_bridge_init(void);
 
 /* 主循环：推 IN、跑延时/复位脉冲、按预算处理 OUT 帧。 */
 void spi_bridge_poll(void);
+uint8_t spi_bridge_periodic_ready(void);
+uint8_t spi_bridge_periodic_check(const uint8_t *p, uint16_t len);
+uint8_t spi_bridge_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, uint8_t *n);
+void spi_bridge_periodic_release(void);
 
 /* HID CMD 0x35：req/res 都是 64 B 的 HID 报文（约定见 api_param.c）。 */
 void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid);

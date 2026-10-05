@@ -26,6 +26,9 @@ void i2c_bridge_init(void);
 
 /* 主循环：执行登记的请求（XFER / SCAN / 总线恢复）。未使能时只有一条分支。 */
 void i2c_bridge_poll(void);
+uint8_t i2c_bridge_periodic_ready(void);
+uint8_t i2c_bridge_periodic_check(const uint8_t *p, uint16_t len);
+uint8_t i2c_bridge_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, uint8_t *n);
 
 /* HID CMD 0x36：req/res 都是 64 B 的 HID 报文（约定见 api_param.c）。 */
 void i2c_bridge_hid(uint8_t *req_hid, uint8_t *res_hid);
