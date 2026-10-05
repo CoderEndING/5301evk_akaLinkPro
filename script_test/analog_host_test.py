@@ -1,6 +1,6 @@
 """Compile production ADC adapter for both boards with mocked SDK I/O."""
 from pathlib import Path
-import os, subprocess, tempfile
+import os, subprocess, tempfile, sys
 root = Path(__file__).resolve().parents[1]
 src = root / 'firmware/application_5301/src/analog_bridge'
 header = r'''
@@ -40,6 +40,7 @@ uint8_t led_state_read_vref_raw(uint16_t*);
 test = r'''
 #include <assert.h>
 #include <string.h>
+#include <stdio.h>
 #include "board.h"
 #include "analog_bridge.h"
 ioc_t ioc;
@@ -50,12 +51,32 @@ int adc16_get_oneshot_result(void *base,uint8_t channel,uint16_t *raw){
  (void)base;assert(channel==3);assert(ioc.PAD[11].FUNC_CTL==IOC_PAD_FUNC_CTL_ANALOG_MASK);
  reads++;*raw=0xabcd;return read_fail;
 }
+#ifdef ANALOG_WIRE
+int main(void){
+ char line[256];uint8_t req[64],res[64];
+ while(fgets(line,sizeof(line),stdin)){
+   assert(strlen(line)>=128);
+   for(unsigned i=0;i<64;i++){unsigned n;assert(sscanf(line+2*i,"%2x",&n)==1);req[i]=(uint8_t)n;}
+   memset(res,0,sizeof(res));res[0]=1;analog_bridge_hid(req,res);
+   for(unsigned i=0;i<64;i++)printf("%02x",res[i]);puts("");fflush(stdout);
+ }
+ return 0;
+}
+#else
 int main(void){
  uint8_t req[64]={0},res[64]={0},p[2]={BOARD_HAS_VREF_ADC?2:3,16},data[2],n;
  req[1]=2;analog_bridge_hid(req,res);assert(res[1]==20&&!memcmp(res+8,"ANA1",4));
  assert(res[12]==p[0]&&res[13]==16&&res[14]==(BOARD_HAS_VREF_ADC?2:1)&&res[15]==0);
  req[1]=1;analog_bridge_hid(req,res);assert(res[4]==1);
- req[1]=2;req[3]=1;analog_bridge_hid(req,res);assert(res[4]==1);
+ req[1]=2;req[3]=ANALOG_DAC_CAPS;analog_bridge_hid(req,res);
+ assert(res[1]==24&&!res[4]&&!memcmp(res+8,"DAC1",4)&&res[12]==1&&res[13]==0);
+ for(unsigned a=ANALOG_DAC_CONFIG;a<=ANALOG_DAC_GET_CONFIG;a++){
+  req[3]=a;req[1]=(uint8_t[]){10,5,12,11,7,3,3}[a-ANALOG_DAC_CONFIG];req[11]=1;
+  analog_bridge_hid(req,res);assert(res[4]==ANALOG_UNSUPPORTED);
+  req[1]=2;analog_bridge_hid(req,res);assert(res[4]==ANALOG_RANGE);
+ }
+ assert(!reads&&!clocks&&!inits);
+ req[1]=2;req[3]=9;analog_bridge_hid(req,res);assert(res[4]==1);
  enabled=1;assert(analog_periodic_exec(p,2,data,&n)==2&&n==0&&!reads);enabled=0;
  assert(analog_periodic_check(p,1));p[1]=7;assert(analog_periodic_check(p,2));p[1]=16;
 #if !BOARD_HAS_VREF_ADC
@@ -74,14 +95,16 @@ int main(void){
 #endif
  return 0;
 }
+#endif
 '''
 with tempfile.TemporaryDirectory() as folder:
     path=Path(folder)
     for name in ['board.h','clock.h','hpm_adc16_drv.h','hpm_clock_drv.h','hpm_soc.h','spi_bridge.h','led_state.h']:
         (path/name).write_text(header)
     (path/'test.c').write_text(test)
-    for vref in [0,1]:
-        exe=path/f'test-{vref}'
-        subprocess.run([os.getenv('CC','gcc'),'-std=c11','-O2','-Wall','-Wextra','-Werror',f'-DBOARD_HAS_VREF_ADC={vref}',f'-I{path}',f'-I{src}',str(src/'analog_bridge.c'),str(path/'test.c'),'-o',str(exe)],check=True)
-        subprocess.run([str(exe)],check=True)
+    wire=len(sys.argv)==3 and sys.argv[1]=='--wire'
+    for vref in ([0] if wire else [0,1]):
+        exe=Path(sys.argv[2]) if wire else path/f'test-{vref}'
+        subprocess.run([os.getenv('CC','gcc'),'-std=c11','-O2','-Wall','-Wextra','-Werror',*(['-DANALOG_WIRE=1','-Wno-misleading-indentation'] if wire else []),f'-DBOARD_HAS_VREF_ADC={vref}',f'-I{path}',f'-I{src}',str(src/'analog_bridge.c'),str(path/'test.c'),'-o',str(exe)],check=True)
+        if not wire: subprocess.run([str(exe)],check=True)
 print('Analog production adapter: board CAPS, input bounds, SPI exclusion, quantization, initialization errors and pad restoration PASS')

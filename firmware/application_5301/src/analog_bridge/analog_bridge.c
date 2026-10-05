@@ -20,7 +20,26 @@ static uint8_t ready;
 void analog_bridge_hid(uint8_t *req, uint8_t *res) {
     res[1] = 8U; res[2] = ANALOG_CMD; res[3] = req[3];
     memset(res + 4, 0, 4);
-    if (req[1] != 2U || req[3] != 0U) { res[4] = 1U; return; }
+    if (req[1] < 2U || req[1] > 62U) { res[4] = ANALOG_RANGE; return; }
+    if (req[3] == ANALOG_DAC_CAPS) {
+        if (req[1] != 2U) { res[4] = ANALOG_RANGE; return; }
+        /* Versioned reservation, no buffers, pin writes, IRQs or clock setup. */
+        memset(res + 8, 0, 16); memcpy(res + 8, "DAC1", 4); res[12] = 1U;
+        res[1] = 24U; return;
+    }
+    if (req[3] >= ANALOG_DAC_CONFIG && req[3] <= ANALOG_DAC_GET_CONFIG) {
+        const uint8_t minimum[] = {10U, 5U, 12U, 11U, 7U, 3U, 3U};
+        uint8_t expected = minimum[req[3] - ANALOG_DAC_CONFIG];
+        if (req[3] == ANALOG_DAC_WRITE) {
+            if (req[1] < 12U) { res[4] = ANALOG_RANGE; return; }
+            uint8_t n = req[11];
+            if (!n || n > 25U) { res[4] = ANALOG_RANGE; return; }
+            expected = (uint8_t)(10U + 2U * n);
+        }
+        res[4] = req[1] == expected ? ANALOG_UNSUPPORTED : ANALOG_RANGE;
+        return;
+    }
+    if (req[1] != 2U || req[3] != ANALOG_ADC_CAPS) { res[4] = ANALOG_RANGE; return; }
     memcpy(res + 8, "ANA1", 4);
     res[12] = ANALOG_CHANNEL; res[13] = 16U; res[14] = ANALOG_GAIN;
     res[15] = 0U; /* no physical DAC */
