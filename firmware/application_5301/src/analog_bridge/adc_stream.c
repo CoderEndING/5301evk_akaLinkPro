@@ -11,7 +11,7 @@
 static uint32_t *capture;
 static uint8_t *transmit;
 static volatile uint8_t configured, owned, start_req, stop_req, close_req, reset_req, busy, ended;
-static uint8_t running, prepared, bits, fault, wslot, rslot, end_queued;
+static uint8_t running, prepared, dma_ready, bits, fault, wslot, rslot, end_queued;
 static volatile uint8_t queued;
 static uint16_t read_pos, last_pos, lengths[2];
 static volatile uint32_t generation;
@@ -37,7 +37,7 @@ uint8_t adc_stream_open(uint8_t width, uint32_t hz, uint32_t count, uint32_t *to
     else {
         owned=1U; bits=width; requested=hz; target=count; *token=++generation;
         start_req=stop_req=close_req=reset_req=busy=ended=0U;
-        running=prepared=fault=wslot=rslot=queued=end_queued=0U;
+        running=prepared=dma_ready=fault=wslot=rslot=queued=end_queued=0U;
         read_pos=last_pos=0U; received=sent=block_seq=rate=0U; last_push=bp_now();
     }
     bp_unlock(level); return rc;
@@ -89,16 +89,20 @@ void adc_stream_poll(void) {
     if (start_req) {
         start_req=0U; prepared=1U;
         fault=adc_hw_prepare(capture,bits,requested,target,&rate);
+        dma_ready=!fault;
         if (reset_req) { retire(); return; }
+        uint32_t level=bp_lock();
         if (fault || stop_req || scope_sampler_is_running() || rtt_bridge_is_running()) stop_req=1U;
-        else { running=1U; adc_hw_begin(); }
+        else if(!reset_req) { running=1U; adc_hw_begin(); }
+        bp_unlock(level);
+        if(reset_req){retire();return;}
     }
     if (running) {
         uint8_t error=adc_hw_fault();
         if (error) { fault=error; stop_req=1U; }
         if (stop_req) { adc_hw_stop(); running=0U; }
     }
-    if (prepared) {
+    if (dma_ready) {
         uint16_t pos=adc_hw_position();
         received+=(pos-last_pos)&(ADC_DMA_WORDS-1U); last_pos=pos;
         if (target && received>=target) {
