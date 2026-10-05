@@ -13,6 +13,7 @@
 #define BP_I2C 1U
 #define BP_SPI 2U
 #define BP_DELAY 3U
+#define BP_ADC 4U
 enum { BP_CAPS, BP_CLEAR, BP_PUT, BP_START, BP_STOP, BP_STATUS, BP_READ, BP_ACK, BP_RUN };
 enum { BP_OK, BP_RANGE, BP_BUSY, BP_STATE, BP_EMPTY, BP_OVERFLOW };
 /* Program records: kind:u8, flags:u8 (zero), length:u16 LE, bytes.

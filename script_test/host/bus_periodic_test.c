@@ -4,6 +4,13 @@
 #include "bus_periodic.h"
 #include "i2c_bridge.h"
 #include "spi_bridge.h"
+uint8_t analog_periodic_ready(void) { return 1U; }
+uint8_t analog_periodic_check(const uint8_t *p, uint16_t len) {
+    return len != 2U || p[0] != 3U || (p[1] != 8U && p[1] != 10U && p[1] != 12U && p[1] != 16U);
+}
+uint8_t analog_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, uint8_t *n) {
+    assert(!analog_periodic_check(p, len)); data[0] = 0x34; data[1] = 0x12; *n = 2; return 0;
+}
 volatile uint8_t i2c_bridge_req_kind;
 static uint64_t now, timer;
 static unsigned reads, releases, fail, core, reset_on_exec, clock_failure;

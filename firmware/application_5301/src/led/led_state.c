@@ -140,6 +140,13 @@ static void led_adc_init(void)
 #endif
 }
 
+/* Main-loop ADC consumer; keeps the existing VREF calibration/configuration. */
+uint8_t led_state_read_vref_raw(uint16_t *raw)
+{
+    if (!s_adc_ready) return 1U;
+    return adc16_get_oneshot_result(LED_ADC_BASE, LED_ADC_CH, raw) != status_success;
+}
+
 /* Sample the divided reference and update the mode-5 state with hysteresis:
  * on at 90% of the setting, off at 85%. */
 static void led_vref_update(void)

@@ -37,6 +37,7 @@ extern "C"
     /* Last measured external reference voltage in mV (already x2, undoing the
      * 10k/10k divider). Returns 0 until the first ADC sample is available. */
     uint16_t led_state_get_external_mv(void);
+    uint8_t led_state_read_vref_raw(uint16_t *raw);
 
 #ifdef __cplusplus
 }

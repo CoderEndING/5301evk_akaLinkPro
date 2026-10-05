@@ -2327,7 +2327,7 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
     res_hid[2] = SB_HID_CMD;
     res_hid[3] = action;
 
-    if (bus_periodic_owns(BP_SPI) && action != SB_ACT_STATUS && action != SB_ACT_GET_CFG &&
+    if ((bus_periodic_owns(BP_SPI) || bus_periodic_owns(BP_ADC)) && action != SB_ACT_STATUS && action != SB_ACT_GET_CFG &&
         action != SB_ACT_GET_PROFILE && action != SB_ACT_DBG && action != SB_ACT_DRAIN) {
         wr_u32(res_hid + 4, sb_status_word() | ((uint32_t)SB_E_BUSY << SB_ST_SHIFT_ERR));
         res_hid[1] = 8U;

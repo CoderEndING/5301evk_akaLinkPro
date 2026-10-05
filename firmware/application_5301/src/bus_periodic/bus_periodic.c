@@ -3,6 +3,7 @@
 #include "bus_periodic.h"
 #include "i2c_bridge.h"
 #include "spi_bridge.h"
+#include "analog_bridge.h"
 #include "scope_sampler.h"
 #include "rtt_bridge.h"
 
@@ -84,6 +85,8 @@ static uint8_t validate(bp_job_t *j) {
         } else if (p[0] != j->bus) return BP_RANGE;
         else if (j->bus == BP_I2C) {
             if (i2c_bridge_periodic_check(p + 4, len)) return BP_RANGE;
+        } else if (j->bus == BP_ADC) {
+            if (analog_periodic_check(p + 4, len)) return BP_RANGE;
         } else if (spi_bridge_periodic_check(p + 4, len)) return BP_RANGE;
         off = (uint16_t)(off + 4U + len);
     }
@@ -106,12 +109,12 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
         break;
     case BP_CLEAR:
         /* One page owns this engine; never clear another running acquisition. */
-        if (bus_periodic_owns(BP_I2C) || bus_periodic_owns(BP_SPI)) { rc = BP_BUSY; break; }
+        if (bus_periodic_owns(BP_I2C) || bus_periodic_owns(BP_SPI) || bus_periodic_owns(BP_ADC)) { rc = BP_BUSY; break; }
         memset(jobs, 0, sizeof(jobs)); head = used = fault = 0;
         break;
     case BP_PUT: {
         uint16_t off = u16(req + 6); uint8_t n = req[8];
-        if (slot >= BP_JOBS || req[5] < BP_I2C || req[5] > BP_SPI || !n || n > 55U ||
+        if (slot >= BP_JOBS || (req[5] != BP_I2C && req[5] != BP_SPI && req[5] != BP_ADC) || !n || n > 55U ||
             (uint32_t)off + n > BP_PROGRAM || (uint16_t)req[1] + 2U < 9U + n) { rc = BP_RANGE; break; }
         bp_job_t *j = &jobs[slot];
         if (j->running || j->in_cycle || j->armed || cleanup) { rc = BP_BUSY; break; }
@@ -126,8 +129,11 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
         uint32_t ms = u32(req + 5);
         if (j->running || j->in_cycle || j->armed || cleanup || fault) { rc = BP_BUSY; break; }
         if (!ms || ms > 60000U) { rc = BP_RANGE; break; }
-        if (bus_periodic_owns(j->bus == BP_SPI ? BP_I2C : BP_SPI) ||
-            (j->bus == BP_SPI ? !spi_bridge_periodic_ready() : !i2c_bridge_periodic_ready())) {
+        if ((j->bus != BP_ADC && bus_periodic_owns(BP_ADC)) ||
+            bus_periodic_owns(j->bus == BP_SPI ? BP_I2C : BP_SPI) ||
+            (j->bus == BP_ADC && bus_periodic_owns(BP_I2C)) ||
+            (j->bus == BP_ADC ? !analog_periodic_ready() :
+             j->bus == BP_SPI ? !spi_bridge_periodic_ready() : !i2c_bridge_periodic_ready())) {
             rc = BP_BUSY; break;
         }
         rc = validate(j); if (rc) break;
@@ -228,6 +234,7 @@ void bus_periodic_poll(void) {
             if (jobs[slot].epoch == token) jobs[slot].ready = now + 480000U;
             bp_unlock(level); slot = 255U;
         } else if (kind == BP_I2C) err = i2c_bridge_periodic_exec(bytes, len, data, &n);
+        else if (kind == BP_ADC) err = analog_periodic_exec(bytes, len, data, &n);
         else err = spi_bridge_periodic_exec(bytes, len, data, &n);
     }
     level = bp_lock();

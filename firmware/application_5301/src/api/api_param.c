@@ -9,6 +9,7 @@
 #include "spi_bridge.h"
 #include "i2c_bridge.h"
 #include "bus_periodic.h"
+#include "analog_bridge.h"
 #include "SW_DP.h"
 #include "led_state.h"
 #include "hpm_dfu_trigger.h"
@@ -653,6 +654,9 @@ void api_param_proc_hid(uint8_t *req_hid, uint8_t *res_hid)
         break;
     }
 
+    case ANALOG_CMD:
+        analog_bridge_hid(req_hid, res_hid);
+        break;
     case BP_CMD:
         bus_periodic_hid(req_hid, res_hid);
         break;

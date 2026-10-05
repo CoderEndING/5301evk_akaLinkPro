@@ -58,6 +58,7 @@ test-jtag-host:
 	$(PYTHON) script_test/riscv_jtag_host_test.py
 
 test-host: test-jtag-host
+	$(PYTHON) script_test/analog_host_test.py
 	$(PYTHON) script_test/bus_periodic_host_test.py
 	$(PYTHON) script_test/scope_host_test.py
 	$(PYTHON) script_test/rtt_stop_host_test.py
