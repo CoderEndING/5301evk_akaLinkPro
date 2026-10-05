@@ -32,25 +32,6 @@ static uint32_t u32(const uint8_t *p) {
 static void put32(uint8_t *p, uint32_t v) {
     for (uint8_t i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8U * i));
 }
-uint8_t bus_periodic_queued(void) { return used; }
-uint8_t bus_periodic_fault(void) { return fault; }
-/* Caller holds bp_lock. Queue slots remain owned until USB completes. */
-uint8_t bus_periodic_adc_packet(uint8_t *out) {
-    uint8_t count = used < 19U ? used : 19U;
-    for (uint8_t i = 0; i < count; i++) {
-        bp_result_t *r = &results[(head + i) % BP_QUEUE];
-        if (jobs[r->slot].bus != BP_ADC || r->len > 2U) return 0U;
-        uint8_t *p = out + 26U * i;
-        put32(p, r->seq); put32(p + 4U, r->epoch); put32(p + 8U, r->cycle);
-        put32(p + 12U, r->time_ms); put32(p + 16U, r->skipped);
-        p[20] = r->slot; p[21] = r->step; p[22] = r->err; p[23] = r->len;
-        p[24] = r->len ? r->data[0] : 0U; p[25] = r->len > 1U ? r->data[1] : 0U;
-    }
-    return count;
-}
-void bus_periodic_adc_ack(uint8_t count) {
-    if (count <= used) { head = (uint8_t)((head + count) % BP_QUEUE); used -= count; }
-}
 uint8_t bus_periodic_owns(uint8_t bus) {
     if ((cleanup & (1U << bus)) != 0U) return 1U;
     for (uint8_t i = 0; i < BP_JOBS; i++)
@@ -119,6 +100,9 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
     uint8_t minimum = action == BP_PUT ? 7U : action == BP_START ? 11U :
         action == BP_ACK ? 6U : (action == BP_STOP || action == BP_READ) ? 3U : 2U;
     if (req[1] < minimum) { put32(res + 4, BP_RANGE); return; }
+    if (adc_stream_enabled() && action != BP_CAPS && action != BP_STATUS) {
+        put32(res + 4, BP_BUSY); return;
+    }
     uint32_t level = bp_lock();
     switch (action) {
     case BP_CAPS:
@@ -129,8 +113,7 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
         break;
     case BP_CLEAR:
         /* One page owns this engine; never clear another running acquisition. */
-        if (bus_periodic_owns(BP_I2C) || bus_periodic_owns(BP_SPI) || bus_periodic_owns(BP_ADC) ||
-            (adc_stream_enabled() && used)) { rc = BP_BUSY; break; }
+        if (bus_periodic_owns(BP_I2C) || bus_periodic_owns(BP_SPI) || bus_periodic_owns(BP_ADC)) { rc = BP_BUSY; break; }
         memset(jobs, 0, sizeof(jobs)); head = used = fault = 0;
         break;
     case BP_PUT: {
@@ -138,7 +121,6 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
         if (slot >= BP_JOBS || (req[5] != BP_I2C && req[5] != BP_SPI && req[5] != BP_ADC) || !n || n > 55U ||
             (uint32_t)off + n > BP_PROGRAM || (uint16_t)req[1] + 2U < 9U + n) { rc = BP_RANGE; break; }
         bp_job_t *j = &jobs[slot];
-        if (adc_stream_enabled() && req[5] != BP_ADC) { rc = BP_BUSY; break; }
         if (j->running || j->in_cycle || j->armed || cleanup) { rc = BP_BUSY; break; }
         if (off == 0U) { j->size = 0U; j->bus = req[5]; }
         if (off != j->size || j->bus != req[5]) { rc = BP_STATE; break; }
@@ -149,7 +131,6 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
         if (slot >= BP_JOBS || req[1] < 11U) { rc = BP_RANGE; break; }
         bp_job_t *j = &jobs[slot];
         uint32_t ms = u32(req + 5);
-        if (adc_stream_enabled() && j->bus != BP_ADC) { rc = BP_BUSY; break; }
         if (j->running || j->in_cycle || j->armed || cleanup || fault) { rc = BP_BUSY; break; }
         if (!ms || ms > 60000U) { rc = BP_RANGE; break; }
         if ((j->bus != BP_ADC && bus_periodic_owns(BP_ADC)) ||
@@ -171,7 +152,6 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
             jobs[i].armed = 0U; jobs[i].running = 1U; jobs[i].next = now; n++;
         }
         if (!n) { rc = BP_STATE; break; }
-        if (bus_periodic_owns(BP_ADC)) adc_stream_started();
         dirty = 1U; bus_periodic_wake();
         break;
     }
@@ -188,7 +168,6 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
         break;
     }
     case BP_READ: {
-        if (adc_stream_enabled()) { rc = BP_BUSY; break; }
         if (!used) { rc = BP_EMPTY; break; }
         bp_result_t *r = &results[head]; uint8_t off = req[4];
         if (off > r->len) { rc = BP_RANGE; break; }
@@ -200,7 +179,6 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
         break;
     }
     case BP_ACK:
-        if (adc_stream_enabled()) { rc = BP_BUSY; break; }
         if (!used || u32(req + 4) != results[head].seq) { rc = BP_STATE; break; }
         head = (uint8_t)((head + 1U) % BP_QUEUE); used--;
         break;
@@ -208,7 +186,6 @@ void bus_periodic_hid(uint8_t *req, uint8_t *res) {
     }
     put32(res + 4, rc);
     bp_unlock(level);
-    adc_stream_poll();
 }
 
 /* Main loop only. One record per visit; no FIFO wait inside the timer ISR. */
@@ -307,5 +284,4 @@ void bus_periodic_poll(void) {
     }
     else bp_timer_stop();
     bp_unlock(level);
-    adc_stream_poll();
 }

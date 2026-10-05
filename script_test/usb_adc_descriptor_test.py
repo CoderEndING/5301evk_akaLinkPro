@@ -22,13 +22,13 @@ prefix = r'''
 #define CONFIG_CHERRYDAP_USE_CUSTOM_HID 1
 #define CONFIG_CHERRYDAP_USE_MSC 0
 #define BOARD_HAS_SPI_BRIDGE 1
-#define CONFIG_USBDEV_REQUEST_BUFFER_LEN 1024
+#define CONFIG_USBDEV_REQUEST_BUFFER_LEN 768
 #define DAP_PACKET_SIZE 512
 '''
 # Endpoint constants and HID MPS are taken from production, not duplicated.
 header = (usb / 'usb_composite.h').read_text()
 for name in ['DAP_IN_EP','DAP_OUT_EP','SWO_IN_EP','CDC_IN_EP','CDC_OUT_EP','CDC_INT_EP',
-             'HID_IN_EP','HID_OUT_EP','ADC_IN_EP','MSC_IN_EP','MSC_OUT_EP','SPI_IN_EP','SPI_OUT_EP',
+             'HID_IN_EP','HID_OUT_EP','MSC_IN_EP','MSC_OUT_EP','SPI_IN_EP','SPI_OUT_EP',
              'USBD_VID','USBD_PID','USBD_MAX_POWER','HID_PACKET_SIZE']:
     prefix += re.search(r'^#define\s+' + name + r'\s+[^\n]+', header, re.M).group(0) + '\n'
 test = r'''
@@ -51,12 +51,13 @@ int main(void){
    if(d[1]==4)interfaces++;
    if(d[1]==5){unsigned bit=1U<<((d[2]&15)+(d[2]&128?16:0));assert(!(eps&bit));eps|=bit;
      if(d[2]==0x87 || d[2]==8){assert(u16(d+4)==64 && d[6]==6);hid++;}
-     if(d[2]==0x8c){assert(d[3]==2 && u16(d+4)==512);adc++;}
+     assert(d[2]!=0x8c);
+     if(d[2]==0x8b){assert(d[3]==2 && u16(d+4)==512);adc++;}
      if(d[2]==0x83){assert(d[3]==2 && u16(d+4)==512);scope++;}
    }off+=d[0];
  }
  assert(interfaces==INTF_NUM && hid==2 && adc==1 && scope==1);
- puts("Production USB descriptors: ADC WinUSB/Bulk, unique endpoints, HID 64 bytes/4 ms, lengths PASS");
+ puts("Production USB descriptors: shared SPI/ADC Bulk, no extra endpoint, HID 64 bytes/4 ms, lengths PASS");
 }
 '''
 with tempfile.TemporaryDirectory() as folder:

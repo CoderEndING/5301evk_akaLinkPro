@@ -25,10 +25,6 @@ void bus_periodic_irq(void);
 void bus_periodic_reset(void);
 uint8_t bus_periodic_owns(uint8_t bus);
 void bus_periodic_wake(void);
-uint8_t bus_periodic_queued(void);
-uint8_t bus_periodic_fault(void);
-uint8_t bus_periodic_adc_packet(uint8_t *out); /* up to 19 x 26-byte records */
-void bus_periodic_adc_ack(uint8_t count);
 /* Platform adapter; timer is GPTMR1 channel 1, shared IRQ with LED channel 0. */
 uint64_t bp_now(void); /* 24 MHz MCHTMR */
 uint32_t bp_lock(void);

@@ -1,6 +1,7 @@
 /* Host-only hardware substitutes. Production sampler C is compiled by the runner. */
 #include <assert.h>
 #include <stdint.h>
+static int adc_stream_enabled(void) { return 0; }
 #include <stdio.h>
 #include <string.h>
 #define ATTR_PLACE_AT_NONCACHEABLE_BSS_WITH_ALIGNMENT(n) __attribute__((aligned(n)))

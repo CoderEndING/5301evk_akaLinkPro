@@ -36,6 +36,7 @@
 #include "spi_bridge.h"
 #include "i2c_bridge.h"   /* 交叉检查：I2C 桥使能时占着 PA28/PA29，别当辅助脚用 */
 #include "bus_periodic.h"
+#include "adc_stream.h"
 
 #if !defined(BOARD_HAS_SPI_BRIDGE) || (BOARD_HAS_SPI_BRIDGE == 0)
 
@@ -59,6 +60,11 @@ uint8_t spi_bridge_periodic_exec(const uint8_t *p, uint16_t len, uint8_t *data, 
     (void)p; (void)len; (void)data; *n = 0U; return SB_E_DISABLED;
 }
 void spi_bridge_periodic_release(void) {}
+uint8_t spi_bridge_adc_claim(uint32_t **capture, uint8_t **transmit) {
+    (void)capture; (void)transmit; return 0U;
+}
+void spi_bridge_adc_release(void) {}
+uint8_t spi_bridge_adc_flags(void) { return 2U; }
 
 void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
 {
@@ -128,9 +134,9 @@ _Static_assert(sizeof(sb_profile_t) == 16U, "sb_profile_t layout changed: sync h
 
 /* ============================== 缓冲（AHB SRAM） ============================== */
 
-ATTR_PLACE_AT_WITH_ALIGNMENT(".ahb_sram", 8)
+ATTR_PLACE_AT_WITH_ALIGNMENT(".ahb_sram", 64)
 static uint8_t s_out_buf[SB_OUT_SLOTS][SB_PKT_SIZE];
-ATTR_PLACE_AT_WITH_ALIGNMENT(".ahb_sram", 8)
+ATTR_PLACE_AT_WITH_ALIGNMENT(".ahb_sram", 64)
 static uint8_t s_in_buf[SB_IN_SLOTS][SB_PKT_SIZE];
 
 /* ============================== 状态 ============================== */
@@ -266,6 +272,20 @@ static volatile uint8_t s_drain_reads;
 #define s_pad_te (s_st.pad_te)
 #define s_format (s_st.format)
 #define s_fmt_addr_len (s_st.fmt_addr_len)
+static volatile uint8_t s_adc_owner;
+uint8_t spi_bridge_adc_flags(void) {
+    return (s_out_inflight ? 1U : 0U) | ((s_enabled || s_in_inflight || s_in_used ||
+        s_out_used || s_pkt_active || s_hw_req || s_reset_req || s_usb_reset_req ||
+        s_abort_req || s_drain_reads || s_adc_owner || s_cs_asserted) ? 2U : 0U);
+}
+uint8_t spi_bridge_adc_claim(uint32_t **capture, uint8_t **transmit) {
+    /* Caller disables IRQs. OUT must retire (host sends a ZLP when flags bit0 is set). */
+    if (spi_bridge_adc_flags()) return 0U;
+    s_adc_owner = 1U;
+    *capture = (uint32_t *)&s_out_buf[0][0]; *transmit = &s_in_buf[0][0];
+    return 1U;
+}
+void spi_bridge_adc_release(void) { s_adc_owner = 0U; }
 
 /* ============================== 小工具 ============================== */
 
@@ -1740,6 +1760,7 @@ static void sb_drain_pending_reads(void)
 
 void spi_bridge_poll(void)
 {
+    if (s_adc_owner) { adc_stream_poll(); return; }
     if (s_usb_reset_req != 0U)
     {
         /* USB 总线复位：端点上在飞的传输被硬件作废、完成回调**不会再来**，
@@ -2326,6 +2347,12 @@ void spi_bridge_hid(uint8_t *req_hid, uint8_t *res_hid)
 
     res_hid[2] = SB_HID_CMD;
     res_hid[3] = action;
+
+    if (s_adc_owner && action != SB_ACT_STATUS && action != SB_ACT_GET_CFG &&
+        action != SB_ACT_GET_PROFILE && action != SB_ACT_DBG) {
+        wr_u32(res_hid + 4, sb_status_word() | ((uint32_t)SB_E_BUSY << SB_ST_SHIFT_ERR));
+        res_hid[1] = 8U; return;
+    }
 
     if ((bus_periodic_owns(BP_SPI) || bus_periodic_owns(BP_ADC)) && action != SB_ACT_STATUS && action != SB_ACT_GET_CFG &&
         action != SB_ACT_GET_PROFILE && action != SB_ACT_DBG && action != SB_ACT_DRAIN) {

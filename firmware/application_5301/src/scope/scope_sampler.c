@@ -24,6 +24,7 @@
  */
 
 #include <string.h>
+#include "adc_stream.h"
 
 #include "board.h"
 #include "hpm_common.h"
@@ -823,6 +824,7 @@ static int scope_be_link_ready(void)
 
 static int scope_start_now(void)
 {
+    if (adc_stream_enabled()) return -14;
     if ((s_nvars == 0U) || (s_frame_bytes == 0U)) { return -3; }
     scope_make_plan();
 

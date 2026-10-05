@@ -18,21 +18,36 @@
 #define ANALOG_GAIN 1U
 static uint8_t ready;
 #endif
+void analog_periodic_invalidate(void) {
+#if !BOARD_HAS_VREF_ADC
+    ready=0U;
+#endif
+}
+static uint32_t stream_word(const uint8_t *p) {
+    return p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+}
 void analog_bridge_hid(uint8_t *req, uint8_t *res) {
     res[1] = 8U; res[2] = ANALOG_CMD; res[3] = req[3];
     memset(res + 4, 0, 4);
     if (req[1] < 2U || req[1] > 62U) { res[4] = ANALOG_RANGE; return; }
-    if (req[3] >= ANALOG_STREAM_CAPS && req[3] <= ANALOG_STREAM_CLOSE) {
-        if (req[1] != 2U) { res[4] = ANALOG_RANGE; return; }
+    if (req[3] >= ANALOG_STREAM_CAPS && req[3] <= ANALOG_STREAM_STATUS) {
+        if (req[1] != (req[3]==ANALOG_STREAM_OPEN?12U:2U)) { res[4] = ANALOG_RANGE; return; }
         if (req[3] == ANALOG_STREAM_CAPS) {
-            memcpy(res + 8U, "ADB1", 4); res[12] = 0x8CU; res[13] = 1U;
-            res[14] = 0U; res[15] = 2U; res[1] = 16U;
+            memset(res+8U,0,20U); memcpy(res+8U,"ADB2",4);
+            res[12]=0x8BU; res[13]=2U; res[14]=0x0FU; res[15]=ADC_FAST_CHANNEL;
+            for (uint8_t i=0;i<4;i++) res[16U+i]=(uint8_t)(ADC_FAST_MAX_RATE>>(8U*i));
+            res[21]=0x10U; res[23]=0x10U; /* DMA 4096 words, block 4096 bytes */
+            res[24]=spi_bridge_adc_flags(); res[25]=adc_hw_supported();
+            res[26]=3300U&255U; res[27]=3300U>>8; res[1]=28U;
         } else if (req[3] == ANALOG_STREAM_OPEN) {
-            uint32_t token = 0U; res[4] = adc_stream_open(&token);
+            uint32_t token = 0U;
+            res[4]=adc_stream_open(req[4],stream_word(req+5U),stream_word(req+9U),&token);
             for (uint8_t i = 0; i < 4; i++) res[8U + i] = (uint8_t)(token >> (8U * i));
             res[1] = 12U;
         } else if (req[3] == ANALOG_STREAM_END) adc_stream_end();
-        else res[4] = adc_stream_close();
+        else if (req[3] == ANALOG_STREAM_CLOSE) res[4]=adc_stream_close();
+        else if (req[3] == ANALOG_STREAM_START) res[4]=adc_stream_start();
+        else { adc_stream_status(res+8U); res[1]=32U; }
         return;
     }
     if (req[3] == ANALOG_DAC_CAPS) {
@@ -61,7 +76,7 @@ void analog_bridge_hid(uint8_t *req, uint8_t *res) {
     res[18] = 1000U & 255U; res[19] = 1000U >> 8;
     res[1] = 20U;
 }
-uint8_t analog_periodic_ready(void) { return !spi_bridge_is_enabled(); }
+uint8_t analog_periodic_ready(void) { return !spi_bridge_is_enabled() && !adc_stream_enabled(); }
 uint8_t analog_periodic_check(const uint8_t *p, uint16_t len) {
     return len != 2U || p[0] != ANALOG_CHANNEL ||
         (p[1] != 8U && p[1] != 10U && p[1] != 12U && p[1] != 16U);

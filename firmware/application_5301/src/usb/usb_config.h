@@ -28,8 +28,8 @@
  * (DAP + WebUSB + SPI bridge + DFU) the set is 10 + 160*4 = 650 B.
  * 512 B used to be enough for 3 subsets (490 B) and silently broke enumeration
  * as soon as the SPI bridge added the 4th (Windows: Code 10, no HID, no bulk).
- * ADC adds the 5th subset (810 B); usb_composite.c guards the capacity at compile time. */
-#define CONFIG_USBDEV_REQUEST_BUFFER_LEN 1024
+ * usb_composite.c guards the capacity at compile time. */
+#define CONFIG_USBDEV_REQUEST_BUFFER_LEN 768
 #define CONFIG_USBDEV_ADVANCE_DESC
 #define CONFIG_USBDEV_MAX_BUS 1
 

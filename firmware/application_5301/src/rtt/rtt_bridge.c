@@ -18,6 +18,7 @@
  */
 
 #include <string.h>
+#include "adc_stream.h"
 
 #include "board.h"
 #include "hpm_common.h"
@@ -531,6 +532,7 @@ static void rtt_link_recover(void)
 
 int rtt_bridge_start(uint32_t addr, uint32_t size, uint8_t channel)
 {
+    if (adc_stream_enabled()) return -14; /* shared ADC must retire before core streaming */
     rtt_bridge_stop();
 
     s_channel = channel;
