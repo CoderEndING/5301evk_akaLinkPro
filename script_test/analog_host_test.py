@@ -46,7 +46,7 @@ test = r'''
 #include "analog_bridge.h"
 ioc_t ioc;
 unsigned enabled,reads,clocks,inits,init_fail,channel_fail,read_fail;
-uint8_t adc_stream_open(uint8_t bits,uint32_t rate,uint32_t count,uint32_t *token){assert(bits==16&&rate==1000&&count==0);*token=1;return 0;}
+uint8_t adc_stream_open(uint8_t bits,uint32_t rate,uint32_t count,uint32_t *token){assert(bits==16&&((rate==1000&&count==0)||(rate==500&&count==512)));*token=1;return 0;}
 uint8_t adc_stream_close(void){return 0;}
 uint8_t adc_stream_start(void){return 0;}
 uint8_t adc_stream_enabled(void){return 0;}
@@ -88,7 +88,8 @@ int main(void){
  req[1]=2;req[3]=255;analog_bridge_hid(req,res);assert(res[4]==1);
  req[3]=ANALOG_STREAM_CAPS;analog_bridge_hid(req,res);assert(res[1]==28&&!memcmp(res+8,"ADB2",4)&&res[12]==0x8b&&res[15]==6);
  req[3]=ANALOG_STREAM_OPEN;analog_bridge_hid(req,res);assert(res[4]==ANALOG_RANGE);
- req[1]=12;req[4]=16;req[5]=0xe8;req[6]=3;memset(req+7,0,6);
+ req[1]=12;analog_bridge_hid(req,res);assert(res[4]==ANALOG_RANGE);
+ req[1]=11;req[4]=16;req[5]=0xe8;req[6]=3;memset(req+7,0,6);
  analog_bridge_hid(req,res);assert(res[1]==12&&res[8]==1);
  enabled=1;assert(analog_periodic_exec(p,2,data,&n)==2&&n==0&&!reads);enabled=0;
  assert(analog_periodic_check(p,1));p[1]=7;assert(analog_periodic_check(p,2));p[1]=16;

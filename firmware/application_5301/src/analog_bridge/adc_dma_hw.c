@@ -13,7 +13,7 @@
 #include "adc_stream.h"
 #if BOARD_HAS_SPI_BRIDGE && !BOARD_HAS_VREF_ADC
 #define TIMER HPM_GPTMR1
-#define ADC_TIMER_CH 2U /* LED ch0, periodic buses ch1: do not alter their clock/IRQ. */
+#define ADC_TIMER_CH 2U /* LED ch0, periodic buses ch1: keep their clocks and IRQs untouched. */
 #define TRIGGER HPM_TRGM0_OUTPUT_SRC_ADC0_STRGI
 static uint8_t saved;
 static uint32_t mux, pad, route, timer_cr, timer_rld, timer_cmp[2], int_en;
@@ -80,7 +80,8 @@ uint8_t adc_hw_prepare(uint32_t *buffer, uint8_t bits, uint32_t hz, uint32_t cou
     HPM_ADC0->INT_EN=0U; /* no per-sample IRQ */
     adc16_get_channel_default_config(&ch); ch.ch=ADC_FAST_CHANNEL; ch.sample_cycle=3U;
     if (adc16_init_channel(HPM_ADC0,&ch)!=status_success) return 3U;
-    seq.seq_len=1U; seq.queue[0].ch=ADC_FAST_CHANNEL; seq.hw_trig_en=true;
+    /* Process the one-entry queue to completion on each hardware trigger. */
+    seq.seq_len=1U; seq.queue[0].ch=ADC_FAST_CHANNEL; seq.cont_en=true; seq.hw_trig_en=true;
     if (adc16_set_seq_config(HPM_ADC0,&seq)!=status_success) return 3U;
     adc16_seq_disable_hw_trigger(HPM_ADC0);
     adc16_dma_config_t dma={0}; dma.start_addr=buffer; dma.buff_len_in_4bytes=ADC_DMA_WORDS;
@@ -88,12 +89,15 @@ uint8_t adc_hw_prepare(uint32_t *buffer, uint8_t bits, uint32_t hz, uint32_t cou
     if (adc16_init_seq_dma(HPM_ADC0,&dma)!=status_success) return 3U;
     l1c_dc_flush((uint32_t)(uintptr_t)buffer,ADC_DMA_WORDS*4U);
     adc16_clear_status_flags(HPM_ADC0,0xFFFFFFFFU);
+    /* Keep both GPTMR compares: CMP0 raises the pulse halfway through the
+     * period and CMP1 returns it at reload (the SDK PWM example uses the same
+     * compare-pair pattern). */
     gptmr_channel_config_t t; gptmr_channel_get_default_config(TIMER,&t);
-    t.reload=period; t.cmp[0]=1U; t.cmp[1]=period/2U; t.enable_cmp_output=true;
+    t.reload=period; t.cmp[0]=period/2U; t.cmp[1]=period; t.enable_cmp_output=true;
     t.cmp_initial_polarity_high=false;
     if (gptmr_channel_config(TIMER,ADC_TIMER_CH,&t,false)!=status_success) return 3U;
     trgm_output_t trig={0}; trig.input=HPM_TRGM0_INPUT_SRC_GPTMR1_OUT2;
-    trig.type=trgm_output_pulse_at_input_rising_edge;
+    trig.type=trgm_output_same_as_input;
     trgm_output_config(HPM_TRGM0,TRIGGER,&trig);
     *actual=timer/period; return 0U;
 }
@@ -106,7 +110,9 @@ uint16_t adc_hw_position(void) {
 }
 uint8_t adc_hw_fault(void) {
     uint32_t flags=HPM_ADC0->INT_STS;
-    if (flags & (ADC16_INT_STS_SEQ_HW_CFLCT_MASK|ADC16_INT_STS_DMA_FIFO_FULL_MASK)) return 6U;
+    if (flags & ADC16_INT_STS_SEQ_HW_CFLCT_MASK) return 6U;
+    if (flags & ADC16_INT_STS_DMA_FIFO_FULL_MASK) return 7U;
+    if (flags & ADC16_INT_STS_AHB_ERR_MASK) return 8U;
     if (flags & ADC16_INT_STS_SEQ_DMAABT_MASK) return 5U;
     return 0U;
 }

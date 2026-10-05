@@ -31,7 +31,9 @@ void analog_bridge_hid(uint8_t *req, uint8_t *res) {
     memset(res + 4, 0, 4);
     if (req[1] < 2U || req[1] > 62U) { res[4] = ANALOG_RANGE; return; }
     if (req[3] >= ANALOG_STREAM_CAPS && req[3] <= ANALOG_STREAM_STATUS) {
-        if (req[1] != (req[3]==ANALOG_STREAM_OPEN?12U:2U)) { res[4] = ANALOG_RANGE; return; }
+        /* HID length counts CMD + action + arguments (the length byte itself is not counted).
+         * OPEN has 1 CMD + 1 action + 9 argument bytes = 11. */
+        if (req[1] != (req[3]==ANALOG_STREAM_OPEN?11U:2U)) { res[4] = ANALOG_RANGE; return; }
         if (req[3] == ANALOG_STREAM_CAPS) {
             memset(res+8U,0,20U); memcpy(res+8U,"ADB2",4);
             res[12]=0x8BU; res[13]=2U; res[14]=0x0FU; res[15]=ADC_FAST_CHANNEL;
