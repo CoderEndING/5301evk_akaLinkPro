@@ -188,6 +188,11 @@ spi-bench:
 spi-info:
 	cd script_test && $(PYTHON) spi_bridge_test.py info
 
+# --- ADC / SPI shared-buffer ownership --------------------------------------
+.PHONY: adc-owner-hw
+adc-owner-hw:  ## ADC 与 SPI/QSPI 共享缓冲：互斥 + 关桥后自愈的硬件回归
+	$(PYTHON) script_test/spi_adc_owner_hw_test.py
+
 # --- one-click regression ---------------------------------------------------
 # SWD  = F103ZE（SRAM 测速 / RTT 20·45·60M 交付率+零丢 / HSS 单·多变量 bench+run+拟合）
 # RISCV = HPM6800EVK（selfcheck+块基准+sbastat / RTT 交付+零丢 / HSS 完整性+bench+契约）

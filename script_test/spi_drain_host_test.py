@@ -26,6 +26,7 @@ static volatile uint8_t s_drain_reads;
 static uint8_t req_hid[16], res_hid[16], slot[8];
 static int full, responses, enabled_work;
 static uint8_t s_enabled;
+static uint8_t s_hw_req;
 static uint8_t *sb_in_alloc(void){ return full ? NULL : slot; }
 static void sb_rsp_init(uint8_t *p,uint8_t type,uint8_t status,uint16_t seq){ assert(p==slot && type==SB_R_EVT && status==SB_OK && seq==0xFFFF); }
 static void sb_in_commit(uint16_t n){ assert(n==0); responses++; }
@@ -43,6 +44,9 @@ int main(void){
  poll();assert(responses==16);
  s_enabled=1;req_hid[4]=4;hid();for(int i=0;i<4;i++)poll();assert(responses==20 && enabled_work==4);
  req_hid[4]=0;hid();poll();assert(responses==20 && !s_drain_reads);
+ /* A closed bridge has no hardware to reconfigure: the guard must drop any
+  * hardware-reinit request instead of carrying it across the disabled state. */
+ s_enabled=0;s_hw_req=1;poll();assert(!s_hw_req && enabled_work==5);
  return 0;
 }
 '''
@@ -51,4 +55,4 @@ with tempfile.TemporaryDirectory() as directory:
     (path / 'test.c').write_text(source)
     subprocess.run([os.environ.get('CC', 'gcc'), '-std=c11', '-Wall', '-Werror', str(path / 'test.c'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)
-print('SPI drain: bounded short responses, ring backpressure, disabled bridge, capability signature PASS')
+print('SPI drain: bounded short responses, ring backpressure, disabled bridge drops pending hw reinit, capability signature PASS')

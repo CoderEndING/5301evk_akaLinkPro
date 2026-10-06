@@ -273,14 +273,85 @@ static sb_state_t s_st;
 #define s_format (s_st.format)
 #define s_fmt_addr_len (s_st.fmt_addr_len)
 #define s_adc_owner (spi_bridge_gate.flag[5])
-uint8_t spi_bridge_adc_flags(void) {
-    return (s_out_inflight ? 1U : 0U) | ((s_enabled || s_in_inflight || s_in_used ||
-        s_out_used || s_pkt_active || s_hw_req || s_reset_req || s_usb_reset_req ||
-        s_abort_req || s_drain_reads || s_adc_owner || s_cs_asserted) ? 2U : 0U);
+
+/* 见"CS"一节；共享缓冲所有权判定要用到它释放 CS。 */
+static void sb_cs_release(void);
+
+/* ==================== 共享缓冲所有权：SPI/QSPI 桥 ↔ ADC DMA ====================
+ *
+ * ADC 高速模式**复用 SPI 桥的 bulk 缓冲**（SPI OUT 环 = DMA 目标，SPI IN 环 =
+ * 上行块），所以两者互斥。判据必须是"**此刻真的有人在用**"，绝不能是"内部账目里
+ * 还剩什么"。
+ *
+ * 血案（2026-10-06 实机）：桥早已关掉（STATUS 里 enabled=0/active=0/cs=0，
+ * frames_ok=0、sclk 未跑，ADC 侧 owned=0），CAPS 却一直报 flags=2 —— 因为
+ * bit1 把 s_hw_req / s_drain_reads / 环计数 / 各种 *_req 也算作"占用"。这些位只
+ * 由特定路径清（s_hw_req 甚至**只在桥使能时**才会被主循环清），一次异常退出就
+ * 永久粘住；而主机侧**没有任何命令**能清掉它 → ADC 再也起不来，只能拔插/断电。
+ *
+ * 所以这里把不变量钉死：
+ *   ① bit1 只表示 s_enabled || s_pkt_active || s_adc_owner（有人真的在占用）；
+ *   ② 桥没使能时，claim 先把 SPIB 侧的挂起账目一次性作废再独占缓冲 —— 残留账目
+ *      永远不能成为 ADC 的永久拒绝理由。作废手法与 USB 总线复位清账完全一致
+ *      （代数 +1，让迟到的完成回调被识别成旧包丢弃），那条路径早已过审。
+ *
+ * 互斥语义不变：桥使能中/有帧在执行 ⇒ 一律拒绝，主机必须先在 SPI/QSPI 页停下
+ * （或走跨页接管），这一点是用户明确要求的（ADC 与 SPI/QSPI 互斥）。
+ */
+static uint8_t sb_live_owner(void)
+{
+    return (uint8_t)((s_enabled != 0U) || (s_pkt_active != 0U) || (s_adc_owner != 0U));
 }
-uint8_t spi_bridge_adc_claim(uint32_t **capture, uint8_t **transmit) {
-    /* Caller disables IRQs. OUT must retire (host sends a ZLP when flags bit0 is set). */
-    if (spi_bridge_adc_flags()) return 0U;
+
+/* 作废 SPIB 侧的全部挂起账目。调用者必须关中断（claim 的调用者已保证）。 */
+static void sb_reclaim_shared(void)
+{
+    s_out_gen++;
+    s_in_gen++;
+    s_out_w = 0U;
+    s_out_r = 0U;
+    s_out_used = 0U;
+    s_out_inflight = 0U;
+    s_in_w = 0U;
+    s_in_r = 0U;
+    s_in_used = 0U;
+    s_in_inflight = 0U;
+    s_pkt_active = 0U;
+    s_pkt_off = 0U;
+    s_pkt_len = 0U;
+    s_delay_active = 0U;
+    s_rst_state = 0U;
+    s_reset_req = 0U;
+    s_usb_reset_req = 0U;
+    s_abort_req = 0U;
+    s_drain_reads = 0U;
+    s_hw_req = 0U;
+    if (s_cs_asserted != 0U)
+    {
+        sb_cs_release(); /* 桥没使能，CS 不该停在有效电平 */
+    }
+}
+
+uint8_t spi_bridge_adc_flags(void)
+{
+    /* bit0: OUT 端点上还挂着一笔已武装的读（主机可用一个 ZLP 让它退场）。
+     * bit1: 桥此刻**真的**占着共享缓冲（使能中 / 有帧在执行）。
+     *       不含任何"残留账目"——见上面的不变量。 */
+    return (uint8_t)((s_out_inflight ? 1U : 0U) | (sb_live_owner() ? 2U : 0U));
+}
+
+uint8_t spi_bridge_adc_claim(uint32_t **capture, uint8_t **transmit)
+{
+    /* 调用者已关中断：下面的读-改-写是安全的。 */
+    if (sb_live_owner() != 0U)
+    {
+        return 0U; /* SPI/QSPI 真的在用：互斥 */
+    }
+    sb_reclaim_shared();
+    if (sb_live_owner() != 0U)
+    {
+        return 0U; /* 结构上到不了这里，纯粹把不变量钉死 */
+    }
     s_adc_owner = 1U;
     *capture = (uint32_t *)&s_out_buf[0][0]; *transmit = &s_in_buf[0][0];
     return 1U;
@@ -1841,6 +1912,10 @@ void spi_bridge_poll(void)
 
     if (s_enabled == 0U)
     {
+        /* 桥是关着的：没有硬件需要重新配置。s_hw_req 原本只在这一行**之后**
+         * （即桥使能时）才会被清掉，于是"使能期间登记、之后关桥"的残留会永久
+         * 留在 s_st 里。这里就地落干净，避免跨状态残留。 */
+        s_hw_req = 0U;
         return;
     }
 
