@@ -8,7 +8,7 @@
 #   make flash-app  - J-Link flash APP only (bootloader preserved)
 #   make dfu        - dfu-util download of the APP (needs dfu-util in PATH)
 #   make reset-usb  - force a USB re-enumeration of the probe
-#   make clean      - remove the evklite build directories
+#   make clean      - remove generated EVKLite output, preserve checked-in ELF snapshots
 #
 # Hardware test targets (ST/EVKLite target board must be wired up):
 #   make sram-test  - STM32F103 SRAM read/write benchmark over CMSIS-DAP+OpenOCD
@@ -224,9 +224,8 @@ regression-riscv-jsonl:
 	@powershell -NoProfile -Command "if (Test-Path '$(REGDIR)\riscv.jsonl') { Get-Content '$(REGDIR)\riscv.jsonl' -Encoding UTF8 } else { 'no jsonl yet' }"
 
 clean:
-	@echo [make] cleaning evklite build dirs ...
-	rmdir /s /q $(APP_DIR)\build_dfu_evklite
-	rmdir /s /q $(BOOT_DIR)\build_xip_evklite
+	@echo [make] cleaning generated evklite output ...
+	powershell -NoProfile -ExecutionPolicy Bypass -File tools/clean-evklite-build.ps1
 
 help:
 	@echo akaLinkPro targets:
@@ -262,4 +261,4 @@ help:
 	@echo   make regression-riscv     6800EVK: engine + RTT + HSS integrity/contract/fit
 	@echo   make regression-riscv-bg  same, background   make regression-riscv-log to watch
 	@echo   (needs PYHID interpreter with hidapi; floor 80 pct, FAIL = early exit)
-	@echo   make clean       remove evklite build directories
+	@echo   make clean       remove generated EVKLite output (checked-in ELF snapshots kept)
