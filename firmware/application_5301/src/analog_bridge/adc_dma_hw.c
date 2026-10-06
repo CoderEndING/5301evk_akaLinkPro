@@ -81,7 +81,7 @@ uint8_t adc_hw_prepare(uint32_t *buffer, uint8_t bits, uint32_t hz, uint32_t cou
     adc16_get_channel_default_config(&ch); ch.ch=ADC_FAST_CHANNEL; ch.sample_cycle=3U;
     if (adc16_init_channel(HPM_ADC0,&ch)!=status_success) return 3U;
     /* Process the one-entry queue to completion on each hardware trigger. */
-    seq.seq_len=1U; seq.queue[0].ch=ADC_FAST_CHANNEL; seq.cont_en=true; seq.hw_trig_en=true;
+    seq.seq_len=1U; seq.queue[0].ch=ADC_FAST_CHANNEL; seq.cont_en=true; seq.hw_trig_en=false;
     if (adc16_set_seq_config(HPM_ADC0,&seq)!=status_success) return 3U;
     adc16_seq_disable_hw_trigger(HPM_ADC0);
     adc16_dma_config_t dma={0}; dma.start_addr=buffer; dma.buff_len_in_4bytes=ADC_DMA_WORDS;
@@ -102,7 +102,11 @@ uint8_t adc_hw_prepare(uint32_t *buffer, uint8_t bits, uint32_t hz, uint32_t cou
     *actual=timer/period; return 0U;
 }
 void adc_hw_begin(void) {
-    adc16_seq_enable_hw_trigger(HPM_ADC0); gptmr_channel_reset_count(TIMER,ADC_TIMER_CH);
+    /* Resetting the counter can change its compare output. Keep the ADC trigger
+     * gated until the timer has a clean phase, then enable conversion and run. */
+    gptmr_channel_reset_count(TIMER,ADC_TIMER_CH);
+    adc16_clear_status_flags(HPM_ADC0,0xFFFFFFFFU);
+    adc16_seq_enable_hw_trigger(HPM_ADC0);
     gptmr_start_counter(TIMER,ADC_TIMER_CH);
 }
 uint16_t adc_hw_position(void) {
@@ -117,11 +121,20 @@ uint8_t adc_hw_fault(void) {
     return 0U;
 }
 void adc_hw_release_until(uint16_t position) { adc16_set_seq_stop_pos(HPM_ADC0,position); }
+static void invalidate_samples(uint32_t *buffer, uint16_t first, uint16_t count) {
+    uint32_t start=HPM_L1C_CACHELINE_ALIGN_DOWN((uint32_t)(uintptr_t)(buffer+first));
+    uint32_t end=HPM_L1C_CACHELINE_ALIGN_UP((uint32_t)(uintptr_t)(buffer+first+count));
+    if (count) l1c_dc_invalidate(start,end-start);
+}
 void adc_hw_read_barrier(uint32_t *buffer, uint16_t first, uint16_t count) {
-    /* DMA ring is immutable to CPU while active. Invalidate whole aligned ring:
-     * no dirty data to lose; avoids partial-line aliasing at wrap boundaries. */
-    (void)first; (void)count;
-    l1c_dc_invalidate((uint32_t)(uintptr_t)buffer,ADC_DMA_WORDS*4U);
+    /* The CPU only reads this cache-line-aligned DMA allocation. Round each
+     * consumed span to complete lines, splitting at ring wrap; no dirty CPU
+     * data or neighboring allocation can be invalidated. A later block
+     * invalidates its lines again, including a line shared with live DMA. */
+    uint16_t span=ADC_DMA_WORDS-first;
+    if (span>count) span=count;
+    invalidate_samples(buffer,first,span);
+    if (count>span) invalidate_samples(buffer,0U,count-span);
 }
 #else
 /* Board with VREF/LED ADC sharing and no SPI endpoints: explicitly unsupported. */

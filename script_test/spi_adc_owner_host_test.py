@@ -4,7 +4,7 @@ import os
 import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[1]
-text = (root / 'firmware/application_5301/src/spi_bridge/spi_bridge.c').read_text()
+text = (root / 'firmware/application_5301/src/spi_bridge/spi_bridge.c').read_text(encoding='utf-8')
 start = text.index('uint8_t spi_bridge_adc_flags(void)', text.index('#define s_adc_owner'))
 end = text.index('/* ============================== 小工具', start)
 helper = text[start:end]

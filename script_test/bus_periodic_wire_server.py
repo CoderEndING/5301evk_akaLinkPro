@@ -19,8 +19,8 @@ def function(text, name):
         elif text[pos] == '}': depth -= 1
         pos += 1
     return text[start:pos]
-i2c = (src / 'i2c_bridge/i2c_bridge.c').read_text()
-spi = (src / 'spi_bridge/spi_bridge.c').read_text()
+i2c = (src / 'i2c_bridge/i2c_bridge.c').read_text(encoding='utf-8')
+spi = (src / 'spi_bridge/spi_bridge.c').read_text(encoding='utf-8')
 # Ignore the unsupported-board stubs, keep the actual production validators.
 i2c = i2c[i2c.index('#else /* BOARD_HAS_I2C_BRIDGE */'):]
 spi = spi[spi.index('#else /* BOARD_HAS_SPI_BRIDGE */'):]

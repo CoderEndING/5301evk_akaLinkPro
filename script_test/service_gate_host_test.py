@@ -15,7 +15,7 @@ for path in modules:
 unit+='int main(void){\n'
 for path,flags in modules.items():
  name=Path(path).name
- code=(src/(path+'.c')).read_text()
+ code=(src/(path+'.c')).read_text(encoding='utf-8')
  unit+=f'assert(!{name}_needs_service());\n'
  for flag in flags:
   match=re.search(r'#define '+flag+r' \('+name+r'_gate.flag\[(\d+)\]\)',code)
@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory() as folder:
  subprocess.run([os.getenv('CC','gcc'),'-std=c11','-O2','-Wall','-Wextra','-Werror',
   *[f'-I{src / Path(path).parent}' for path in modules],str(p/'test.c'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
-main=(src/'main.c').read_text()
+main=(src/'main.c').read_text(encoding='utf-8')
 for path in modules:
  name=Path(path).name
  assert re.search(r'if \('+name+r'_needs_service\(\)\)\s*\{\s*'+name+r'_poll\(\);',main),name

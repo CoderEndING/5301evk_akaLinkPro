@@ -5,7 +5,7 @@ root = Path(__file__).resolve().parents[1]
 usb = root / 'firmware/application_5301/src/usb'
 sdk = Path(os.environ.get('HPM_SDK_BASE', root.parent / 'hpm-sdk-reference'))
 cherry = sdk / 'middleware/cherryusb'
-source = (usb / 'usb_composite.c').read_text()
+source = (usb / 'usb_composite.c').read_text(encoding='utf-8')
 source = source[source.index('#define CMSIS_DAP_INTERFACE_SIZE'):source.index('char serial_number_dynamic')]
 prefix = r'''
 #include <stdint.h>
@@ -26,7 +26,7 @@ prefix = r'''
 #define DAP_PACKET_SIZE 512
 '''
 # Endpoint constants and HID MPS are taken from production, not duplicated.
-header = (usb / 'usb_composite.h').read_text()
+header = (usb / 'usb_composite.h').read_text(encoding='utf-8')
 for name in ['DAP_IN_EP','DAP_OUT_EP','SWO_IN_EP','CDC_IN_EP','CDC_OUT_EP','CDC_INT_EP',
              'HID_IN_EP','HID_OUT_EP','MSC_IN_EP','MSC_OUT_EP','SPI_IN_EP','SPI_OUT_EP',
              'USBD_VID','USBD_PID','USBD_MAX_POWER','HID_PACKET_SIZE']:

@@ -61,6 +61,7 @@ test-host: test-jtag-host
 	$(PYTHON) script_test/service_gate_host_test.py
 	$(PYTHON) script_test/analog_host_test.py
 	$(PYTHON) script_test/adc_stream_host_test.py
+	$(PYTHON) script_test/adc_cache_host_test.py
 	$(PYTHON) script_test/bus_periodic_host_test.py
 	$(PYTHON) script_test/scope_host_test.py
 	$(PYTHON) script_test/rtt_stop_host_test.py

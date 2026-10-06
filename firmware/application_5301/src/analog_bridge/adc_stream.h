@@ -7,7 +7,10 @@
 #define ADC_BLOCK_SAMPLES 2031U /* 4094 bytes: short packet, no ZLP */
 #define ADC_FAST_MAX_RATE 2000000U
 #define ADC_FAST_CHANNEL 6U /* PB14, EVKLite J3[10] */
+#define ADC_MAX_INFLIGHT 32U
 uint8_t adc_stream_open(uint8_t bits, uint32_t rate, uint32_t count, uint32_t *token);
+uint8_t adc_stream_open_pipeline(uint8_t bits, uint32_t rate, uint32_t count,
+                                 uint8_t readers, uint32_t *token);
 uint8_t adc_stream_start(void);
 uint8_t adc_stream_close(void);
 uint8_t adc_stream_enabled(void);

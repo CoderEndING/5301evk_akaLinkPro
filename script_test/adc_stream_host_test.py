@@ -3,7 +3,7 @@ from pathlib import Path
 import os,re,subprocess,tempfile
 root=Path(__file__).resolve().parents[1]
 src=root/'firmware/application_5301/src/analog_bridge/adc_stream.c'
-source=re.sub(r'^#include "(?!adc_stream.h)[^"]+"','',src.read_text(),flags=re.M)
+source=re.sub(r'^#include "(?!adc_stream.h)[^"]+"','',src.read_text(encoding='utf-8'),flags=re.M)
 stub=r'''
 #include <stdint.h>
 #include <assert.h>
@@ -47,7 +47,7 @@ static void produce(unsigned n){for(unsigned i=0;i<n&&hw_running;i++){
 }clock_now+=48000;}
 static unsigned points,blocks;static uint32_t next;
 static void complete(void){assert(flight&&!memcmp(flight,"ADS2",4));unsigned n=flight[24]|flight[25]<<8;
- assert(flight_len==32+2*n&&u32(flight+16)==next);next+=n;points+=n;blocks++;flight=0;adc_stream_complete();}
+ assert(flight_len==32+2*n&&u32(flight+16)==next&&u32(flight+12)==blocks);next+=n;points+=n;blocks++;flight=0;adc_stream_complete();}
 static void drain(void){for(unsigned i=0;i<100;i++){adc_stream_poll();if(flight)complete();else break;}}
 static void close_stream(void){assert(adc_stream_close()==2);adc_stream_poll();assert(!owner&&!adc_stream_enabled());assert(!adc_stream_close());}
 static void open_stream(unsigned count){uint32_t token;next=points=blocks=0;assert(!adc_stream_open(16,2000000,count,&token));assert(!flight&&!hw_running);assert(!adc_stream_start());adc_stream_poll();assert(hw_running);}
@@ -76,6 +76,21 @@ int main(void){
  unsigned before=starts;assert(!adc_stream_open(16,1000,1,&token));inject_reset=1;
  assert(!adc_stream_start());adc_stream_poll();assert(!owner&&!hw_running&&starts==before);adc_stream_reset(1);
  open_stream(1);produce(1);drain();assert(points==1);close_stream();
+ /* Counted END retires every submitted native reader, including stop-before-START. */
+ assert(adc_stream_open_pipeline(16,1000,1,0,&token)==1);
+ assert(adc_stream_open_pipeline(16,1000,1,ADC_MAX_INFLIGHT+1,&token)==1);
+ for(unsigned readers=2;readers<=ADC_MAX_INFLIGHT;readers++){
+  next=points=blocks=0;assert(!adc_stream_open_pipeline(16,2000000,3,readers,&token));
+  assert(!adc_stream_start());adc_stream_poll();produce(3);
+  for(unsigned i=0;i<=readers;i++){
+   adc_stream_poll();assert(flight);complete();
+   adc_stream_status(status);assert(status[22]==(i==readers));
+   if(i<readers)assert(adc_stream_close()==ANALOG_BUSY);
+  }
+  assert(points==3&&blocks==readers+1);adc_stream_poll();assert(!flight);close_stream();
+  next=points=blocks=0;assert(!adc_stream_open_pipeline(16,1000,0,readers,&token));
+  adc_stream_end();drain();assert(points==0&&blocks==readers);close_stream();
+ }
  printf("Shared ADC DMA: finite count/ring wrap, SPI/core exclusion, two slots, overflow, END/reset/restart PASS (%u transfers)\n",transfers);
  return 0;
 }

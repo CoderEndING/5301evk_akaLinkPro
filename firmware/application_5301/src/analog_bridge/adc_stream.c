@@ -12,6 +12,7 @@ static uint32_t *capture;
 static uint8_t *transmit;
 static volatile uint8_t configured, owned, start_req, stop_req, close_req, reset_req, busy, ended;
 static uint8_t running, prepared, dma_ready, bits, fault, wslot, rslot, end_queued;
+static uint8_t end_depth, end_completed;
 static volatile uint8_t queued;
 static uint16_t read_pos, last_pos, lengths[2];
 static volatile uint32_t generation;
@@ -26,8 +27,13 @@ void adc_stream_reset(uint8_t ready) {
     if (owned) { reset_req=1U; adc_hw_abort(); busy=0U; }
 }
 uint8_t adc_stream_open(uint8_t width, uint32_t hz, uint32_t count, uint32_t *token) {
+    return adc_stream_open_pipeline(width,hz,count,1U,token);
+}
+uint8_t adc_stream_open_pipeline(uint8_t width, uint32_t hz, uint32_t count,
+                                 uint8_t readers, uint32_t *token) {
     if (!adc_hw_supported()) return ANALOG_UNSUPPORTED;
-    if ((width!=8U && width!=10U && width!=12U && width!=16U) || !hz || hz>ADC_FAST_MAX_RATE)
+    if ((width!=8U && width!=10U && width!=12U && width!=16U) || !hz || hz>ADC_FAST_MAX_RATE ||
+        !readers || readers>ADC_MAX_INFLIGHT)
         return ANALOG_RANGE;
     uint32_t level=bp_lock(); uint8_t rc=ANALOG_OK;
     if (!configured) rc=ANALOG_STATE;
@@ -38,6 +44,7 @@ uint8_t adc_stream_open(uint8_t width, uint32_t hz, uint32_t count, uint32_t *to
         owned=1U; bits=width; requested=hz; target=count; *token=++generation;
         start_req=stop_req=close_req=reset_req=busy=ended=0U;
         running=prepared=dma_ready=fault=wslot=rslot=queued=end_queued=0U;
+        end_depth=readers; end_completed=0U;
         read_pos=last_pos=0U; received=sent=block_seq=rate=0U; last_push=bp_now();
     }
     bp_unlock(level); return rc;
@@ -66,7 +73,9 @@ static void kick(void) {
 void adc_stream_complete(void) {
     uint32_t level=bp_lock();
     if (owned && busy && queued) {
-        if (transmit[ADC_BLOCK_BYTES*rslot+5U]==2U) ended=1U;
+        /* One END per negotiated native IN request: CLOSE cannot release the
+         * shared endpoint while another reader can still consume next-run data. */
+        if (transmit[ADC_BLOCK_BYTES*rslot+5U]==2U && ++end_completed==end_depth) ended=1U;
         rslot^=1U; queued--; busy=0U;
     }
     bp_unlock(level); kick(); /* ISR only returns a USB slot. */
@@ -113,7 +122,7 @@ void adc_stream_poll(void) {
         }
     }
     kick();
-    if (end_queued || queued==2U) return;
+    if (end_queued>=end_depth || queued==2U) return;
     uint16_t available=(uint16_t)((last_pos-read_pos)&(ADC_DMA_WORDS-1U));
     uint16_t count=available>ADC_BLOCK_SAMPLES?ADC_BLOCK_SAMPLES:available;
     if (running && count<ADC_BLOCK_SAMPLES && bp_now()-last_push<48000U) return;
@@ -134,7 +143,7 @@ void adc_stream_poll(void) {
             if (target && target-sent<space) space=target-sent;
             adc_hw_release_until((uint16_t)((read_pos+space)&(ADC_DMA_WORDS-1U)));
         }
-    } else end_queued=1U;
+    } else end_queued++;
     lengths[wslot]=(uint16_t)(32U+2U*count); last_push=bp_now();
     uint32_t level=bp_lock(); queued++; wslot^=1U; bp_unlock(level); kick();
 }

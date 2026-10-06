@@ -30,10 +30,12 @@ void analog_bridge_hid(uint8_t *req, uint8_t *res) {
     res[1] = 8U; res[2] = ANALOG_CMD; res[3] = req[3];
     memset(res + 4, 0, 4);
     if (req[1] < 2U || req[1] > 62U) { res[4] = ANALOG_RANGE; return; }
-    if (req[3] >= ANALOG_STREAM_CAPS && req[3] <= ANALOG_STREAM_STATUS) {
+    if (req[3] >= ANALOG_STREAM_CAPS && req[3] <= ANALOG_STREAM_PIPELINE) {
         /* HID length counts CMD + action + arguments (the length byte itself is not counted).
-         * OPEN has 1 CMD + 1 action + 9 argument bytes = 11. */
-        if (req[1] != (req[3]==ANALOG_STREAM_OPEN?11U:2U)) { res[4] = ANALOG_RANGE; return; }
+         * Legacy OPEN = 11; extended OPEN = 12, with a negotiated IN depth. */
+        if (req[3]==ANALOG_STREAM_OPEN ? (req[1]!=11U && req[1]!=12U) : req[1]!=2U) {
+            res[4] = ANALOG_RANGE; return;
+        }
         if (req[3] == ANALOG_STREAM_CAPS) {
             memset(res+8U,0,20U); memcpy(res+8U,"ADB2",4);
             res[12]=0x8BU; res[13]=2U; res[14]=0x0FU; res[15]=ADC_FAST_CHANNEL;
@@ -43,13 +45,16 @@ void analog_bridge_hid(uint8_t *req, uint8_t *res) {
             res[26]=3300U&255U; res[27]=3300U>>8; res[1]=28U;
         } else if (req[3] == ANALOG_STREAM_OPEN) {
             uint32_t token = 0U;
-            res[4]=adc_stream_open(req[4],stream_word(req+5U),stream_word(req+9U),&token);
+            if (req[1]==12U)
+                res[4]=adc_stream_open_pipeline(req[4],stream_word(req+5U),stream_word(req+9U),req[13],&token);
+            else res[4]=adc_stream_open(req[4],stream_word(req+5U),stream_word(req+9U),&token);
             for (uint8_t i = 0; i < 4; i++) res[8U + i] = (uint8_t)(token >> (8U * i));
             res[1] = 12U;
         } else if (req[3] == ANALOG_STREAM_END) adc_stream_end();
         else if (req[3] == ANALOG_STREAM_CLOSE) res[4]=adc_stream_close();
         else if (req[3] == ANALOG_STREAM_START) res[4]=adc_stream_start();
-        else { adc_stream_status(res+8U); res[1]=32U; }
+        else if (req[3] == ANALOG_STREAM_STATUS) { adc_stream_status(res+8U); res[1]=32U; }
+        else { res[8]=1U; res[9]=ADC_MAX_INFLIGHT; res[1]=10U; } /* counted END v1, 1..32 readers */
         return;
     }
     if (req[3] == ANALOG_DAC_CAPS) {
