@@ -5,8 +5,10 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-text = (root / 'firmware/application_5301/src/spi_bridge/spi_bridge.c').read_text()
-main = (root / 'firmware/application_5301/src/main.c').read_text()
+# 这两个源文件里有中文注释：必须显式 utf-8，否则在默认编码不是 UTF-8 的机器上
+# （Windows 的 GBK）直接 UnicodeDecodeError，整条 host 回归从这一条断掉。
+text = (root / 'firmware/application_5301/src/spi_bridge/spi_bridge.c').read_text(encoding='utf-8')
+main = (root / 'firmware/application_5301/src/main.c').read_text(encoding='utf-8')
 assert main.index('spi_bridge_init();') < main.index('chry_dap_init('), 'initialize before USB callbacks'
 def section(start, end, after=text.index("/* ============================== 状态")):
     a = text.index(start, after)
@@ -70,7 +72,7 @@ source += '''
 '''
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory)
-    (path / 'test.c').write_text(source)
+    (path / 'test.c').write_text(source, encoding='utf-8')   # 生成物里含抽取出来的中文注释，必须显式 utf-8
     subprocess.run([os.environ.get('CC', 'gcc'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-I', str(root/'firmware/application_5301/src/spi_bridge'),
                     '-I', str(root/'firmware/application_5301/src/api'),
