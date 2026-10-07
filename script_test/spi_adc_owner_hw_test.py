@@ -7,15 +7,10 @@ active=0, cs=0, frames_ok=0 and the ADC stream reported owned=0, yet HID CAPS
 kept returning flags=2. The web therefore refused to start ADC and no host
 command could clear the bit -> the probe had to be unplugged.
 
-The firmware now defines bit1 as "the bridge really owns the buffers"
-(s_enabled / s_pkt_active / s_adc_owner) and lets the ADC reclaim stale
-bookkeeping. This test drives the real HID control plane and asserts:
-
-  1. DRAIN leaves the IN ring busy *without* flipping the takeover bit
-     (this is exactly the state the old firmware reported as flags=3);
-  2. a genuinely enabled bridge still reports bit1 and refuses ADC OPEN
-     -> the ADC / SPI-QSPI mutual exclusion users asked for is intact;
-  3. disabling the bridge always drops bit1 again, whatever was left behind.
+The current admission fence includes native USB ownership. DRAIN with no bulk
+reader must block ADC OPEN; disabling/ABORT cannot cancel the armed transfer.
+This HID-only test checks rejection, not successful bulk handover. Run the ADC
+WebUSB finite/continuous tests separately to verify real IN/OUT retirement.
 """
 import sys
 import threading
@@ -138,7 +133,8 @@ def main():
     spi_word(dev, SB_DRAIN, (4,))
     time.sleep(0.3)
     flags, _ = adc_flags(dev)
-    check(flags & 2 == 0, "DRAIN does not report the buffers as owned (old firmware wedged here)", "flags=%d" % flags)
+    check(flags & 2 != 0, "DRAIN without a reader retains native IN ownership", "flags=%d" % flags)
+    check(adc_open(dev) == ADC_BUSY, "ADC OPEN cannot overwrite the unread IN DMA buffer")
 
     # 2) A really enabled bridge must still exclude ADC.
     spi_word(dev, SB_ENABLE, (1,))
@@ -152,12 +148,13 @@ def main():
     flags, _ = adc_flags(dev)
     check(flags & 2 != 0, "DRAIN does not release the mutual exclusion", "flags=%d" % flags)
 
-    # 3) Disabling must drop bit1 even though the OUT endpoint stays armed (bit0).
+    # 3) Disable does not cancel the IN DMA started by DRAIN (no bulk reader).
     spi_word(dev, SB_ENABLE, (0,))
     time.sleep(0.4)
     flags, _ = adc_flags(dev)
     check(spi_status(dev) & SB_ST_ENABLED == 0, "ENABLE 0 clears enabled in the status word")
-    check(flags & 2 == 0, "disabling the bridge lets the ADC take over again", "flags=%d" % flags)
+    check(flags & 2 != 0, "disable preserves pending native IN ownership", "flags=%d" % flags)
+    check(adc_open(dev) == ADC_BUSY, "disabled bridge still fences the pending native DMA")
 
     # 4) Residual control-path noise must not resurrect the busy bit.
     spi_word(dev, SB_ABORT)
@@ -165,7 +162,7 @@ def main():
     spi_word(dev, SB_DRAIN, (4,))
     time.sleep(0.3)
     flags, _ = adc_flags(dev)
-    check(flags & 2 == 0, "ABORT/RESET/DRAIN leave the ADC free to take over", "flags=%d" % flags)
+    check(flags & 2 != 0, "ABORT/RESET/DRAIN do not erase native IN ownership", "flags=%d" % flags)
 
     print()
     print("SPI/ADC shared-buffer hardware check: %d passed / %d failed" % (checks - failures, failures))

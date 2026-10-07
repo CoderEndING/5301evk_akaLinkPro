@@ -86,6 +86,9 @@ int main(void)
     board_init();
     api_param_load();
 
+    /* Initialize NOLOAD bridge state before USB callbacks can observe it. */
+    spi_bridge_init();
+
     board_init_usb((USB_Type *)CONFIG_HPM_USBD_BASE);
     intc_set_irq_priority(CONFIG_HPM_USBD_IRQn, 2);
     chry_dap_init(0, CONFIG_HPM_USBD_BASE);
@@ -97,9 +100,6 @@ int main(void)
 
     /* Status LEDs, external reference ADC and the periodic LED tick. */
     led_state_init();
-
-    /* USB→SPI/QSPI 转发桥：只清状态（引脚/时钟在 ENABLE=1 时才动）。 */
-    spi_bridge_init();
 
     /* USB→I2C 转发桥：同上，只清状态。 */
     i2c_bridge_init();

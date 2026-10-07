@@ -190,7 +190,7 @@ spi-info:
 
 # --- ADC / SPI shared-buffer ownership --------------------------------------
 .PHONY: adc-owner-hw
-adc-owner-hw:  ## ADC 与 SPI/QSPI 共享缓冲：互斥 + 关桥后自愈的硬件回归
+adc-owner-hw:  ## ADC 与 SPI/QSPI 共享缓冲：互斥及原生传输退场门禁
 	$(PYTHON) script_test/spi_adc_owner_hw_test.py
 
 # --- one-click regression ---------------------------------------------------
